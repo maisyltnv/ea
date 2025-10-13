@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| BUY and SELL EMA50 Strategy with Trailing Stop                  |
+//| EMA26/EMA50/EMA200 + Stochastic Strategy EA                      |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -8,20 +8,18 @@
 input double Lots = 0.10;
 input int SL_Points = 500;
 input int TP_Points = 1000;
-input int EMA_Period = 50;
+input int EMA26_Period = 26;
+input int EMA50_Period = 50;
+input int EMA200_Period = 200;
+input int Stoch_K = 9;
+input int Stoch_D = 3;
+input int Stoch_Slowing = 3;
 input ulong Magic = 123456;
-input int Move_SL_At_Profit = 500;  // ລາຄາຂຶ້ນໄປກວ່າ entry ກີ່ຈຸດຈຶ່ງຍ້າຍ SL
-input int New_SL_Plus = 50;         // ຍ້າຍ SL ໄປຢູ່ເທິງ entry ກີ່ຈຸດ
 
 // Global Variables
 CTrade trade;
-int hEMA;
+int hEMA26, hEMA50, hEMA200, hStoch;
 datetime lastBarTime = 0;
-bool canTrade = true;
-
-// State tracking for post-close conditions
-bool waitingForPriceBelowEMA = false;
-bool waitingForPriceAboveEMA = false;
 
 //+------------------------------------------------------------------+
 //| Check if new bar formed                                          |
@@ -39,91 +37,37 @@ bool IsNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| Get EMA value                                                    |
+//| Get EMA values                                                   |
 //+------------------------------------------------------------------+
-bool GetEMA(double &ema_value)
+bool GetEMAValues(double &ema26, double &ema50, double &ema200)
 {
-   if(hEMA == INVALID_HANDLE) return false;
-   double ema[1];
-   if(CopyBuffer(hEMA, 0, 1, 1, ema) != 1) return false;
-   ema_value = ema[0];
+   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE) return false;
+   
+   double ema26_buf[1], ema50_buf[1], ema200_buf[1];
+   if(CopyBuffer(hEMA26, 0, 1, 1, ema26_buf) != 1) return false;
+   if(CopyBuffer(hEMA50, 0, 1, 1, ema50_buf) != 1) return false;
+   if(CopyBuffer(hEMA200, 0, 1, 1, ema200_buf) != 1) return false;
+   
+   ema26 = ema26_buf[0];
+   ema50 = ema50_buf[0];
+   ema200 = ema200_buf[0];
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Check and update trailing stop                                   |
+//| Get Stochastic values                                            |
 //+------------------------------------------------------------------+
-void CheckTrailingStop()
+bool GetStochValues(double &stoch_main, double &stoch_signal)
 {
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   if(hStoch == INVALID_HANDLE) return false;
    
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      if(PositionGetSymbol(i) == _Symbol && PositionGetInteger(POSITION_MAGIC) == Magic)
-      {
-         ulong ticket = PositionGetInteger(POSITION_TICKET);
-         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-         double currentSL = PositionGetDouble(POSITION_SL);
-         long posType = PositionGetInteger(POSITION_TYPE);
-         
-         double newSL = 0;
-         double priceMovePoints = 0;
-         
-         // BUY Position
-         if(posType == POSITION_TYPE_BUY)
-         {
-            double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-            
-            // ຄິດໄລ່ວ່າລາຄາຂຶ້ນໄປກວ່າ entry ກີ່ຈຸດ
-            priceMovePoints = (currentPrice - openPrice) / point;
-            
-            // ຄິດໄລ່ stop loss ໃໝ່ (entry + 50 points)
-            newSL = openPrice + (New_SL_Plus * point);
-            newSL = NormalizeDouble(newSL, digits);
-            
-            // ເງື່ອນໄຂ: ລາຄາຂຶ້ນໄປຮອດ 500 ຈຸດ ແລະ stop loss ປັດຈຸບັນຍັງຕ່ຳກວ່າ entry + 50 ຈຸດ
-            if(priceMovePoints >= Move_SL_At_Profit && currentSL < newSL)
-            {
-               if(trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
-               {
-                  Print("BUY Trailing stop activated: New SL = ", newSL, " (Entry +", New_SL_Plus, " points)");
-                  Print("Entry: ", openPrice, ", Current Price: ", currentPrice, ", Price moved: ", (int)priceMovePoints, " points");
-               }
-               else
-               {
-                  Print("Failed to modify BUY position: ", trade.ResultRetcode());
-               }
-            }
-         }
-         // SELL Position
-         else if(posType == POSITION_TYPE_SELL)
-         {
-            double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            
-            // ຄິດໄລ່ວ່າລາຄາລົງໄປກວ່າ entry ກີ່ຈຸດ
-            priceMovePoints = (openPrice - currentPrice) / point;
-            
-            // ຄິດໄລ່ stop loss ໃໝ່ (entry - 50 points)
-            newSL = openPrice - (New_SL_Plus * point);
-            newSL = NormalizeDouble(newSL, digits);
-            
-            // ເງື່ອນໄຂ: ລາຄາລົງໄປຮອດ 500 ຈຸດ ແລະ stop loss ປັດຈຸບັນຍັງສູງກວ່າ entry - 50 ຈຸດ
-            if(priceMovePoints >= Move_SL_At_Profit && currentSL > newSL)
-            {
-               if(trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP)))
-               {
-                  Print("SELL Trailing stop activated: New SL = ", newSL, " (Entry -", New_SL_Plus, " points)");
-                  Print("Entry: ", openPrice, ", Current Price: ", currentPrice, ", Price moved: ", (int)priceMovePoints, " points");
-               }
-               else
-               {
-                  Print("Failed to modify SELL position: ", trade.ResultRetcode());
-               }
-            }
-         }
-      }
-   }
+   double stoch_main_buf[1], stoch_signal_buf[1];
+   if(CopyBuffer(hStoch, 0, 1, 1, stoch_main_buf) != 1) return false;
+   if(CopyBuffer(hStoch, 1, 1, 1, stoch_signal_buf) != 1) return false;
+   
+   stoch_main = stoch_main_buf[0];
+   stoch_signal = stoch_signal_buf[0];
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -133,19 +77,27 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(Magic);
    
-   hEMA = iMA(_Symbol, PERIOD_CURRENT, EMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   if(hEMA == INVALID_HANDLE)
+   // Create EMA indicators
+   hEMA26 = iMA(_Symbol, PERIOD_CURRENT, EMA26_Period, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA50 = iMA(_Symbol, PERIOD_CURRENT, EMA50_Period, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA200 = iMA(_Symbol, PERIOD_CURRENT, EMA200_Period, 0, MODE_EMA, PRICE_CLOSE);
+   
+   // Create Stochastic indicator
+   hStoch = iStochastic(_Symbol, PERIOD_CURRENT, Stoch_K, Stoch_D, Stoch_Slowing, MODE_SMA, STO_LOWHIGH);
+   
+   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE || hStoch == INVALID_HANDLE)
    {
-      Print("Failed to create EMA handle");
+      Print("Failed to create indicator handles");
       return INIT_FAILED;
    }
    
    datetime t[1];
    if(CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, t) == 1) lastBarTime = t[0];
    
-   Print("BUY and SELL EA with Trailing Stop initialized");
-   Print("EMA", EMA_Period, ", SL: ", SL_Points, ", TP: ", TP_Points, " points");
-   Print("Move SL when profit >= ", Move_SL_At_Profit, " points: BUY to entry+", New_SL_Plus, ", SELL to entry-", New_SL_Plus);
+   Print("EMA26/EMA50/EMA200 + Stochastic EA initialized");
+   Print("EMA26: ", EMA26_Period, ", EMA50: ", EMA50_Period, ", EMA200: ", EMA200_Period);
+   Print("Stochastic: ", Stoch_K, ",", Stoch_D, ",", Stoch_Slowing);
+   Print("SL: ", SL_Points, ", TP: ", TP_Points, " points");
    return INIT_SUCCEEDED;
 }
 
@@ -154,7 +106,10 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(hEMA != INVALID_HANDLE) IndicatorRelease(hEMA);
+   if(hEMA26 != INVALID_HANDLE) IndicatorRelease(hEMA26);
+   if(hEMA50 != INVALID_HANDLE) IndicatorRelease(hEMA50);
+   if(hEMA200 != INVALID_HANDLE) IndicatorRelease(hEMA200);
+   if(hStoch != INVALID_HANDLE) IndicatorRelease(hStoch);
 }
 
 //+------------------------------------------------------------------+
@@ -162,64 +117,30 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // ກວດສອບ trailing stop ທຸກເທື່ອທີ່ມີ position
-   if(PositionsTotal() > 0)
-   {
-      CheckTrailingStop();
-   }
-   
    // ຖ້າມີ position ເປີດຢູ່, ບໍ່ຕ້ອງກວດສອບສັນຍານໃໝ່
    if(PositionSelect(_Symbol)) return;
    
-   // Check if we need to reset after position closed
-   if(!canTrade)
-   {
-      waitingForPriceBelowEMA = true;
-      waitingForPriceAboveEMA = false;
-      Print("Position closed - Waiting for price to go below EMA50");
-      canTrade = true;
-   }
-   
    if(!IsNewBar()) return;
    
-   double ema50;
-   if(!GetEMA(ema50)) return;
+   // Get indicator values
+   double ema26, ema50, ema200, stoch_main, stoch_signal;
+   if(!GetEMAValues(ema26, ema50, ema200)) return;
+   if(!GetStochValues(stoch_main, stoch_signal)) return;
    
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   
-   // Post-close conditions: Wait for price to go below then above EMA50
-   if(waitingForPriceBelowEMA)
-   {
-      if(ask < ema50)
-      {
-         waitingForPriceBelowEMA = false;
-         waitingForPriceAboveEMA = true;
-         Print("Price went below EMA50 - Now waiting for price to go back above EMA50");
-      }
-      return;
-   }
-   
-   if(waitingForPriceAboveEMA)
-   {
-      if(ask > ema50)
-      {
-         waitingForPriceAboveEMA = false;
-         Print("Price back above EMA50 - Ready to trade again");
-      }
-      else
-      {
-         return;
-      }
-   }
-   
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // BUY: Price above EMA50
-   if(ask > ema50)
+   // BUY Signal: ຕາມເງື່ອນໄຂທີ່ແກ້ໄຂ
+   // 1. Stochastic ≤ 20 (oversold)
+   // 2. EMA50 ຢູ່ເທິງ EMA200 (uptrend)
+   // 3. ລາຄາຢູ່ເທິງ EMA200
+   if(stoch_main <= 20 && ema50 > ema200 && ask > ema200)
    {
-      Print("BUY Signal: Price above EMA50");
+      Print("BUY Signal: Stochastic oversold, EMA50 > EMA200, Price above EMA200");
+      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
+      Print("Stoch: ", stoch_main, "/", stoch_signal);
       
       double sl = ask - SL_Points * point;
       double tp = ask + TP_Points * point;
@@ -227,20 +148,24 @@ void OnTick()
       sl = NormalizeDouble(sl, digits);
       tp = NormalizeDouble(tp, digits);
       
-      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "Price above EMA50"))
+      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA50/200 + Stoch Buy"))
       {
          Print("BUY order opened - Entry: ", ask, ", SL: ", sl, ", TP: ", tp);
-         canTrade = false;
       }
       else
       {
          Print("BUY order failed - Error: ", trade.ResultRetcode());
       }
    }
-   // SELL: Price below EMA50
-   else if(bid < ema50)
+   // SELL Signal: ຕາມເງື່ອນໄຂທີ່ແກ້ໄຂ
+   // 1. Stochastic ≥ 80 (overbought)
+   // 2. EMA50 ຢູ່ລຸ່ມ EMA200 (downtrend)
+   // 3. ລາຄາຢູ່ລຸ່ມ EMA200
+   else if(stoch_main >= 80 && ema50 < ema200 && bid < ema200)
    {
-      Print("SELL Signal: Price below EMA50");
+      Print("SELL Signal: Stochastic overbought, EMA50 < EMA200, Price below EMA200");
+      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
+      Print("Stoch: ", stoch_main, "/", stoch_signal);
       
       double sl = bid + SL_Points * point;
       double tp = bid - TP_Points * point;
@@ -248,10 +173,9 @@ void OnTick()
       sl = NormalizeDouble(sl, digits);
       tp = NormalizeDouble(tp, digits);
       
-      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "Price below EMA50"))
+      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA50/200 + Stoch Sell"))
       {
          Print("SELL order opened - Entry: ", bid, ", SL: ", sl, ", TP: ", tp);
-         canTrade = false;
       }
       else
       {
