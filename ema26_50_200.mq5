@@ -395,14 +395,13 @@ void OnTick()
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // BUY Signal: ເງື່ອນໄຂໃໝ່
+   // BUY Signal: ເງື່ອນໄຂທີ່ຖືກຕ້ອງ
    // 1. Stochastic ≤ 20 (oversold)
-   // 2. EMA50 ຢູ່ເທິງ EMA200 (uptrend)
-   // 3. ລາຄາຢູ່ເທິງ EMA50 (ປ່ຽນຈາກ EMA200)
-   if(stoch_main <= 20 && ema50 > ema200 && ask > ema50)
+   // 2. ລາຄາ > EMA26 > EMA50 > EMA200 (ກວດສອບ trend ກ່ອນ)
+   if(stoch_main <= 20 && ask > ema200 && ask > ema26 && ema26 > ema50 && ema50 > ema200)
    {
-      Print("BUY Signal: Stochastic oversold, EMA50 > EMA200, Price above EMA50");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
+      Print("BUY Signal: Stochastic oversold, Price > EMA26 > EMA50 > EMA200");
+      Print("Price: ", ask, " > EMA26: ", ema26, " > EMA50: ", ema50, " > EMA200: ", ema200);
       Print("Stoch: ", stoch_main, "/", stoch_signal);
       
       double sl = ask - SL_Points * point;
@@ -411,7 +410,7 @@ void OnTick()
       sl = NormalizeDouble(sl, digits);
       tp = NormalizeDouble(tp, digits);
       
-      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA50/200 + Stoch Buy"))
+      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA26>50>200 + Stoch Buy"))
       {
          Print("BUY order opened - Entry: ", ask, ", SL: ", sl, ", TP: ", tp);
          slLocked = false; // Reset flag for new position
@@ -421,14 +420,13 @@ void OnTick()
          Print("BUY order failed - Error: ", trade.ResultRetcode());
       }
    }
-   // SELL Signal: ເງື່ອນໄຂໃໝ່
+   // SELL Signal: ເງື່ອນໄຂທີ່ຖືກຕ້ອງ
    // 1. Stochastic ≥ 80 (overbought)
-   // 2. EMA50 ຢູ່ລຸ່ມ EMA200 (downtrend)
-   // 3. ລາຄາຢູ່ລຸ່ມ EMA50 (ປ່ຽນຈາກ EMA200)
-   else if(stoch_main >= 80 && ema50 < ema200 && bid < ema50)
+   // 2. ລາຄາ < EMA26 < EMA50 < EMA200 (ກວດສອບ trend ກ່ອນ)
+   else if(stoch_main >= 80 && bid < ema200 && bid < ema26 && ema26 < ema50 && ema50 < ema200)
    {
-      Print("SELL Signal: Stochastic overbought, EMA50 < EMA200, Price below EMA50");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
+      Print("SELL Signal: Stochastic overbought, Price < EMA26 < EMA50 < EMA200");
+      Print("Price: ", bid, " < EMA26: ", ema26, " < EMA50: ", ema50, " < EMA200: ", ema200);
       Print("Stoch: ", stoch_main, "/", stoch_signal);
       
       double sl = bid + SL_Points * point;
@@ -437,7 +435,7 @@ void OnTick()
       sl = NormalizeDouble(sl, digits);
       tp = NormalizeDouble(tp, digits);
       
-      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA50/200 + Stoch Sell"))
+      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA26<50<200 + Stoch Sell"))
       {
          Print("SELL order opened - Entry: ", bid, ", SL: ", sl, ", TP: ", tp);
          slLocked = false; // Reset flag for new position
