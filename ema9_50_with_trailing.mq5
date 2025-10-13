@@ -1,25 +1,25 @@
 //+------------------------------------------------------------------+
-//| EMA26/EMA50/EMA200 + Stochastic Strategy EA                      |
+//| EMA9/EMA50 Retest Strategy EA                                   |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
 
 // Input Parameters
 input double Lots = 0.10;
-input int SL_Points = 500;
-input int TP_Points = 1000;
-input int EMA26_Period = 26;
+input int EMA9_Period = 9;
 input int EMA50_Period = 50;
-input int EMA200_Period = 200;
-input int Stoch_K = 9;
-input int Stoch_D = 3;
-input int Stoch_Slowing = 3;
 input ulong Magic = 123456;
 
 // Global Variables
 CTrade trade;
-int hEMA26, hEMA50, hEMA200, hStoch;
+int hEMA9, hEMA50;
 datetime lastBarTime = 0;
+
+// State tracking variables
+bool waitingForRetest = false;
+bool waitingForPriceAboveEMA50 = false;  // for BUY retest
+bool waitingForPriceBelowEMA50 = false;  // for SELL retest
+string lastSignalType = "";
 
 //+------------------------------------------------------------------+
 //| Check if new bar formed                                          |
@@ -39,35 +39,68 @@ bool IsNewBar()
 //+------------------------------------------------------------------+
 //| Get EMA values                                                   |
 //+------------------------------------------------------------------+
-bool GetEMAValues(double &ema26, double &ema50, double &ema200)
+bool GetEMAValues(double &ema9, double &ema50)
 {
-   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE) return false;
+   if(hEMA9 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE) return false;
    
-   double ema26_buf[1], ema50_buf[1], ema200_buf[1];
-   if(CopyBuffer(hEMA26, 0, 1, 1, ema26_buf) != 1) return false;
+   double ema9_buf[1], ema50_buf[1];
+   if(CopyBuffer(hEMA9, 0, 1, 1, ema9_buf) != 1) return false;
    if(CopyBuffer(hEMA50, 0, 1, 1, ema50_buf) != 1) return false;
-   if(CopyBuffer(hEMA200, 0, 1, 1, ema200_buf) != 1) return false;
    
-   ema26 = ema26_buf[0];
+   ema9 = ema9_buf[0];
    ema50 = ema50_buf[0];
-   ema200 = ema200_buf[0];
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| Get Stochastic values                                            |
+//| Check if price retested EMA9                                     |
 //+------------------------------------------------------------------+
-bool GetStochValues(double &stoch_main, double &stoch_signal)
+bool PriceRetestedEMA9(double currentPrice, double ema9, string signalType)
 {
-   if(hStoch == INVALID_HANDLE) return false;
+   if(signalType == "BUY")
+   {
+      // For BUY: price should come down to EMA9 or close to it
+      return (currentPrice <= ema9 * 1.001); // Allow small tolerance
+   }
+   else if(signalType == "SELL")
+   {
+      // For SELL: price should come up to EMA9 or close to it
+      return (currentPrice >= ema9 * 0.999); // Allow small tolerance
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Check exit conditions                                            |
+//+------------------------------------------------------------------+
+void CheckExitConditions()
+{
+   if(!PositionSelect(_Symbol)) return;
    
-   double stoch_main_buf[1], stoch_signal_buf[1];
-   if(CopyBuffer(hStoch, 0, 1, 1, stoch_main_buf) != 1) return false;
-   if(CopyBuffer(hStoch, 1, 1, 1, stoch_signal_buf) != 1) return false;
+   double ema9, ema50;
+   if(!GetEMAValues(ema9, ema50)) return;
    
-   stoch_main = stoch_main_buf[0];
-   stoch_signal = stoch_signal_buf[0];
-   return true;
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   long posType = PositionGetInteger(POSITION_TYPE);
+   
+   // BUY position exit: price below EMA50
+   if(posType == POSITION_TYPE_BUY && currentPrice < ema50)
+   {
+      ulong ticket = PositionGetInteger(POSITION_TICKET);
+      if(trade.PositionClose(ticket))
+      {
+         Print("BUY position closed - Price below EMA50: ", currentPrice, " < ", ema50);
+      }
+   }
+   // SELL position exit: price above EMA50
+   else if(posType == POSITION_TYPE_SELL && currentPrice > ema50)
+   {
+      ulong ticket = PositionGetInteger(POSITION_TICKET);
+      if(trade.PositionClose(ticket))
+      {
+         Print("SELL position closed - Price above EMA50: ", currentPrice, " > ", ema50);
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -78,26 +111,21 @@ int OnInit()
    trade.SetExpertMagicNumber(Magic);
    
    // Create EMA indicators
-   hEMA26 = iMA(_Symbol, PERIOD_CURRENT, EMA26_Period, 0, MODE_EMA, PRICE_CLOSE);
+   hEMA9 = iMA(_Symbol, PERIOD_CURRENT, EMA9_Period, 0, MODE_EMA, PRICE_CLOSE);
    hEMA50 = iMA(_Symbol, PERIOD_CURRENT, EMA50_Period, 0, MODE_EMA, PRICE_CLOSE);
-   hEMA200 = iMA(_Symbol, PERIOD_CURRENT, EMA200_Period, 0, MODE_EMA, PRICE_CLOSE);
    
-   // Create Stochastic indicator
-   hStoch = iStochastic(_Symbol, PERIOD_CURRENT, Stoch_K, Stoch_D, Stoch_Slowing, MODE_SMA, STO_LOWHIGH);
-   
-   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE || hStoch == INVALID_HANDLE)
+   if(hEMA9 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE)
    {
-      Print("Failed to create indicator handles");
+      Print("Failed to create EMA handles");
       return INIT_FAILED;
    }
    
    datetime t[1];
    if(CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, t) == 1) lastBarTime = t[0];
    
-   Print("EMA26/EMA50/EMA200 + Stochastic EA initialized");
-   Print("EMA26: ", EMA26_Period, ", EMA50: ", EMA50_Period, ", EMA200: ", EMA200_Period);
-   Print("Stochastic: ", Stoch_K, ",", Stoch_D, ",", Stoch_Slowing);
-   Print("SL: ", SL_Points, ", TP: ", TP_Points, " points");
+   Print("EMA9/EMA50 Retest Strategy EA initialized");
+   Print("EMA9: ", EMA9_Period, ", EMA50: ", EMA50_Period);
+   Print("Lots: ", Lots);
    return INIT_SUCCEEDED;
 }
 
@@ -106,10 +134,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(hEMA26 != INVALID_HANDLE) IndicatorRelease(hEMA26);
+   if(hEMA9 != INVALID_HANDLE) IndicatorRelease(hEMA9);
    if(hEMA50 != INVALID_HANDLE) IndicatorRelease(hEMA50);
-   if(hEMA200 != INVALID_HANDLE) IndicatorRelease(hEMA200);
-   if(hStoch != INVALID_HANDLE) IndicatorRelease(hStoch);
 }
 
 //+------------------------------------------------------------------+
@@ -117,69 +143,98 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // ຖ້າມີ position ເປີດຢູ່, ບໍ່ຕ້ອງກວດສອບສັນຍານໃໝ່
+   // Check exit conditions first
+   CheckExitConditions();
+   
+   // If position exists, don't look for new signals
    if(PositionSelect(_Symbol)) return;
    
    if(!IsNewBar()) return;
    
    // Get indicator values
-   double ema26, ema50, ema200, stoch_main, stoch_signal;
-   if(!GetEMAValues(ema26, ema50, ema200)) return;
-   if(!GetStochValues(stoch_main, stoch_signal)) return;
+   double ema9, ema50;
+   if(!GetEMAValues(ema9, ema50)) return;
    
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // BUY Signal: ຕາມເງື່ອນໄຂທີ່ແກ້ໄຂ
-   // 1. Stochastic ≤ 20 (oversold)
-   // 2. EMA50 ຢູ່ເທິງ EMA200 (uptrend)
-   // 3. ລາຄາຢູ່ເທິງ EMA200
-   if(stoch_main <= 20 && ema50 > ema200 && ask > ema200)
+   // BUY Signal Logic
+   // 1. EMA9 above EMA50 (uptrend)
+   // 2. Price above EMA50
+   // 3. Wait for price to retest EMA9
+   if(ema9 > ema50 && ask > ema50)
    {
-      Print("BUY Signal: Stochastic oversold, EMA50 > EMA200, Price above EMA200");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
-      Print("Stoch: ", stoch_main, "/", stoch_signal);
-      
-      double sl = ask - SL_Points * point;
-      double tp = ask + TP_Points * point;
-      
-      sl = NormalizeDouble(sl, digits);
-      tp = NormalizeDouble(tp, digits);
-      
-      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA50/200 + Stoch Buy"))
+      if(!waitingForRetest || lastSignalType != "BUY")
       {
-         Print("BUY order opened - Entry: ", ask, ", SL: ", sl, ", TP: ", tp);
+         waitingForRetest = true;
+         waitingForPriceAboveEMA50 = false;
+         waitingForPriceBelowEMA50 = false;
+         lastSignalType = "BUY";
+         Print("BUY Setup: EMA9 > EMA50, Price above EMA50 - Waiting for retest of EMA9");
+         Print("EMA9: ", ema9, ", EMA50: ", ema50, ", Current Price: ", ask);
       }
-      else
+      else if(waitingForRetest && lastSignalType == "BUY")
       {
-         Print("BUY order failed - Error: ", trade.ResultRetcode());
+         // Check if price retested EMA9
+         if(PriceRetestedEMA9(ask, ema9, "BUY"))
+         {
+            Print("BUY Signal: Price retested EMA9 - Opening BUY order");
+            
+            if(trade.Buy(Lots, _Symbol, ask, 0, 0, "EMA9/50 Retest Buy"))
+            {
+               Print("BUY order opened - Entry: ", ask);
+               waitingForRetest = false;
+               lastSignalType = "";
+            }
+            else
+            {
+               Print("BUY order failed - Error: ", trade.ResultRetcode());
+            }
+         }
       }
    }
-   // SELL Signal: ຕາມເງື່ອນໄຂທີ່ແກ້ໄຂ
-   // 1. Stochastic ≥ 80 (overbought)
-   // 2. EMA50 ຢູ່ລຸ່ມ EMA200 (downtrend)
-   // 3. ລາຄາຢູ່ລຸ່ມ EMA200
-   else if(stoch_main >= 80 && ema50 < ema200 && bid < ema200)
+   // SELL Signal Logic
+   // 1. EMA9 below EMA50 (downtrend)
+   // 2. Price below EMA50
+   // 3. Wait for price to retest EMA9
+   else if(ema9 < ema50 && bid < ema50)
    {
-      Print("SELL Signal: Stochastic overbought, EMA50 < EMA200, Price below EMA200");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
-      Print("Stoch: ", stoch_main, "/", stoch_signal);
-      
-      double sl = bid + SL_Points * point;
-      double tp = bid - TP_Points * point;
-      
-      sl = NormalizeDouble(sl, digits);
-      tp = NormalizeDouble(tp, digits);
-      
-      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA50/200 + Stoch Sell"))
+      if(!waitingForRetest || lastSignalType != "SELL")
       {
-         Print("SELL order opened - Entry: ", bid, ", SL: ", sl, ", TP: ", tp);
+         waitingForRetest = true;
+         waitingForPriceAboveEMA50 = false;
+         waitingForPriceBelowEMA50 = false;
+         lastSignalType = "SELL";
+         Print("SELL Setup: EMA9 < EMA50, Price below EMA50 - Waiting for retest of EMA9");
+         Print("EMA9: ", ema9, ", EMA50: ", ema50, ", Current Price: ", bid);
       }
-      else
+      else if(waitingForRetest && lastSignalType == "SELL")
       {
-         Print("SELL order failed - Error: ", trade.ResultRetcode());
+         // Check if price retested EMA9
+         if(PriceRetestedEMA9(bid, ema9, "SELL"))
+         {
+            Print("SELL Signal: Price retested EMA9 - Opening SELL order");
+            
+            if(trade.Sell(Lots, _Symbol, bid, 0, 0, "EMA9/50 Retest Sell"))
+            {
+               Print("SELL order opened - Entry: ", bid);
+               waitingForRetest = false;
+               lastSignalType = "";
+            }
+            else
+            {
+               Print("SELL order failed - Error: ", trade.ResultRetcode());
+            }
+         }
       }
+   }
+   // Reset waiting state if conditions no longer met
+   else if(waitingForRetest)
+   {
+      waitingForRetest = false;
+      lastSignalType = "";
+      Print("Reset waiting state - Conditions no longer met");
    }
 }
