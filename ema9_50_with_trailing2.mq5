@@ -9,10 +9,6 @@ input double Lots = 0.10;
 input int EMA9_Period = 9;
 input int EMA50_Period = 50;
 input ulong Magic = 123456;
-input int SwingLookback = 20;  // ຈຳນວນ bars ເພື່ອຫາ swing low/high
-input int ProfitPoints = 500;  // ຈຸດກຳໄລທີ່ຈະຍ້າຍ SL ໄປ entry ± 20
-input int TP_Points = 1000;    // Take Profit ໃນຈຸດ
-input int LockPoints = 20;     // ຈຸດທີ່ຈະຍ້າຍ SL ໄປ entry ± 20
 
 // Global Variables
 CTrade trade;
@@ -75,39 +71,7 @@ bool PriceRetestedEMA9(double currentPrice, double ema9, string signalType)
 }
 
 //+------------------------------------------------------------------+
-//| Find Swing Low for BUY orders                                    |
-//+------------------------------------------------------------------+
-double FindSwingLow()
-{
-   double low[];
-   if(CopyLow(_Symbol, PERIOD_CURRENT, 1, SwingLookback, low) != SwingLookback) return 0;
-   
-   double minLow = low[0];
-   for(int i = 1; i < SwingLookback; i++)
-   {
-      if(low[i] < minLow) minLow = low[i];
-   }
-   return minLow;
-}
-
-//+------------------------------------------------------------------+
-//| Find Swing High for SELL orders                                  |
-//+------------------------------------------------------------------+
-double FindSwingHigh()
-{
-   double high[];
-   if(CopyHigh(_Symbol, PERIOD_CURRENT, 1, SwingLookback, high) != SwingLookback) return 0;
-   
-   double maxHigh = high[0];
-   for(int i = 1; i < SwingLookback; i++)
-   {
-      if(high[i] > maxHigh) maxHigh = high[i];
-   }
-   return maxHigh;
-}
-
-//+------------------------------------------------------------------+
-//| Check exit conditions and manage SL                              |
+//| Check exit conditions                                            |
 //+------------------------------------------------------------------+
 void CheckExitConditions()
 {
@@ -117,50 +81,24 @@ void CheckExitConditions()
    if(!GetEMAValues(ema9, ema50)) return;
    
    double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    long posType = PositionGetInteger(POSITION_TYPE);
-   ulong ticket = PositionGetInteger(POSITION_TICKET);
-   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-   double currentSL = PositionGetDouble(POSITION_SL);
-   double currentTP = PositionGetDouble(POSITION_TP);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // Calculate profit points
-   double profitPoints = 0.0;
-   if(posType == POSITION_TYPE_BUY)
-      profitPoints = (currentPrice - openPrice) / point;
-   else if(posType == POSITION_TYPE_SELL)
-      profitPoints = (openPrice - currentPrice) / point;
-   
-   // BUY position management
-   if(posType == POSITION_TYPE_BUY)
+   // BUY position exit: price below EMA50
+   if(posType == POSITION_TYPE_BUY && currentPrice < ema50)
    {
-      // If profit >= 500 points, move SL to entry + 20 points
-      if(profitPoints >= ProfitPoints)
+      ulong ticket = PositionGetInteger(POSITION_TICKET);
+      if(trade.PositionClose(ticket))
       {
-         double newSL = openPrice + (LockPoints * point);
-         newSL = NormalizeDouble(newSL, digits);
-         
-         if(trade.PositionModify(ticket, newSL, currentTP))
-         {
-            Print("BUY: SL moved to entry +", LockPoints, " points @ ", newSL, " (Profit: ", (int)profitPoints, " points)");
-         }
+         Print("BUY position closed - Price below EMA50: ", currentPrice, " < ", ema50);
       }
    }
-   // SELL position management
-   else if(posType == POSITION_TYPE_SELL)
+   // SELL position exit: price above EMA50
+   else if(posType == POSITION_TYPE_SELL && currentPrice > ema50)
    {
-      // If profit >= 500 points, move SL to entry - 20 points
-      if(profitPoints >= ProfitPoints)
+      ulong ticket = PositionGetInteger(POSITION_TICKET);
+      if(trade.PositionClose(ticket))
       {
-         double newSL = openPrice - (LockPoints * point);
-         newSL = NormalizeDouble(newSL, digits);
-         
-         if(trade.PositionModify(ticket, newSL, currentTP))
-         {
-            Print("SELL: SL moved to entry -", LockPoints, " points @ ", newSL, " (Profit: ", (int)profitPoints, " points)");
-         }
+         Print("SELL position closed - Price above EMA50: ", currentPrice, " > ", ema50);
       }
    }
 }
@@ -244,18 +182,9 @@ void OnTick()
          {
             Print("BUY Signal: Price retested EMA9 - Opening BUY order");
             
-            // Find swing low for SL
-            double swingLow = FindSwingLow();
-            double sl = (swingLow > 0) ? swingLow : ask - 500 * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-            double tp = ask + TP_Points * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            
-            Print("Swing Low SL: ", swingLow, ", Final SL: ", sl, ", TP: ", tp);
-            
-            if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA9/50 Retest Buy"))
+            if(trade.Buy(Lots, _Symbol, ask, 0, 0, "EMA9/50 Retest Buy"))
             {
-               Print("BUY order opened - Entry: ", ask, ", SL: ", sl);
+               Print("BUY order opened - Entry: ", ask);
                waitingForRetest = false;
                lastSignalType = "";
             }
@@ -288,18 +217,9 @@ void OnTick()
          {
             Print("SELL Signal: Price retested EMA9 - Opening SELL order");
             
-            // Find swing high for SL
-            double swingHigh = FindSwingHigh();
-            double sl = (swingHigh > 0) ? swingHigh : bid + 500 * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-            double tp = bid - TP_Points * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-            sl = NormalizeDouble(sl, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            tp = NormalizeDouble(tp, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            
-            Print("Swing High SL: ", swingHigh, ", Final SL: ", sl, ", TP: ", tp);
-            
-            if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA9/50 Retest Sell"))
+            if(trade.Sell(Lots, _Symbol, bid, 0, 0, "EMA9/50 Retest Sell"))
             {
-               Print("SELL order opened - Entry: ", bid, ", SL: ", sl);
+               Print("SELL order opened - Entry: ", bid);
                waitingForRetest = false;
                lastSignalType = "";
             }
