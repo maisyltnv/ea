@@ -14,12 +14,10 @@ input int EMA_Period_200 = 200;                 // EMA 200 period
 input int Stoch_K_Period = 9;                   // Stochastic %K period
 input int Stoch_D_Period = 3;                   // Stochastic %D period
 input int Stoch_Slowing = 3;                    // Stochastic slowing
-input int TP_Points = 1000;                     // Take Profit in points
-input int SL_Points_Buy = 500;                 // Stop Loss for Buy orders in points
-input int SL_Points_Sell = 500;                // Stop Loss for Sell orders in points
-input int Trailing_Profit = 500;               // Profit level to start trailing
-input int Trailing_Distance = 20;              // Trailing distance from entry
-input int Max_Losses_Per_Day = 1;               // Maximum consecutive losses per day
+input int TP_Points = 2000;                     // Take Profit in points
+input int SL_Points_Buy = 1000;                // Stop Loss for Buy orders in points
+input int SL_Points_Sell = 1000;               // Stop Loss for Sell orders in points
+input int Max_Profit_Per_Day = 3000;            // Maximum profit per day in points
 input int Start_Hour = 5;                       // Trading start hour (Bangkok time)
 input int End_Hour = 23;                        // Trading end hour (Bangkok time)
 
@@ -28,8 +26,7 @@ int ema50_handle, ema200_handle, stoch_handle;
 double ema50_buffer[], ema200_buffer[];
 double stoch_main_buffer[], stoch_signal_buffer[];
 datetime last_trade_date = 0;
-int daily_loss_count = 0;
-int daily_tp_count = 0;
+double daily_profit = 0.0;
 bool trading_allowed_today = true;
 
 //+------------------------------------------------------------------+
@@ -81,6 +78,14 @@ void OnTick()
     if(!trading_allowed_today)
         return;
     
+    //--- Check if daily profit limit reached
+    if(daily_profit >= Max_Profit_Per_Day * _Point * LotSize * 100000)
+    {
+        trading_allowed_today = false;
+        Print("Daily profit limit reached: ", daily_profit);
+        return;
+    }
+    
     //--- Check trading time (Bangkok timezone)
     if(!IsWithinTradingHours())
         return;
@@ -111,8 +116,7 @@ void CheckNewDay()
     if(current_date != last_trade_date)
     {
         last_trade_date = current_date;
-        daily_loss_count = 0;
-        daily_tp_count = 0;
+        daily_profit = 0.0;
         trading_allowed_today = true;
         Print("New trading day started: ", TimeToString(bangkok_time, TIME_DATE));
     }
@@ -267,40 +271,7 @@ void OpenSellOrder()
 //+------------------------------------------------------------------+
 void ManagePositions()
 {
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
-        if(PositionGetSymbol(i) != _Symbol)
-            continue;
-            
-        ulong ticket = PositionGetInteger(POSITION_TICKET);
-        double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
-        double current_sl = PositionGetDouble(POSITION_SL);
-        double current_profit = PositionGetDouble(POSITION_PROFIT);
-        ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        
-        //--- Check for trailing stop
-        if(MathAbs(current_profit) >= Trailing_Profit * _Point * LotSize * 100000)
-        {
-            double new_sl;
-            
-            if(pos_type == POSITION_TYPE_BUY)
-            {
-                new_sl = open_price + Trailing_Distance * _Point;
-                if(new_sl > current_sl)
-                {
-                    ModifyPosition(ticket, new_sl, PositionGetDouble(POSITION_TP));
-                }
-            }
-            else if(pos_type == POSITION_TYPE_SELL)
-            {
-                new_sl = open_price - Trailing_Distance * _Point;
-                if(new_sl < current_sl || current_sl == 0)
-                {
-                    ModifyPosition(ticket, new_sl, PositionGetDouble(POSITION_TP));
-                }
-            }
-        }
-    }
+    // No trailing stop management needed
 }
 
 //+------------------------------------------------------------------+
@@ -343,25 +314,13 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             
             if(deal_entry == DEAL_ENTRY_OUT)
             {
-                if(profit > 0)
+                daily_profit += profit;
+                Print("Position closed. Profit: ", profit, " Daily total: ", daily_profit);
+                
+                if(daily_profit >= Max_Profit_Per_Day * _Point * LotSize * 100000)
                 {
-                    daily_tp_count++;
-                    Print("Take Profit hit! Daily TP count: ", daily_tp_count);
-                    if(daily_tp_count >= 1)
-                    {
-                        trading_allowed_today = false;
-                        Print("Trading stopped for today due to TP");
-                    }
-                }
-                else if(profit < 0)
-                {
-                    daily_loss_count++;
-                    Print("Stop Loss hit! Daily loss count: ", daily_loss_count);
-                    if(daily_loss_count >= Max_Losses_Per_Day)
-                    {
-                        trading_allowed_today = false;
-                        Print("Trading stopped for today due to consecutive losses");
-                    }
+                    trading_allowed_today = false;
+                    Print("Trading stopped for today due to profit limit reached");
                 }
             }
         }
