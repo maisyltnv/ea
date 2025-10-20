@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| EMA50/EMA200 Strategy EA                                         |
+//| EMA9 with Trailing Stop Strategy EA                              |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
@@ -22,8 +22,8 @@ input int EndHour = 23;              // ເວລາສິ້ນສຸດເທ�
 input int BangkokGMTOffset = 7;      // Bangkok = GMT+7
 
 // Daily loss limit settings
-input bool UseDailyLossLimit = true; // ເປີດ/ປິດການຈຳກັດການຂາດທຶນຕໍ່ວັນ
-input int MaxDailySLHits = 2;        // ຈຳນວນຄັ້ງທີ່ຖືກ SL ສູງສຸດຕໍ່ວັນ
+input bool UseDailyLossLimit = false; // ເປີດ/ປິດການຈຳກັດການຂາດທຶນຕໍ່ວັນ
+input int MaxDailySLHits = 20;       // ຈຳນວນຄັ້ງທີ່ຖືກ SL ສູງສຸດຕໍ່ວັນ
 
 // Global Variables
 CTrade trade;
@@ -391,8 +391,6 @@ void OnTick()
       return;
    }
    
-   if(!IsNewBar()) return;
-   
    // ກວດສອບວ່າຖືກ SL ເກີນກຳນົດແລ້ວບໍ່
    if(!CanTradeToday()) return;
    
@@ -429,10 +427,12 @@ void OnTick()
          Print("BUY order failed - Error: ", trade.ResultRetcode());
       }
    }
+   
    // SELL Signal: ລາຄາຢູ່ລຸ່ມ EMA9 ຫຼາຍກວ່າ 20- ຈຸດ
-   else if(buyDistance < -20)
+   double sellDistance = (ema9 - bid) / point;
+   if(sellDistance > 20)
    {
-      Print("SELL Signal: ລາຄາຢູ່ລຸ່ມ EMA9 ", (int)MathAbs(buyDistance), " ຈຸດ");
+      Print("SELL Signal: ລາຄາຢູ່ລຸ່ມ EMA9 ", (int)sellDistance, " ຈຸດ");
       Print("Bid: ", bid, ", EMA9: ", ema9);
       
       double sl = bid + SL_Points * point;
