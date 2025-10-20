@@ -18,6 +18,8 @@ input int    SwingSLBufferPoints = 50; // Buffer points added to swing SL (Buy: 
 input int    BreakevenTriggerPoints = 200; // Move SL to BE when profit >= this (points)
 input int    BreakevenOffsetPoints  = 10;  // Offset from BE in points (+ for buy, - for sell)
 input int    TrailTriggerPoints     = 500; // Start EMA9 trailing when profit >= this (points)
+input int    TakeProfitPoints       = 500; // Fixed TP distance in points
+input int    DailyProfitLimitPoints = 1000; // Stop new entries when today's net profit reaches this (points)
 
 //--- Global variables
 int ema_handle;
@@ -27,6 +29,7 @@ double current_ema = 0;
 //--- Helper forward declarations
 double GetRecentSwingLow(int lookbackBars);
 double GetRecentSwingHigh(int lookbackBars);
+double GetTodayNetProfitPoints();
 
 //+------------------------------------------------------------------+
 //| Find recent swing low over lookback bars                         |
@@ -62,6 +65,63 @@ double GetRecentSwingHigh(int lookbackBars)
             swingHigh = highBuffer[i];
     }
     return swingHigh;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate today's net profit in points for this symbol/magic     |
+//+------------------------------------------------------------------+
+double GetTodayNetProfitPoints()
+{
+    datetime from, to;
+    MqlDateTime dt;
+    TimeToStruct(TimeCurrent(), dt);
+    dt.hour = 0; dt.min = 0; dt.sec = 0;
+    from = StructToTime(dt);
+    to = TimeCurrent();
+
+    if(!HistorySelect(from, to))
+        return 0.0;
+
+    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double netPoints = 0.0;
+
+    uint deals = HistoryDealsTotal();
+    for(uint i = 0; i < deals; i++)
+    {
+        ulong dealTicket = HistoryDealGetTicket(i);
+        if(dealTicket == 0)
+            continue;
+
+        string sym = (string)HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+        long magic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+        int type = (int)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+
+        if(sym != _Symbol || magic != MagicNumber)
+            continue;
+
+        // Consider only closed position results (DEAL_PROFIT and DEAL_SWAP, DEAL_COMMISSION reflected in profit)
+        double profitCurrency = HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+        // Convert currency profit to approximate points using tick value if available
+        double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+        double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+
+        // Estimate points from profit: points = profit / (tickValue * volume) / (1/point)
+        double tickValue = 0.0;
+        double tickSize = 0.0;
+        SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE, tickValue);
+        SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE, tickSize);
+        if(tickValue > 0.0 && tickSize > 0.0 && volume > 0.0)
+        {
+            double pointsFromProfit = (profitCurrency / (tickValue * volume)) * (tickSize / point);
+            netPoints += pointsFromProfit;
+        }
+        else
+        {
+            // Fallback: skip if cannot compute reliably
+        }
+    }
+
+    return netPoints;
 }
 
 //+------------------------------------------------------------------+
@@ -148,6 +208,14 @@ void CheckTradingConditions(double current_price)
         return;
     }
     
+    // Stop opening new trades if daily profit limit reached
+    if(DailyProfitLimitPoints > 0)
+    {
+        double todayPoints = GetTodayNetProfitPoints();
+        if(todayPoints >= DailyProfitLimitPoints)
+            return;
+    }
+    
     // Buy condition: Price above EMA 9
     if(current_price > current_ema)
     {
@@ -192,7 +260,8 @@ void OpenBuyOrder(double current_price)
     double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     double buffer = SwingSLBufferPoints * point;
     request.sl = swingLow > 0.0 ? swingLow + buffer : 0.0;
-    request.tp = 0;            // No Take Profit
+    // Fixed TP in points from entry price
+    request.tp = request.price + (TakeProfitPoints * point);
     request.deviation = Slippage;
     request.magic = MagicNumber;
     request.comment = "EMA9 Buy";
@@ -234,7 +303,8 @@ void OpenSellOrder(double current_price)
     double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
     double buffer = SwingSLBufferPoints * point;
     request.sl = swingHigh > 0.0 ? swingHigh - buffer : 0.0;
-    request.tp = 0;            // No Take Profit
+    // Fixed TP in points from entry price
+    request.tp = request.price - (TakeProfitPoints * point);
     request.deviation = Slippage;
     request.magic = MagicNumber;
     request.comment = "EMA9 Sell";
