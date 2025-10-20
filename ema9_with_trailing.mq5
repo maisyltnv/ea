@@ -5,20 +5,15 @@
 #include <Trade/Trade.mqh>
 
 // Input Parameters
-input double Lots = 0.10;
-input int SL_Points = 500;
-input int TP_Points = 1000;
-input int EMA26_Period = 26;
-input int EMA50_Period = 50;
-input int EMA200_Period = 200;
-input int Stoch_K = 9;
-input int Stoch_D = 3;
-input int Stoch_Slowing = 3;
+input double Lots = 0.01;
+input int SL_Points = 200;
+input int EMA9_Period = 9;
 input ulong Magic = 123456;
 
 // Lock-after-profit settings
 input int ProfitTriggerPoints = 200; // ຍ້າຍ SL ເມື່ອກຳໄລ ≥ 200 ຈຸດ
 input int LockPoints = 20;           // ຍ້າຍ SL ໄປ entry ± 20 ຈຸດ
+input int TrailingStartPoints = 500; // ເລີ່ມ trailing stop ເມື່ອກຳໄລ ≥ 500 ຈຸດ
 
 // Time filter settings (Bangkok timezone = GMT+7)
 input bool UseTimeFilter = true;     // ເປີດ/ປິດການກັ່ນຕອງເວລາ
@@ -32,9 +27,10 @@ input int MaxDailySLHits = 2;        // ຈຳນວນຄັ້ງທີ່ຖ�
 
 // Global Variables
 CTrade trade;
-int hEMA26, hEMA50, hEMA200, hStoch;
+int hEMA9;
 datetime lastBarTime = 0;
 bool slLocked = false; // ຕິດຕາມວ່າ SL ຖືກຍ້າຍແລ້ວຫຼືຍັງ
+bool trailingActive = false; // ຕິດຕາມວ່າ trailing stop ເປີດແລ້ວຫຼືຍັງ
 
 // Daily loss tracking
 int dailySLHitCount = 0;      // ນັບຈຳນວນຄັ້ງທີ່ຖືກ SL ໃນວັນນີ້
@@ -57,38 +53,19 @@ bool IsNewBar()
 }
 
 //+------------------------------------------------------------------+
-//| Get EMA values                                                   |
+//| Get EMA9 value                                                   |
 //+------------------------------------------------------------------+
-bool GetEMAValues(double &ema26, double &ema50, double &ema200)
+bool GetEMA9Value(double &ema9)
 {
-   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE) return false;
+   if(hEMA9 == INVALID_HANDLE) return false;
    
-   double ema26_buf[1], ema50_buf[1], ema200_buf[1];
-   if(CopyBuffer(hEMA26, 0, 1, 1, ema26_buf) != 1) return false;
-   if(CopyBuffer(hEMA50, 0, 1, 1, ema50_buf) != 1) return false;
-   if(CopyBuffer(hEMA200, 0, 1, 1, ema200_buf) != 1) return false;
+   double ema9_buf[1];
+   if(CopyBuffer(hEMA9, 0, 1, 1, ema9_buf) != 1) return false;
    
-   ema26 = ema26_buf[0];
-   ema50 = ema50_buf[0];
-   ema200 = ema200_buf[0];
+   ema9 = ema9_buf[0];
    return true;
 }
 
-//+------------------------------------------------------------------+
-//| Get Stochastic values                                            |
-//+------------------------------------------------------------------+
-bool GetStochValues(double &stoch_main, double &stoch_signal)
-{
-   if(hStoch == INVALID_HANDLE) return false;
-   
-   double stoch_main_buf[1], stoch_signal_buf[1];
-   if(CopyBuffer(hStoch, 0, 1, 1, stoch_main_buf) != 1) return false;
-   if(CopyBuffer(hStoch, 1, 1, 1, stoch_signal_buf) != 1) return false;
-   
-   stoch_main = stoch_main_buf[0];
-   stoch_signal = stoch_signal_buf[0];
-   return true;
-}
 
 //+------------------------------------------------------------------+
 //| Check and reset daily SL hit counter if new day                 |
@@ -239,14 +216,11 @@ bool IsWithinTradingHours()
 }
 
 //+------------------------------------------------------------------+
-//| Manage Lock After Profit                                         |
+//| Manage Lock After Profit and Trailing Stop                      |
 //+------------------------------------------------------------------+
 void ManageLockAfterProfit()
 {
    if(!PositionSelect(_Symbol)) return;
-   
-   // ຖ້າ SL ຖືກຍ້າຍແລ້ວ, ບໍ່ຕ້ອງກວດອີກ
-   if(slLocked) return;
    
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -265,8 +239,40 @@ void ManageLockAfterProfit()
    else if(type == POSITION_TYPE_SELL)
       profitPoints = (openPrice - ask) / point;
    
-   // ຖ້າກຳໄລ ≥ 200 ຈຸດ, ຍ້າຍ SL
-   if(profitPoints >= ProfitTriggerPoints)
+   // ຖ້າກຳໄລ ≥ 500 ຈຸດ, ເລີ່ມ trailing stop ທີ່ EMA9
+   if(profitPoints >= TrailingStartPoints && !trailingActive)
+   {
+      double ema9;
+      if(GetEMA9Value(ema9))
+      {
+         double newSL = 0.0;
+         
+         if(type == POSITION_TYPE_BUY)
+         {
+            newSL = ema9;
+            newSL = NormalizeDouble(newSL, digits);
+            
+            if(trade.PositionModify(_Symbol, newSL, currentTP))
+            {
+               Print("BUY: ເລີ່ມ Trailing Stop ທີ່ EMA9 @ ", newSL, " (ກຳໄລ: ", (int)profitPoints, " ຈຸດ)");
+               trailingActive = true;
+            }
+         }
+         else if(type == POSITION_TYPE_SELL)
+         {
+            newSL = ema9;
+            newSL = NormalizeDouble(newSL, digits);
+            
+            if(trade.PositionModify(_Symbol, newSL, currentTP))
+            {
+               Print("SELL: ເລີ່ມ Trailing Stop ທີ່ EMA9 @ ", newSL, " (ກຳໄລ: ", (int)profitPoints, " ຈຸດ)");
+               trailingActive = true;
+            }
+         }
+      }
+   }
+   // ຖ້າກຳໄລ ≥ 200 ຈຸດ ແລະ ຍັງບໍ່ໄດ້ trailing, ຍ້າຍ SL ໄປ entry ± 20 ຈຸດ
+   else if(profitPoints >= ProfitTriggerPoints && !slLocked && !trailingActive)
    {
       double newSL = 0.0;
       
@@ -281,10 +287,6 @@ void ManageLockAfterProfit()
             Print("BUY: SL ຍ້າຍໄປ entry +", LockPoints, " ຈຸດ @ ", newSL, " (ກຳໄລ: ", (int)profitPoints, " ຈຸດ)");
             slLocked = true;
          }
-         else
-         {
-            Print("BUY: ຍ້າຍ SL ບໍ່ສຳເລັດ. Retcode=", trade.ResultRetcode());
-         }
       }
       else if(type == POSITION_TYPE_SELL)
       {
@@ -297,9 +299,29 @@ void ManageLockAfterProfit()
             Print("SELL: SL ຍ້າຍໄປ entry -", LockPoints, " ຈຸດ @ ", newSL, " (ກຳໄລ: ", (int)profitPoints, " ຈຸດ)");
             slLocked = true;
          }
-         else
+      }
+   }
+   // ຖ້າ trailing active, ອັບເດດ SL ຕາມ EMA9
+   else if(trailingActive)
+   {
+      double ema9;
+      if(GetEMA9Value(ema9))
+      {
+         double newSL = NormalizeDouble(ema9, digits);
+         
+         // ກວດສອບວ່າຕ້ອງອັບເດດ SL ບໍ່
+         bool needUpdate = false;
+         if(type == POSITION_TYPE_BUY && newSL > currentSL)
+            needUpdate = true;
+         else if(type == POSITION_TYPE_SELL && newSL < currentSL)
+            needUpdate = true;
+         
+         if(needUpdate)
          {
-            Print("SELL: ຍ້າຍ SL ບໍ່ສຳເລັດ. Retcode=", trade.ResultRetcode());
+            if(trade.PositionModify(_Symbol, newSL, currentTP))
+            {
+               Print("Trailing Stop ອັບເດດ: ", newSL, " (EMA9)");
+            }
          }
       }
    }
@@ -312,27 +334,23 @@ int OnInit()
 {
    trade.SetExpertMagicNumber(Magic);
    
-   // Create EMA indicators
-   hEMA26 = iMA(_Symbol, PERIOD_CURRENT, EMA26_Period, 0, MODE_EMA, PRICE_CLOSE);
-   hEMA50 = iMA(_Symbol, PERIOD_CURRENT, EMA50_Period, 0, MODE_EMA, PRICE_CLOSE);
-   hEMA200 = iMA(_Symbol, PERIOD_CURRENT, EMA200_Period, 0, MODE_EMA, PRICE_CLOSE);
+   // Create EMA9 indicator
+   hEMA9 = iMA(_Symbol, PERIOD_CURRENT, EMA9_Period, 0, MODE_EMA, PRICE_CLOSE);
    
-   // Create Stochastic indicator
-   hStoch = iStochastic(_Symbol, PERIOD_CURRENT, Stoch_K, Stoch_D, Stoch_Slowing, MODE_SMA, STO_LOWHIGH);
-   
-   if(hEMA26 == INVALID_HANDLE || hEMA50 == INVALID_HANDLE || hEMA200 == INVALID_HANDLE || hStoch == INVALID_HANDLE)
+   if(hEMA9 == INVALID_HANDLE)
    {
-      Print("Failed to create indicator handles");
+      Print("Failed to create EMA9 indicator handle");
       return INIT_FAILED;
    }
    
    datetime t[1];
    if(CopyTime(_Symbol, PERIOD_CURRENT, 0, 1, t) == 1) lastBarTime = t[0];
    
-   Print("EMA50/EMA200 Strategy EA initialized");
-   Print("EMA50: ", EMA50_Period, ", EMA200: ", EMA200_Period);
-   Print("SL: ", SL_Points, ", TP: ", TP_Points, " points");
+   Print("EMA9 Strategy EA initialized");
+   Print("EMA9: ", EMA9_Period, " periods");
+   Print("Lots: ", Lots, ", SL: ", SL_Points, " points");
    Print("Lock SL: ກຳໄລ ≥ ", ProfitTriggerPoints, " ຈຸດ → ຍ້າຍໄປ entry ± ", LockPoints, " ຈຸດ");
+   Print("Trailing Stop: ກຳໄລ ≥ ", TrailingStartPoints, " ຈຸດ → trailing ທີ່ EMA9");
    
    if(UseTimeFilter)
       Print("Time Filter: ເທຣດພຽງ ", StartHour, ":00 - ", EndHour, ":00 (Bangkok GMT+7)");
@@ -355,10 +373,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(hEMA26 != INVALID_HANDLE) IndicatorRelease(hEMA26);
-   if(hEMA50 != INVALID_HANDLE) IndicatorRelease(hEMA50);
-   if(hEMA200 != INVALID_HANDLE) IndicatorRelease(hEMA200);
-   if(hStoch != INVALID_HANDLE) IndicatorRelease(hStoch);
+   if(hEMA9 != INVALID_HANDLE) IndicatorRelease(hEMA9);
 }
 
 //+------------------------------------------------------------------+
@@ -384,63 +399,55 @@ void OnTick()
    // ກວດສອບເວລາກ່ອນຊອກຫາສັນຍານໃໝ່
    if(!IsWithinTradingHours()) return;
    
-   // Get indicator values
-   double ema26, ema50, ema200;
-   if(!GetEMAValues(ema26, ema50, ema200)) return;
+   // Get EMA9 value
+   double ema9;
+   if(!GetEMA9Value(ema9)) return;
    
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    
-   // BUY Signal: ເງື່ອນໄຂໃໝ່ (ບໍ່ໃຊ້ Stochastic)
-   // 1. EMA50 ຢູ່ເທິງ EMA200 (uptrend)
-   // 2. ລາຄາຢູ່ເທິງ EMA50
-   if(ema50 > ema200 && ask > ema50)
+   // BUY Signal: ລາຄາຢູ່ເທິງ EMA9 ຫຼາຍກວ່າ 20+ ຈຸດ
+   double buyDistance = (ask - ema9) / point;
+   if(buyDistance > 20)
    {
-      Print("BUY Signal: EMA50 > EMA200 (Uptrend), Price above EMA50");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
-      Print("Ask: ", ask);
+      Print("BUY Signal: ລາຄາຢູ່ເທິງ EMA9 ", (int)buyDistance, " ຈຸດ");
+      Print("Ask: ", ask, ", EMA9: ", ema9);
       
       double sl = ask - SL_Points * point;
-      double tp = ask + TP_Points * point;
-      
       sl = NormalizeDouble(sl, digits);
-      tp = NormalizeDouble(tp, digits);
       
-      if(trade.Buy(Lots, _Symbol, ask, sl, tp, "EMA50/200 + Stoch Buy"))
+      if(trade.Buy(Lots, _Symbol, ask, sl, 0, "EMA9 Buy"))
       {
-         Print("BUY order opened - Entry: ", ask, ", SL: ", sl, ", TP: ", tp);
-         slLocked = false; // Reset flag for new position
+         Print("BUY order opened - Entry: ", ask, ", SL: ", sl);
+         slLocked = false; // Reset flags for new position
+         trailingActive = false;
       }
       else
       {
          Print("BUY order failed - Error: ", trade.ResultRetcode());
       }
    }
-   // SELL Signal: ເງື່ອນໄຂໃໝ່ (ບໍ່ໃຊ້ Stochastic)
-   // 1. EMA50 ຢູ່ລຸ່ມ EMA200 (downtrend)
-   // 2. ລາຄາຢູ່ລຸ່ມ EMA50
-   else if(ema50 < ema200 && bid < ema50)
+   // SELL Signal: ລາຄາຢູ່ລຸ່ມ EMA9 ຫຼາຍກວ່າ 20- ຈຸດ
+   else if(buyDistance < -20)
    {
-      Print("SELL Signal: EMA50 < EMA200 (Downtrend), Price below EMA50");
-      Print("EMA26: ", ema26, ", EMA50: ", ema50, ", EMA200: ", ema200);
-      Print("Bid: ", bid);
+      Print("SELL Signal: ລາຄາຢູ່ລຸ່ມ EMA9 ", (int)MathAbs(buyDistance), " ຈຸດ");
+      Print("Bid: ", bid, ", EMA9: ", ema9);
       
       double sl = bid + SL_Points * point;
-      double tp = bid - TP_Points * point;
-      
       sl = NormalizeDouble(sl, digits);
-      tp = NormalizeDouble(tp, digits);
       
-      if(trade.Sell(Lots, _Symbol, bid, sl, tp, "EMA50/200 + Stoch Sell"))
+      if(trade.Sell(Lots, _Symbol, bid, sl, 0, "EMA9 Sell"))
       {
-         Print("SELL order opened - Entry: ", bid, ", SL: ", sl, ", TP: ", tp);
-         slLocked = false; // Reset flag for new position
+         Print("SELL order opened - Entry: ", bid, ", SL: ", sl);
+         slLocked = false; // Reset flags for new position
+         trailingActive = false;
       }
       else
       {
          Print("SELL order failed - Error: ", trade.ResultRetcode());
       }
    }
+   
 }
