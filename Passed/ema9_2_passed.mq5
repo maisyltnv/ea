@@ -14,7 +14,6 @@ input int    EMA_Period = 9;         // EMA period
 input int    Slippage = 3;            // Slippage
 input bool   TradeOnNewBar = true;    // Trade only on new bar
 input int    SwingLookbackBars = 10;  // Bars to look back for swing high/low
-input int    SwingSLBufferPoints = 50; // Buffer points added to swing SL (Buy: +50, Sell: -50)
 input int    BreakevenTriggerPoints = 200; // Move SL to BE when profit >= this (points)
 input int    BreakevenOffsetPoints  = 10;  // Offset from BE in points (+ for buy, - for sell)
 input int    TrailTriggerPoints     = 500; // Start EMA9 trailing when profit >= this (points)
@@ -187,11 +186,9 @@ void OpenBuyOrder(double current_price)
     request.volume = LotSize;
     request.type = ORDER_TYPE_BUY;
     request.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-    // Initial SL at recent swing low + buffer
+    // Initial SL at recent swing low
     double swingLow = GetRecentSwingLow(SwingLookbackBars);
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double buffer = SwingSLBufferPoints * point;
-    request.sl = swingLow > 0.0 ? swingLow + buffer : 0.0;
+    request.sl = swingLow > 0.0 ? swingLow : 0.0;
     request.tp = 0;            // No Take Profit
     request.deviation = Slippage;
     request.magic = MagicNumber;
@@ -229,11 +226,9 @@ void OpenSellOrder(double current_price)
     request.volume = LotSize;
     request.type = ORDER_TYPE_SELL;
     request.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-    // Initial SL at recent swing high - buffer
+    // Initial SL at recent swing high
     double swingHigh = GetRecentSwingHigh(SwingLookbackBars);
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double buffer = SwingSLBufferPoints * point;
-    request.sl = swingHigh > 0.0 ? swingHigh - buffer : 0.0;
+    request.sl = swingHigh > 0.0 ? swingHigh : 0.0;
     request.tp = 0;            // No Take Profit
     request.deviation = Slippage;
     request.magic = MagicNumber;
