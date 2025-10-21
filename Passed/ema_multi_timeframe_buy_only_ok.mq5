@@ -21,6 +21,7 @@ input int Profit_500_Points = 500;              // Threshold #1 (points)
 input int SL_Move_Buffer = 20;                  // Move-to-BE buffer (points)
 input int TP_Points = 1500;                     // Take Profit in points
 input int Max_Daily_Profit = 1500;              // Max daily profit in points
+input int Max_Daily_SL = 5;                     // Max daily stop losses
 input int Magic_Number = 123456;                // Magic
 
 //--- Global handles/buffers
@@ -32,6 +33,7 @@ double m5_ema50_buffer[], m5_ema100_buffer[], m5_ema200_buffer[];
 
 double entry_price = 0.0;
 double daily_profit = 0.0;
+int daily_sl_count = 0;
 datetime last_trade_date = 0;
 bool trading_allowed_today = true;
 
@@ -142,6 +144,13 @@ void OnTick()
       return;
    }
    
+   // Check if daily SL limit reached
+   if(daily_sl_count >= Max_Daily_SL)
+   {
+      trading_allowed_today = false;
+      Print("Daily SL limit reached: ", daily_sl_count, " stop losses");
+      return;
+   }
 
    // If we already have a position on this symbol (any magic), manage it
    if(PositionSelect(_Symbol))
@@ -287,6 +296,7 @@ void CheckNewDay()
    {
       last_trade_date = current_date;
       daily_profit = 0.0;
+      daily_sl_count = 0;
       trading_allowed_today = true;
       Print("New trading day started: ", TimeToString(current_time, TIME_DATE));
    }
@@ -336,6 +346,19 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          {
             daily_profit += profit;
             Print("Position closed. Profit: ", profit, " Daily total: ", daily_profit);
+            
+            // Check if it was a stop loss
+            if(profit < 0)
+            {
+               daily_sl_count++;
+               Print("Stop loss hit! Daily SL count: ", daily_sl_count);
+               
+               if(daily_sl_count >= Max_Daily_SL)
+               {
+                  trading_allowed_today = false;
+                  Print("Trading stopped for today due to SL limit reached: ", daily_sl_count);
+               }
+            }
             
             if(daily_profit >= Max_Daily_Profit * _Point * LotSize * 100000)
             {
