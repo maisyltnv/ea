@@ -1,5 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                    ema_martingale_strategy.mq5   |
+//|                                    ໃຊ້ໄດ້ຕອນທີກຣາຟເປັນເທຣນ   |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
@@ -27,7 +28,6 @@ int lot_sequence_index = 0;                        // Index for lot sequence
 int daily_sl_count = 0;                            // Daily SL count
 datetime last_trade_date = 0;                      // Last trade date
 bool trading_allowed_today = true;                 // Trading allowed today flag
-datetime last_processed_deal_time = 0;            // Last processed deal time for safety sync
 
 //--- Martingale lot sequence as specified
 double martingale_lots[] = {0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.11, 0.14, 0.19, 0.26};
@@ -60,7 +60,7 @@ int OnInit()
    ArraySetAsSeries(ema200_buffer, true);
 
    // Initialize current lot size
-   current_lot_size = martingale_lots[0];  // Start with first lot size from martingale sequence (0.01)
+   current_lot_size = InitialLotSize;
    lot_sequence_index = 0;
 
    Print("EMA Martingale Strategy EA initialized successfully");
@@ -93,9 +93,6 @@ void OnTick()
 {
    // Check if new day started
    CheckNewDay();
-   
-   // Safety: sync lot progression from the latest closed deal (handles race conditions)
-   SyncLotProgressionFromHistory();
    
    // Check if trading is allowed today
    if(!trading_allowed_today)
@@ -262,18 +259,15 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          {
             Print("Position closed. Profit: ", DoubleToString(profit, 2));
             
-            // Determine close reason explicitly (TP/SL) to drive lot progression
-            int deal_reason = (int)HistoryDealGetInteger(trans.deal, DEAL_REASON);
-            datetime deal_time = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
-
-            if(deal_reason == DEAL_REASON_SL)
+            // Check if it was a loss (SL hit)
+            if(profit < 0)
             {
                daily_sl_count++;
                Print("SL hit! Daily SL count: ", daily_sl_count, "/", Max_Daily_SL_Count);
-
+               
                // Move to next lot size in martingale sequence
                lot_sequence_index++;
-
+               
                if(lot_sequence_index < ArraySize(martingale_lots))
                {
                   current_lot_size = martingale_lots[lot_sequence_index];
@@ -286,7 +280,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                   current_lot_size = martingale_lots[0];
                   Print("Reached end of martingale sequence. Reset to first lot size: ", current_lot_size);
                }
-
+               
                // Stop trading if SL limit reached
                if(daily_sl_count >= Max_Daily_SL_Count)
                {
@@ -294,74 +288,15 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                   Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
                }
             }
-            else if(deal_reason == DEAL_REASON_TP)
+            // If it was a profit (TP hit), reset lot sequence and continue trading
+            else if(profit > 0)
             {
-               // Reset to start of martingale sequence on TP
-               lot_sequence_index = 0;
-               current_lot_size = martingale_lots[0];
+               lot_sequence_index = 0;  // Reset lot sequence index to start from 0.01
+               current_lot_size = InitialLotSize;  // Reset lot size to 0.01
                Print("TP hit! Lot sequence reset to initial size: ", current_lot_size, ". Continuing trading...");
             }
-
-            // Remember last processed deal time
-            last_processed_deal_time = deal_time;
          }
       }
-   }
-}
-//+------------------------------------------------------------------+
-//| Sync lot progression by inspecting latest closed deal            |
-//+------------------------------------------------------------------+
-void SyncLotProgressionFromHistory()
-{
-   // Only run when there is no open position; otherwise live management applies
-   if(PositionSelect(_Symbol) && PositionGetInteger(POSITION_MAGIC) == Magic_Number)
-      return;
-
-   int deals_total = (int)HistoryDealsTotal();
-   if(deals_total <= 0)
-      return;
-
-   // Scan back for the most recent OUT deal with our magic
-   for(int i = deals_total - 1; i >= 0; --i)
-   {
-      ulong deal_ticket = HistoryDealGetTicket(i);
-      if(!HistoryDealSelect(deal_ticket))
-         continue;
-
-      long magic = HistoryDealGetInteger(deal_ticket, DEAL_MAGIC);
-      if(magic != Magic_Number)
-         continue;
-
-      ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal_ticket, DEAL_ENTRY);
-      if(entry != DEAL_ENTRY_OUT)
-         continue;
-
-      datetime dtime = (datetime)HistoryDealGetInteger(deal_ticket, DEAL_TIME);
-      if(dtime <= last_processed_deal_time)
-         return; // already handled
-
-      int reason = (int)HistoryDealGetInteger(deal_ticket, DEAL_REASON);
-      if(reason == DEAL_REASON_TP)
-      {
-         lot_sequence_index = 0;
-         current_lot_size = martingale_lots[0];
-         Print("[Sync] TP detected from history. Reset to ", current_lot_size);
-      }
-      else if(reason == DEAL_REASON_SL)
-      {
-         lot_sequence_index++;
-         if(lot_sequence_index < ArraySize(martingale_lots))
-            current_lot_size = martingale_lots[lot_sequence_index];
-         else
-         {
-            lot_sequence_index = 0;
-            current_lot_size = martingale_lots[0];
-         }
-         Print("[Sync] SL detected from history. Next lot ", current_lot_size, " (idx ", lot_sequence_index, ")");
-      }
-
-      last_processed_deal_time = dtime;
-      return;
    }
 }
 
