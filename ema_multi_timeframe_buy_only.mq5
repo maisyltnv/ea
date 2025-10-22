@@ -17,10 +17,10 @@ input int M5_EMA100_Period = 100;               // M5 EMA 100 period
 input int M5_EMA200_Period = 200;               // M5 EMA 200 period
 input int SwingBars = 30;                       // Bars to look back for swing low
 input int SL_Buffer_Points = 100;               // Additional points for SL
-input int Profit_500_Points = 500;              // Threshold #1 (points)
-input int SL_Move_Buffer = 20;                  // Move-to-BE buffer (points)
-input int TP_Points = 1500;                     // Take Profit in points
+// Removed trailing stop parameters - no longer needed
+input int TP_Points = 2000;                     // Take Profit in points
 input int Max_Daily_Profit = 1500;              // Max daily profit in points
+input int Max_Daily_SL_Count = 5;               // Max daily SL count before stopping
 input int Magic_Number = 123456;                // Magic
 
 //--- Global handles/buffers
@@ -30,8 +30,9 @@ int m5_ema50_handle, m5_ema100_handle, m5_ema200_handle;
 double m1_ema14_buffer[], m1_ema26_buffer[], m1_ema50_buffer[], m1_ema100_buffer[], m1_ema200_buffer[];
 double m5_ema50_buffer[], m5_ema100_buffer[], m5_ema200_buffer[];
 
-double entry_price = 0.0;
+// Removed entry_price - no longer needed for trailing stop
 double daily_profit = 0.0;
+int daily_sl_count = 0;
 datetime last_trade_date = 0;
 bool trading_allowed_today = true;
 
@@ -142,6 +143,14 @@ void OnTick()
       return;
    }
    
+   // Check if daily SL count limit reached
+   if(daily_sl_count >= Max_Daily_SL_Count)
+   {
+      trading_allowed_today = false;
+      Print("Daily SL limit reached: ", daily_sl_count, " SL hits");
+      return;
+   }
+   
 
    // If we already have a position on this symbol (any magic), manage it
    if(PositionSelect(_Symbol))
@@ -217,11 +226,6 @@ void OpenBuyOrder()
    if(OrderSend(request,result))
    {
       Print("Buy order opened: ", result.order);
-      // cache entry price for faster point math
-      if(PositionSelect(_Symbol))
-         entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
-      else
-         entry_price = ask;
    }
    else
    {
@@ -243,33 +247,11 @@ double GetSwingLow()
 //+------------------------------------------------------------------+
 void ManagePosition()
 {
-   // make sure we’re working with the current position
+   // make sure we're working with the current position
    if(!PositionSelect(_Symbol)) return;
-   if(!UpdateEMA_M1()) return; // refresh M1 EMA14 for trailing
 
-   ulong  ticket      = (ulong)PositionGetInteger(POSITION_TICKET);
-   double sl_current  = PositionGetDouble(POSITION_SL);
-   double open_price  = PositionGetDouble(POSITION_PRICE_OPEN);
-   double bid         = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   // keep local entry cache up to date
-   if(entry_price <= 0.0) entry_price = open_price;
-
-   // compute profit in POINTS (not money!)
-   int profit_pts = ProfitPointsForBuy(open_price);
-
-   // when profit >= 500 points -> move SL to BE + buffer and update TP
-   if(profit_pts >= Profit_500_Points)
-   {
-      double be_sl = entry_price + SL_Move_Buffer * _Point;
-      double new_tp = entry_price + TP_Points * _Point;
-      be_sl = ClampSLForBuy(be_sl);
-      if(be_sl > sl_current + (_Point*0.5)) // move only if improves
-      {
-         if(ModifyPosition(ticket, be_sl, new_tp))
-            Print("Moved SL to BE+", SL_Move_Buffer, " points: ", be_sl, " TP: ", new_tp);
-      }
-   }
+   // No trailing stop logic - just monitor position
+   // Position will be closed by TP or SL automatically
 }
 
 //+------------------------------------------------------------------+
@@ -287,6 +269,7 @@ void CheckNewDay()
    {
       last_trade_date = current_date;
       daily_profit = 0.0;
+      daily_sl_count = 0;
       trading_allowed_today = true;
       Print("New trading day started: ", TimeToString(current_time, TIME_DATE));
    }
@@ -337,10 +320,24 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             daily_profit += profit;
             Print("Position closed. Profit: ", profit, " Daily total: ", daily_profit);
             
+            // Check if it was a loss (SL hit)
+            if(profit < 0)
+            {
+               daily_sl_count++;
+               Print("SL hit! Daily SL count: ", daily_sl_count);
+            }
+            
+            // Stop trading if profit target reached
             if(daily_profit >= Max_Daily_Profit * _Point * LotSize * 100000)
             {
                trading_allowed_today = false;
                Print("Trading stopped for today due to profit limit reached");
+            }
+            // Stop trading if SL limit reached
+            else if(daily_sl_count >= Max_Daily_SL_Count)
+            {
+               trading_allowed_today = false;
+               Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
             }
          }
       }

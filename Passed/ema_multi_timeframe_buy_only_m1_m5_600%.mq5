@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//|                       ema_multi_timeframe_sell_only.mq5          |
+//|                       ema_multi_timeframe_buy_only.mq5           |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2024, MetaQuotes Software Corp."
 #property link      "https://www.mql5.com"
-#property version   "1.00"
+#property version   "1.01"   // <- bumped
 
 //--- Input parameters
 input double LotSize = 0.01;                    // Lot size
@@ -15,13 +15,13 @@ input int M1_EMA200_Period = 200;               // M1 EMA 200 period
 input int M5_EMA50_Period = 50;                 // M5 EMA 50 period
 input int M5_EMA100_Period = 100;               // M5 EMA 100 period
 input int M5_EMA200_Period = 200;               // M5 EMA 200 period
-input int SwingBars = 30;                       // Bars to look back for swing high
+input int SwingBars = 30;                       // Bars to look back for swing low
 input int SL_Buffer_Points = 100;               // Additional points for SL
-input int Profit_500_Points = 500;              // Threshold #1 (points)
-input int SL_Move_Buffer = 20;                  // Move-to-BE buffer (points)
-input int TP_Points = 1500;                     // Take Profit in points
+// Removed trailing stop parameters - no longer needed
+input int TP_Points = 2000;                     // Take Profit in points
 input int Max_Daily_Profit = 1500;              // Max daily profit in points
-input int Magic_Number = 123457;                // Magic (different from buy EA)
+input int Max_Daily_SL_Count = 5;               // Max daily SL count before stopping
+input int Magic_Number = 123456;                // Magic
 
 //--- Global handles/buffers
 int m1_ema14_handle, m1_ema26_handle, m1_ema50_handle, m1_ema100_handle, m1_ema200_handle;
@@ -30,8 +30,9 @@ int m5_ema50_handle, m5_ema100_handle, m5_ema200_handle;
 double m1_ema14_buffer[], m1_ema26_buffer[], m1_ema50_buffer[], m1_ema100_buffer[], m1_ema200_buffer[];
 double m5_ema50_buffer[], m5_ema100_buffer[], m5_ema200_buffer[];
 
-double entry_price = 0.0;
+// Removed entry_price - no longer needed for trailing stop
 double daily_profit = 0.0;
+int daily_sl_count = 0;
 datetime last_trade_date = 0;
 bool trading_allowed_today = true;
 
@@ -52,10 +53,10 @@ bool UpdateEMA_M5()
    if(CopyBuffer(m5_ema200_handle,0,0,1,m5_ema200_buffer) < 1) return false;
    return true;
 }
-int ProfitPointsForSell(double open_price)
+int ProfitPointsForBuy(double open_price)
 {
-   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
-   return (int)MathFloor( (open_price - ask) / _Point );
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   return (int)MathFloor( (bid - open_price) / _Point );
 }
 int MinStopDistancePoints() // broker stop/freeze guard
 {
@@ -63,12 +64,12 @@ int MinStopDistancePoints() // broker stop/freeze guard
    int freeze     = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    return MathMax(stop_level, freeze);
 }
-double ClampSLForSell(double desired_sl)
+double ClampSLForBuy(double desired_sl)
 {
-   double ask = SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol,SYMBOL_BID);
    int minDist = MinStopDistancePoints();
-   double minAllowedSL = ask + minDist * _Point; // for SELL SL must be > Ask + stop level
-   return MathMax(desired_sl, minAllowedSL);
+   double maxAllowedSL = bid - minDist * _Point; // for BUY SL must be < Bid - stop level
+   return MathMin(desired_sl, maxAllowedSL);
 }
 //-------------------------------------------------------------------
 
@@ -106,7 +107,7 @@ int OnInit()
    ArraySetAsSeries(m5_ema100_buffer,true);
    ArraySetAsSeries(m5_ema200_buffer,true);
 
-   Print("Multi-timeframe EMA Sell-Only EA initialized successfully");
+   Print("Multi-timeframe EMA Buy-Only EA initialized successfully");
    return INIT_SUCCEEDED;
 }
 
@@ -141,6 +142,15 @@ void OnTick()
       Print("Daily profit limit reached: ", daily_profit);
       return;
    }
+   
+   // Check if daily SL count limit reached
+   if(daily_sl_count >= Max_Daily_SL_Count)
+   {
+      trading_allowed_today = false;
+      Print("Daily SL limit reached: ", daily_sl_count, " SL hits");
+      return;
+   }
+   
 
    // If we already have a position on this symbol (any magic), manage it
    if(PositionSelect(_Symbol))
@@ -153,24 +163,22 @@ void OnTick()
    if(!UpdateEMA_M1() || !UpdateEMA_M5())
       return;
 
-   CheckSellSignal();
+   CheckBuySignal();
 }
 
 //+------------------------------------------------------------------+
 //| Entry logic                                                      |
 //+------------------------------------------------------------------+
-void CheckSellSignal()
+void CheckBuySignal()
 {
-   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double current_price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    double m5_ema50 = m5_ema50_buffer[0];
    double m5_ema100= m5_ema100_buffer[0];
    double m5_ema200= m5_ema200_buffer[0];
 
-   // SELL: Price must be BELOW EMA50 - 50 points
-   bool m5_price_condition = (current_price < m5_ema50 - 50*_Point);
-   // SELL: EMA50 < EMA100 < EMA200 (bearish trend)
-   bool m5_ema_condition   = (m5_ema50 < m5_ema100 && m5_ema100 < m5_ema200);
+   bool m5_price_condition = (current_price > m5_ema50 + 50*_Point);
+   bool m5_ema_condition   = (m5_ema50 > m5_ema100 && m5_ema100 > m5_ema200);
 
    double m1_ema14 = m1_ema14_buffer[0];
    double m1_ema26 = m1_ema26_buffer[0];
@@ -178,30 +186,28 @@ void CheckSellSignal()
    double m1_ema100= m1_ema100_buffer[0];
    double m1_ema200= m1_ema200_buffer[0];
 
-   // SELL: Price must be BELOW EMA14 - 50 points
-   bool m1_price_condition = (current_price < m1_ema14 - 50*_Point);
-   // SELL: EMA14 < EMA26 < EMA50 < EMA100 < EMA200 (perfect bearish alignment)
-   bool m1_ema_condition   = (m1_ema14 < m1_ema26 && m1_ema26 < m1_ema50 &&
-                              m1_ema50 < m1_ema100 && m1_ema100 < m1_ema200);
+   bool m1_price_condition = (current_price > m1_ema14 + 50*_Point);
+   bool m1_ema_condition   = (m1_ema14 > m1_ema26 && m1_ema26 > m1_ema50 &&
+                              m1_ema50 > m1_ema100 && m1_ema100 > m1_ema200);
 
    if(m5_price_condition && m5_ema_condition && m1_price_condition && m1_ema_condition)
-      OpenSellOrder();
+      OpenBuyOrder();
 }
 
 //+------------------------------------------------------------------+
-void OpenSellOrder()
+void OpenBuyOrder()
 {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
 
-   double swing_high = GetSwingHigh();
-   if(swing_high <= 0)
+   double swing_low = GetSwingLow();
+   if(swing_low <= 0)
    {
-      Print("Error: Could not calculate swing high");
+      Print("Error: Could not calculate swing low");
       return;
    }
 
-   double raw_sl = swing_high - SL_Buffer_Points*_Point; // keep your logic
-   double sl = ClampSLForSell(raw_sl);
+   double raw_sl = swing_low + SL_Buffer_Points*_Point; // keep your logic
+   double sl = ClampSLForBuy(raw_sl);
 
    MqlTradeRequest request={};
    MqlTradeResult  result={};
@@ -209,70 +215,43 @@ void OpenSellOrder()
    request.action   = TRADE_ACTION_DEAL;
    request.symbol   = _Symbol;
    request.volume   = LotSize;
-   request.type     = ORDER_TYPE_SELL;
-   request.price    = bid;
-   request.sl       = sl;
-   request.tp       = bid - TP_Points * _Point;
-   request.deviation= 10;
-   request.magic    = Magic_Number;
-   request.comment  = "Multi-EMA Sell Only";
+   request.type     = ORDER_TYPE_BUY;
+   request.price    = ask;
+    request.sl       = sl;
+    request.tp       = ask + TP_Points * _Point;
+    request.deviation= 10;
+    request.magic    = Magic_Number;
+    request.comment  = "Multi-EMA Buy Only";
 
    if(OrderSend(request,result))
    {
-      Print("Sell order opened: ", result.order);
-      // cache entry price for faster point math
-      if(PositionSelect(_Symbol))
-         entry_price = PositionGetDouble(POSITION_PRICE_OPEN);
-      else
-         entry_price = bid;
+      Print("Buy order opened: ", result.order);
    }
    else
    {
-      Print("Error opening sell order: ", result.retcode);
+      Print("Error opening buy order: ", result.retcode);
    }
 }
 
 //+------------------------------------------------------------------+
-double GetSwingHigh()
+double GetSwingLow()
 {
-   double highs[];
-   ArrayResize(highs, SwingBars);
-   if(CopyHigh(_Symbol, PERIOD_M1, 1, SwingBars, highs) < SwingBars) return 0.0;
-   return highs[ArrayMaximum(highs,0,SwingBars)];
+   double lows[];
+   ArrayResize(lows, SwingBars);
+   if(CopyLow(_Symbol, PERIOD_M1, 1, SwingBars, lows) < SwingBars) return 0.0;
+   return lows[ArrayMinimum(lows,0,SwingBars)];
 }
 
 //+------------------------------------------------------------------+
-//| Manage existing SELL position                                     |
+//| Manage existing BUY position                                     |
 //+------------------------------------------------------------------+
 void ManagePosition()
 {
    // make sure we're working with the current position
    if(!PositionSelect(_Symbol)) return;
-   if(!UpdateEMA_M1()) return; // refresh M1 EMA14 for trailing
 
-   ulong  ticket      = (ulong)PositionGetInteger(POSITION_TICKET);
-   double sl_current  = PositionGetDouble(POSITION_SL);
-   double open_price  = PositionGetDouble(POSITION_PRICE_OPEN);
-   double ask         = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   // keep local entry cache up to date
-   if(entry_price <= 0.0) entry_price = open_price;
-
-   // compute profit in POINTS (not money!)
-   int profit_pts = ProfitPointsForSell(open_price);
-
-   // when profit >= 500 points -> move SL to BE + buffer and update TP
-   if(profit_pts >= Profit_500_Points)
-   {
-      double be_sl = entry_price - SL_Move_Buffer * _Point;
-      double new_tp = entry_price - TP_Points * _Point;
-      be_sl = ClampSLForSell(be_sl);
-      if(be_sl < sl_current - (_Point*0.5)) // move only if improves
-      {
-         if(ModifyPosition(ticket, be_sl, new_tp))
-            Print("Moved SL to BE-", SL_Move_Buffer, " points: ", be_sl, " TP: ", new_tp);
-      }
-   }
+   // No trailing stop logic - just monitor position
+   // Position will be closed by TP or SL automatically
 }
 
 //+------------------------------------------------------------------+
@@ -290,6 +269,7 @@ void CheckNewDay()
    {
       last_trade_date = current_date;
       daily_profit = 0.0;
+      daily_sl_count = 0;
       trading_allowed_today = true;
       Print("New trading day started: ", TimeToString(current_time, TIME_DATE));
    }
@@ -340,10 +320,24 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             daily_profit += profit;
             Print("Position closed. Profit: ", profit, " Daily total: ", daily_profit);
             
+            // Check if it was a loss (SL hit)
+            if(profit < 0)
+            {
+               daily_sl_count++;
+               Print("SL hit! Daily SL count: ", daily_sl_count);
+            }
+            
+            // Stop trading if profit target reached
             if(daily_profit >= Max_Daily_Profit * _Point * LotSize * 100000)
             {
                trading_allowed_today = false;
                Print("Trading stopped for today due to profit limit reached");
+            }
+            // Stop trading if SL limit reached
+            else if(daily_sl_count >= Max_Daily_SL_Count)
+            {
+               trading_allowed_today = false;
+               Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
             }
          }
       }
