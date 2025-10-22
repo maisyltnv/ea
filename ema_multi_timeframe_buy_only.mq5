@@ -16,10 +16,10 @@ input int M5_EMA50_Period = 50;                 // M5 EMA 50 period
 input int M5_EMA100_Period = 100;               // M5 EMA 100 period
 input int M5_EMA200_Period = 200;               // M5 EMA 200 period
 input int SwingBars = 30;                       // Bars to look back for swing low
-input int SL_Buffer_Points = 100;               // Additional points for SL
+input int SL_Points = 500;                      // Stop Loss in points
 // Removed trailing stop parameters - no longer needed
 input int TP_Points = 2000;                     // Take Profit in points
-input int Max_Daily_SL_Count = 5;               // Max daily SL count before stopping
+input int Max_Daily_SL_Count = 10;              // Max daily SL count before stopping
 input int Magic_Number = 123456;                // Magic
 
 //--- Global handles/buffers
@@ -33,6 +33,8 @@ double m5_ema50_buffer[], m5_ema100_buffer[], m5_ema200_buffer[];
 int daily_sl_count = 0;
 datetime last_trade_date = 0;
 bool trading_allowed_today = true;
+double current_lot_size = LotSize;  // Current lot size for martingale
+int lot_sequence_index = 0;  // Index for Fibonacci lot sequence
 
 //-------------------------- helpers --------------------------------
 bool UpdateEMA_M1()
@@ -129,6 +131,18 @@ void OnTick()
    // Check if new day started
    CheckNewDay();
    
+   // Debug: Print current status
+   static datetime last_debug_time = 0;
+   if(TimeCurrent() - last_debug_time > 60) // Print every minute
+   {
+      Print("=== EA Status ===");
+      Print("Trading allowed today: ", trading_allowed_today);
+      Print("Daily SL count: ", daily_sl_count, "/", Max_Daily_SL_Count);
+      Print("Current lot size: ", current_lot_size);
+      Print("Lot sequence index: ", lot_sequence_index);
+      last_debug_time = TimeCurrent();
+   }
+   
    // Check if trading is allowed today
    if(!trading_allowed_today)
       return;
@@ -142,10 +156,16 @@ void OnTick()
    }
    
 
-   // If we already have a position on this symbol (any magic), manage it
+   // If we already have a position on this symbol with our magic number, manage it
    if(PositionSelect(_Symbol))
    {
-      ManagePosition();
+      if(PositionGetInteger(POSITION_MAGIC) == Magic_Number)
+      {
+         ManagePosition();
+         return;
+      }
+      // If position exists but not our magic number, don't trade
+      Print("Position exists with different magic number. Skipping...");
       return;
    }
 
@@ -180,8 +200,22 @@ void CheckBuySignal()
    bool m1_ema_condition   = (m1_ema14 > m1_ema26 && m1_ema26 > m1_ema50 &&
                               m1_ema50 > m1_ema100 && m1_ema100 > m1_ema200);
 
+   // Debug: Print all conditions for verification
+   Print("=== Entry Conditions Check ===");
+   Print("M5 Price > EMA50+50: ", m5_price_condition, " (Price: ", current_price, " vs EMA50+50: ", m5_ema50 + 50*_Point, ")");
+   Print("M5 EMA Alignment: ", m5_ema_condition, " (EMA50: ", m5_ema50, " > EMA100: ", m5_ema100, " > EMA200: ", m5_ema200, ")");
+   Print("M1 Price > EMA14+50: ", m1_price_condition, " (Price: ", current_price, " vs EMA14+50: ", m1_ema14 + 50*_Point, ")");
+   Print("M1 EMA Alignment: ", m1_ema_condition, " (EMA14: ", m1_ema14, " > EMA26: ", m1_ema26, " > EMA50: ", m1_ema50, " > EMA100: ", m1_ema100, " > EMA200: ", m1_ema200, ")");
+   
    if(m5_price_condition && m5_ema_condition && m1_price_condition && m1_ema_condition)
+   {
+      Print("All conditions met! Opening BUY order...");
       OpenBuyOrder();
+   }
+   else
+   {
+      Print("Entry conditions not met. Waiting...");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -196,15 +230,14 @@ void OpenBuyOrder()
       return;
    }
 
-   double raw_sl = swing_low + SL_Buffer_Points*_Point; // keep your logic
-   double sl = ClampSLForBuy(raw_sl);
+   double sl = ask - SL_Points * _Point;  // Fixed SL distance from entry price
 
    MqlTradeRequest request={};
    MqlTradeResult  result={};
 
    request.action   = TRADE_ACTION_DEAL;
    request.symbol   = _Symbol;
-   request.volume   = LotSize;
+   request.volume   = current_lot_size;
    request.type     = ORDER_TYPE_BUY;
    request.price    = ask;
     request.sl       = sl;
@@ -317,7 +350,14 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             if(profit < 0)
             {
                daily_sl_count++;
-               Print("SL hit! Daily SL count: ", daily_sl_count);
+               // Fibonacci lot sequence: 0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.11, 0.14, 0.19, 0.26
+               double fib_lots[] = {0.01, 0.02, 0.03, 0.04, 0.06, 0.08, 0.11, 0.14, 0.19, 0.26};
+               lot_sequence_index++;
+               if(lot_sequence_index < ArraySize(fib_lots))
+                  current_lot_size = fib_lots[lot_sequence_index];
+               else
+                  current_lot_size = fib_lots[ArraySize(fib_lots)-1];  // Use last value if exceeded
+               Print("SL hit! Daily SL count: ", daily_sl_count, " Next lot size: ", current_lot_size);
                
                // Stop trading if SL limit reached
                if(daily_sl_count >= Max_Daily_SL_Count)
@@ -326,11 +366,12 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                   Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
                }
             }
-            // If it was a profit (TP hit), stop trading for today
+            // If it was a profit (TP hit), reset lot sequence and continue trading
             else if(profit > 0)
             {
-               trading_allowed_today = false;
-               Print("TP hit! Trading stopped for today due to profit target reached");
+               lot_sequence_index = 0;  // Reset lot sequence index to start from 0.01
+               current_lot_size = LotSize;  // Reset lot size to 0.01
+               Print("TP hit! Lot sequence reset to 0.01. Continuing trading...");
             }
          }
       }
