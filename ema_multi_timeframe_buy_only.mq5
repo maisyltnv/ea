@@ -19,7 +19,6 @@ input int SwingBars = 30;                       // Bars to look back for swing l
 input int SL_Buffer_Points = 100;               // Additional points for SL
 // Removed trailing stop parameters - no longer needed
 input int TP_Points = 2000;                     // Take Profit in points
-input int Max_Daily_Profit = 1500;              // Max daily profit in points
 input int Max_Daily_SL_Count = 5;               // Max daily SL count before stopping
 input int Magic_Number = 123456;                // Magic
 
@@ -31,7 +30,6 @@ double m1_ema14_buffer[], m1_ema26_buffer[], m1_ema50_buffer[], m1_ema100_buffer
 double m5_ema50_buffer[], m5_ema100_buffer[], m5_ema200_buffer[];
 
 // Removed entry_price - no longer needed for trailing stop
-double daily_profit = 0.0;
 int daily_sl_count = 0;
 datetime last_trade_date = 0;
 bool trading_allowed_today = true;
@@ -134,14 +132,6 @@ void OnTick()
    // Check if trading is allowed today
    if(!trading_allowed_today)
       return;
-   
-   // Check if daily profit limit reached
-   if(daily_profit >= Max_Daily_Profit * _Point * LotSize * 100000)
-   {
-      trading_allowed_today = false;
-      Print("Daily profit limit reached: ", daily_profit);
-      return;
-   }
    
    // Check if daily SL count limit reached
    if(daily_sl_count >= Max_Daily_SL_Count)
@@ -268,7 +258,6 @@ void CheckNewDay()
    if(current_date != last_trade_date)
    {
       last_trade_date = current_date;
-      daily_profit = 0.0;
       daily_sl_count = 0;
       trading_allowed_today = true;
       Print("New trading day started: ", TimeToString(current_time, TIME_DATE));
@@ -312,32 +301,36 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    {
       if(HistoryDealSelect(trans.deal))
       {
+         // Only process deals from this EA (check magic number)
+         long deal_magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+         if(deal_magic != Magic_Number)
+            return;
+            
          double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
          ENUM_DEAL_ENTRY deal_entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
          
          if(deal_entry == DEAL_ENTRY_OUT)
          {
-            daily_profit += profit;
-            Print("Position closed. Profit: ", profit, " Daily total: ", daily_profit);
+            Print("Position closed. Profit: ", profit);
             
             // Check if it was a loss (SL hit)
             if(profit < 0)
             {
                daily_sl_count++;
                Print("SL hit! Daily SL count: ", daily_sl_count);
+               
+               // Stop trading if SL limit reached
+               if(daily_sl_count >= Max_Daily_SL_Count)
+               {
+                  trading_allowed_today = false;
+                  Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
+               }
             }
-            
-            // Stop trading if profit target reached
-            if(daily_profit >= Max_Daily_Profit * _Point * LotSize * 100000)
+            // If it was a profit (TP hit), stop trading for today
+            else if(profit > 0)
             {
                trading_allowed_today = false;
-               Print("Trading stopped for today due to profit limit reached");
-            }
-            // Stop trading if SL limit reached
-            else if(daily_sl_count >= Max_Daily_SL_Count)
-            {
-               trading_allowed_today = false;
-               Print("Trading stopped for today due to SL limit reached: ", daily_sl_count, " SL hits");
+               Print("TP hit! Trading stopped for today due to profit target reached");
             }
          }
       }
