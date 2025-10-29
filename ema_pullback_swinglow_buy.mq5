@@ -47,29 +47,35 @@ bool IsSpreadOk()
 
 void DeleteOurPendingOrders()
 {
-    for(int i=OrdersTotal()-1; i>=0; --i)
+    bool removed = true;
+    while(removed)
     {
-        ulong ticket = OrderGetTicket(i);
-        if(ticket==0) continue;
-        if(!OrderSelect(ticket)) continue;
-
-        string ord_symbol = "";
-        OrderGetString(ORDER_SYMBOL, ord_symbol);
-        if(ord_symbol != _Symbol) continue;
-
-        long ord_magic = 0;
-        OrderGetInteger(ORDER_MAGIC, ord_magic);
-        if(ord_magic != (long)InpMagicNumber) continue;
-
-        ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-        if(t==ORDER_TYPE_BUY_LIMIT || t==ORDER_TYPE_SELL_LIMIT || t==ORDER_TYPE_BUY_STOP || t==ORDER_TYPE_SELL_STOP || t==ORDER_TYPE_BUY_STOP_LIMIT || t==ORDER_TYPE_SELL_STOP_LIMIT)
+        removed = false;
+        for(int i=OrdersTotal()-1; i>=0; --i)
         {
-            MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
-            req.action = TRADE_ACTION_REMOVE;
-            req.order  = ticket;
-            req.symbol = _Symbol;
-            req.magic  = InpMagicNumber;
-            OrderSend(req, res);
+            ulong ticket = OrderGetTicket(i);
+            if(ticket==0) continue;
+            if(!OrderSelect(ticket)) continue;
+
+            string ord_symbol = "";
+            OrderGetString(ORDER_SYMBOL, ord_symbol);
+            if(ord_symbol != _Symbol) continue;
+
+            long ord_magic = 0;
+            OrderGetInteger(ORDER_MAGIC, ord_magic);
+            if(ord_magic != (long)InpMagicNumber) continue;
+
+            ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+            if(t==ORDER_TYPE_BUY_LIMIT || t==ORDER_TYPE_SELL_LIMIT || t==ORDER_TYPE_BUY_STOP || t==ORDER_TYPE_SELL_STOP || t==ORDER_TYPE_BUY_STOP_LIMIT || t==ORDER_TYPE_SELL_STOP_LIMIT)
+            {
+                MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+                req.action = TRADE_ACTION_REMOVE;
+                req.order  = ticket;
+                req.symbol = _Symbol;
+                req.magic  = InpMagicNumber;
+                if(OrderSend(req, res))
+                    removed = true;
+            }
         }
     }
 }
@@ -307,13 +313,8 @@ void OnTick()
 {
 	// Only operate on the chart symbol
 	if(_Symbol != g_symbol) return;
-	// Work only on new M1 bar to avoid spamming
-	static datetime lastBarTime = 0;
-	datetime curBar = iTime(_Symbol, InpTF_M1, 0);
-	if(curBar == lastBarTime) return;
-	lastBarTime = curBar;
 
-    // Management: if price exceeds shared TP, clear and re-arm
+	    // Management runs every tick: handle TP/SL/Case3 immediately
     if(g_setupActive)
     {
         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
@@ -321,24 +322,18 @@ void OnTick()
         if(bid >= g_sharedTP)
         {
             DeleteOurPendingOrders();
+            if(CountOurOrders() > 0) DeleteOurPendingOrders();
             CloseOurOpenPositions();
             g_setupActive = false;
-            if(CountOurOrders() == 0)
-            {
-                TryPlaceSetup();
-            }
             return;
         }
         // Case 2: Stop-loss breached
         if(bid <= g_sharedSL)
         {
             DeleteOurPendingOrders();
+            if(CountOurOrders() > 0) DeleteOurPendingOrders();
             CloseOurOpenPositions();
             g_setupActive = false;
-            if(CountOurOrders() == 0)
-            {
-                TryPlaceSetup();
-            }
             return;
         }
         // Case 3: more than two positions and price exceeds first entry by offset
@@ -358,23 +353,26 @@ void OnTick()
             if(bid >= trigger)
             {
                 DeleteOurPendingOrders();
+                if(CountOurOrders() > 0) DeleteOurPendingOrders();
                 CloseOurOpenPositions();
                 g_setupActive = false;
-                if(CountOurOrders() == 0)
-                {
-                    TryPlaceSetup();
-                }
                 return;
             }
         }
     }
 
-    // If nothing of ours is active anymore, look for a fresh setup
-    if(CountOurOrders() == 0)
-    {
-        TryPlaceSetup();
-        return;
-    }
+	// Only place or re-place new setups on new M1 bar to avoid spamming
+	static datetime lastBarTime = 0;
+	datetime curBar = iTime(_Symbol, InpTF_M1, 0);
+	if(curBar == lastBarTime) return;
+	lastBarTime = curBar;
+
+	// If nothing of ours is active anymore, look for a fresh setup
+	if(CountOurOrders() == 0)
+	{
+	    TryPlaceSetup();
+	    return;
+	}
 
 	TryPlaceSetup();
 }
