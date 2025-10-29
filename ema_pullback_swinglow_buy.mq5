@@ -26,17 +26,94 @@ input int    InpSLPoints                          = 1000;   // Stop Loss (points
 input int    InpTPPoints                          = 1000;   // Take Profit (points)
 input int    InpSwingLeftRight                    = 3;      // Swing low detection: bars left/right
 input int    InpLookbackBars                      = 50;     // Max bars to search for swing low
+input double InpLot4                              = 0.04;   // Fourth Buy Limit lot
+input int    InpCloseAllProfitOffsetPoints        = 200;    // Case3: close all when price exceeds first entry by X points
 
 //======================== Globals ========================
 string g_symbol;
 double g_point;
 int    g_digits;
+bool   g_setupActive = false;
+double g_sharedSL = 0.0;
+double g_sharedTP = 0.0;
+double g_firstEntry = 0.0;
 
 //======================== Utilities ========================
 bool IsSpreadOk()
 {
 	int spread_points = (int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
 	return spread_points <= InpMaxSpreadPoints;
+}
+
+void DeleteOurPendingOrders()
+{
+    for(int i=OrdersTotal()-1; i>=0; --i)
+    {
+        ulong ticket = OrderGetTicket(i);
+        if(ticket==0) continue;
+        if(!OrderSelect(ticket)) continue;
+
+        string ord_symbol = "";
+        OrderGetString(ORDER_SYMBOL, ord_symbol);
+        if(ord_symbol != _Symbol) continue;
+
+        long ord_magic = 0;
+        OrderGetInteger(ORDER_MAGIC, ord_magic);
+        if(ord_magic != (long)InpMagicNumber) continue;
+
+        ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+        if(t==ORDER_TYPE_BUY_LIMIT || t==ORDER_TYPE_SELL_LIMIT || t==ORDER_TYPE_BUY_STOP || t==ORDER_TYPE_SELL_STOP || t==ORDER_TYPE_BUY_STOP_LIMIT || t==ORDER_TYPE_SELL_STOP_LIMIT)
+        {
+            MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+            req.action = TRADE_ACTION_REMOVE;
+            req.order  = ticket;
+            req.symbol = _Symbol;
+            req.magic  = InpMagicNumber;
+            OrderSend(req, res);
+        }
+    }
+}
+
+void CloseOurOpenPositions()
+{
+    for(int j=PositionsTotal()-1; j>=0; --j)
+    {
+        string pos_symbol = PositionGetSymbol(j);
+        if(pos_symbol != _Symbol) continue;
+        if(!PositionSelect(pos_symbol)) continue;
+
+        long pos_magic = 0;
+        PositionGetInteger(POSITION_MAGIC, pos_magic);
+        if(pos_magic != (long)InpMagicNumber) continue;
+
+        long type = PositionGetInteger(POSITION_TYPE);
+        double volume = PositionGetDouble(POSITION_VOLUME);
+        ulong pos_ticket = (ulong)PositionGetInteger(POSITION_TICKET);
+
+        MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+        req.action = TRADE_ACTION_DEAL;
+        req.symbol = _Symbol;
+        req.magic  = InpMagicNumber;
+        req.deviation = 20;
+        if(type==POSITION_TYPE_BUY)
+        {
+            req.type = ORDER_TYPE_SELL;
+            req.volume = volume;
+            req.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        }
+        else if(type==POSITION_TYPE_SELL)
+        {
+            req.type = ORDER_TYPE_BUY;
+            req.volume = volume;
+            req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        }
+        req.position = pos_ticket; // ensure closing the specific position (hedging-safe)
+        req.type_filling = ORDER_FILLING_IOC;
+        if(req.volume>0.0)
+        {
+            bool sent = OrderSend(req, res);
+        }
+    }
 }
 
 int CountOurOrders()
@@ -196,14 +273,25 @@ void TryPlaceSetup()
 	double entry2 = entry1 - InpGridStepPoints * g_point;
 	double entry3 = entry2 - InpGridStepPoints * g_point;
 
-    // Shared SL/TP for all orders, based on first entry
+    // Shared absolute SL/TP for all orders, based on first entry (your example)
     double shared_sl = entry1 - InpSLPoints * g_point;
     double shared_tp = entry1 + InpTPPoints * g_point;
+
+    double entry4 = entry3 - InpGridStepPoints * g_point;
 
     bool ok1 = PlaceBuyLimit(entry1, InpLot1, shared_sl, shared_tp);
     bool ok2 = PlaceBuyLimit(entry2, InpLot2, shared_sl, shared_tp);
     bool ok3 = PlaceBuyLimit(entry3, InpLot3, shared_sl, shared_tp);
-	// No further handling here; orders share identical SL/TP distances from their own entry
+    bool ok4 = PlaceBuyLimit(entry4, InpLot4, shared_sl, shared_tp);
+    // No further handling here; orders share identical SL/TP distances from their own entry
+
+    if(ok1 || ok2 || ok3 || ok4)
+    {
+        g_setupActive = true;
+        g_sharedSL = shared_sl;
+        g_sharedTP = shared_tp;
+        g_firstEntry = entry1;
+    }
 }
 
 //======================== Standard Events ========================
@@ -224,6 +312,69 @@ void OnTick()
 	datetime curBar = iTime(_Symbol, InpTF_M1, 0);
 	if(curBar == lastBarTime) return;
 	lastBarTime = curBar;
+
+    // Management: if price exceeds shared TP, clear and re-arm
+    if(g_setupActive)
+    {
+        double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        // Case 1: Take-profit exceeded
+        if(bid >= g_sharedTP)
+        {
+            DeleteOurPendingOrders();
+            CloseOurOpenPositions();
+            g_setupActive = false;
+            if(CountOurOrders() == 0)
+            {
+                TryPlaceSetup();
+            }
+            return;
+        }
+        // Case 2: Stop-loss breached
+        if(bid <= g_sharedSL)
+        {
+            DeleteOurPendingOrders();
+            CloseOurOpenPositions();
+            g_setupActive = false;
+            if(CountOurOrders() == 0)
+            {
+                TryPlaceSetup();
+            }
+            return;
+        }
+        // Case 3: more than two positions and price exceeds first entry by offset
+        int openPositions = 0;
+        for(int j=0; j<PositionsTotal(); ++j)
+        {
+            string s = PositionGetSymbol(j);
+            if(s != _Symbol) continue;
+            if(!PositionSelect(s)) continue;
+            long pm = 0; PositionGetInteger(POSITION_MAGIC, pm);
+            if(pm != (long)InpMagicNumber) continue;
+            ++openPositions;
+        }
+        if(openPositions > 2)
+        {
+            double trigger = g_firstEntry + InpCloseAllProfitOffsetPoints * g_point;
+            if(bid >= trigger)
+            {
+                DeleteOurPendingOrders();
+                CloseOurOpenPositions();
+                g_setupActive = false;
+                if(CountOurOrders() == 0)
+                {
+                    TryPlaceSetup();
+                }
+                return;
+            }
+        }
+    }
+
+    // If nothing of ours is active anymore, look for a fresh setup
+    if(CountOurOrders() == 0)
+    {
+        TryPlaceSetup();
+        return;
+    }
 
 	TryPlaceSetup();
 }
