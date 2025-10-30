@@ -4,11 +4,13 @@
 
 #include <Trade/Trade.mqh>
 
-input ulong   InpMagicNumber          = 90010504;   // Magic Number (reverse martingale BUY+SELL EA)
-input int     InpSlPoints             = 100;        // Stop Loss (points)
-input int     InpTpPoints             = 200;        // Take Profit (points)
+input ulong   InpMagicNumber          = 90010503;   // Magic Number (reverse martingale EA - SELL)
+input int     InpSlPoints             = 400;        // Stop Loss (points)
+input int     InpTpPoints             = 400;        // Take Profit (points)
 input int     InpEmaFastPeriod        = 5;          // Fast EMA period (M1)
-input int     InpPriceOffsetPoints    = 5;          // Price offset (points)
+input int     InpPriceOffsetPoints    = 5;          // Price < EMA5 - offset (points)
+input int     InpEmaM1Period50        = 50;         // EMA50 period (M1)
+input int     InpEma50ExtraOffsetPoints = 10;       // EMA5 < EMA50 - this offset (points)
 
 // Reverse martingale lot sequence (3 steps): 0.01 -> 0.02 -> 0.03; reset to 0.01 on loss
 input double  InpLotStep1             = 0.01;
@@ -18,9 +20,9 @@ input double  InpLotStep3             = 0.03;
 // Internal state
 CTrade        trade;
 int           handleEmaM1_Fast = -1;
+int           handleEmaM1_50   = -1;
 
-string        gvRevMartiStepBuyName;
-string        gvRevMartiStepSellName;
+string        gvRevMartiStepName;
 
 //--- helpers
 double GetPoint() { return(_Point); }
@@ -50,22 +52,22 @@ int GetOpenPositionsCountForThisEA()
    return count;
 }
 
-int ReadStep(const string name)
+int ReadRevMartingaleStep()
 {
-   if(!GlobalVariableCheck(name))
-      GlobalVariableSet(name, 1.0);
-   double v = GlobalVariableGet(name);
+   if(!GlobalVariableCheck(gvRevMartiStepName))
+      GlobalVariableSet(gvRevMartiStepName, 1.0);
+   double v = GlobalVariableGet(gvRevMartiStepName);
    int step = (int)MathRound(v);
    if(step < 1 || step > 3) step = 1;
    return step;
 }
 
-void WriteStep(const string name, const int step)
+void WriteRevMartingaleStep(const int step)
 {
    int s = step;
    if(s < 1) s = 1;
    if(s > 3) s = 3;
-   GlobalVariableSet(name, (double)s);
+   GlobalVariableSet(gvRevMartiStepName, (double)s);
 }
 
 double GetLotForStep(const int step)
@@ -78,7 +80,7 @@ double GetLotForStep(const int step)
    }
 }
 
-bool UpdateStepsFromLastClosed()
+bool UpdateRevMartingaleStepFromLastClosed()
 {
    datetime from = (datetime)0;
    datetime to   = TimeCurrent();
@@ -114,22 +116,18 @@ bool UpdateStepsFromLastClosed()
    double commission = HistoryDealGetDouble((ulong)lastTicket, DEAL_COMMISSION);
    double net = profit + swap + commission;
 
-   int type = (int)HistoryDealGetInteger((ulong)lastTicket, DEAL_TYPE);
-   bool wasBuy = (type == DEAL_TYPE_BUY);
-
-   string stepName = wasBuy ? gvRevMartiStepBuyName : gvRevMartiStepSellName;
-   int step = ReadStep(stepName);
+   int step = ReadRevMartingaleStep();
    if(net >= 0.0)
    {
       // TP or positive close -> advance step (1->2->3->1)
       step++;
       if(step > 3) step = 1;
-      WriteStep(stepName, step);
+      WriteRevMartingaleStep(step);
    }
    else
    {
       // SL or negative close -> reset to step 1
-      WriteStep(stepName, 1);
+      WriteRevMartingaleStep(1);
    }
    return true;
 }
@@ -150,62 +148,42 @@ bool GetEmaFast(double &emaM1Fast)
    return true;
 }
 
-bool EntryConditionBuy()
+bool GetEmaM1_50(double &emaM1_50)
+{
+   emaM1_50 = 0.0;
+   if(handleEmaM1_50 < 0)
+      return false;
+
+   double buf50[];
+   ArraySetAsSeries(buf50, true);
+
+   // Read the previous closed bar (shift=1)
+   if(CopyBuffer(handleEmaM1_50, 0, 1, 1, buf50) < 1) return false;
+
+   emaM1_50 = buf50[0];
+   return true;
+}
+
+bool EntryCondition()
 {
    double emaF;
    if(!GetEmaFast(emaF))
       return false;
 
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   if(ask <= 0.0) return false;
-
-   double offset = InpPriceOffsetPoints * GetPoint();
-   if(!(ask > (emaF + offset))) return false;
-
-   return true;
-}
-
-bool EntryConditionSell()
-{
-   double emaF;
-   if(!GetEmaFast(emaF))
+   double ema50;
+   if(!GetEmaM1_50(ema50))
       return false;
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(bid <= 0.0) return false;
 
-   double offset = InpPriceOffsetPoints * GetPoint();
-   if(!(bid < (emaF - offset))) return false;
+   // Sell when M1: price < EMA5 - 5 points and EMA5 < EMA50 - 10 points
+   double offset5 = InpPriceOffsetPoints * GetPoint();
+   double offset50 = InpEma50ExtraOffsetPoints * GetPoint();
+   if(!(bid < (emaF - offset5))) return false;
+   if(!(emaF < (ema50 - offset50))) return false;
 
    return true;
-}
-
-void TryOpenBuy()
-{
-   if(GetOpenPositionsCountForThisEA() > 0)
-      return;
-
-   if(!EntryConditionBuy())
-      return;
-
-   int step = ReadStep(gvRevMartiStepBuyName);
-   double lots = GetLotForStep(step);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double pt  = GetPoint();
-
-   double sl = 0.0, tp = 0.0;
-   if(InpSlPoints > 0) sl = ask - InpSlPoints * pt;
-   if(InpTpPoints > 0) tp = ask + InpTpPoints * pt;
-
-   trade.SetExpertMagicNumber(InpMagicNumber);
-   trade.SetTypeFilling(ORDER_FILLING_FOK);
-   trade.SetDeviationInPoints(10);
-
-   bool ok = trade.Buy(lots, _Symbol, ask, sl, tp, "EMA_RevMarti_BuySell_Buy");
-   if(!ok)
-   {
-      PrintFormat("Buy failed: %s", trade.ResultRetcodeDescription());
-   }
 }
 
 void TryOpenSell()
@@ -213,10 +191,10 @@ void TryOpenSell()
    if(GetOpenPositionsCountForThisEA() > 0)
       return;
 
-   if(!EntryConditionSell())
+   if(!EntryCondition())
       return;
 
-   int step = ReadStep(gvRevMartiStepSellName);
+   int step = ReadRevMartingaleStep();
    double lots = GetLotForStep(step);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double pt  = GetPoint();
@@ -229,7 +207,7 @@ void TryOpenSell()
    trade.SetTypeFilling(ORDER_FILLING_FOK);
    trade.SetDeviationInPoints(10);
 
-   bool ok = trade.Sell(lots, _Symbol, bid, sl, tp, "EMA_RevMarti_BuySell_Sell");
+   bool ok = trade.Sell(lots, _Symbol, bid, sl, tp, "EMA_RevMarti_Sell");
    if(!ok)
    {
       PrintFormat("Sell failed: %s", trade.ResultRetcodeDescription());
@@ -239,17 +217,15 @@ void TryOpenSell()
 int OnInit()
 {
    trade.SetExpertMagicNumber(InpMagicNumber);
-   gvRevMartiStepBuyName  = StringFormat("EA_RevMartiStepBuy_%s_%I64u", _Symbol, InpMagicNumber);
-   gvRevMartiStepSellName = StringFormat("EA_RevMartiStepSell_%s_%I64u", _Symbol, InpMagicNumber);
-   if(!GlobalVariableCheck(gvRevMartiStepBuyName))
-      GlobalVariableSet(gvRevMartiStepBuyName, 1.0);
-   if(!GlobalVariableCheck(gvRevMartiStepSellName))
-      GlobalVariableSet(gvRevMartiStepSellName, 1.0);
+   gvRevMartiStepName = StringFormat("EA_RevMartiStep_%s_%I64u", _Symbol, InpMagicNumber);
+   if(!GlobalVariableCheck(gvRevMartiStepName))
+      GlobalVariableSet(gvRevMartiStepName, 1.0);
 
    // Indicator
    handleEmaM1_Fast = iMA(_Symbol, PERIOD_M1, InpEmaFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   handleEmaM1_50   = iMA(_Symbol, PERIOD_M1, InpEmaM1Period50, 0, MODE_EMA, PRICE_CLOSE);
 
-   if(handleEmaM1_Fast < 0)
+   if(handleEmaM1_Fast < 0 || handleEmaM1_50 < 0)
    {
       Print("Failed to create indicator handle");
       return(INIT_FAILED);
@@ -264,14 +240,14 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   // If there are no open positions for this EA, check last closed result to set reverse martingale step per side
+   // If there are no open positions for this EA, check last closed result to set reverse martingale step
    if(GetOpenPositionsCountForThisEA() == 0)
    {
-      UpdateStepsFromLastClosed();
-      // Try both sides; only one can trigger due to single-position rule
-      TryOpenBuy();
+      UpdateRevMartingaleStepFromLastClosed();
       TryOpenSell();
    }
 }
+
+
 
 
