@@ -28,6 +28,8 @@ input int    InpGridStepPoints                    = 2;      // Distance between 
 input int    InpNumPending                        = 3;       // Number of buy limit pendings
 input int    InpCloseAllProfitOffsetPoints        = 100;    // Case3 threshold above first entry
 input int    InpCase4SumPoints                    = 1000;   // Case4: min sum of first 3 positions' profit (points)
+input string Inp___Daily_________________________ = "------ Daily ------";
+input int    InpMaxDailyTPPoints                  = 2000;   // Max TP per day (points)
 
 //======================== Globals ========================
 string g_symbol;
@@ -37,6 +39,8 @@ bool   g_basketActive = false;
 double g_sharedSL = 0.0;
 double g_sharedTP = 0.0;
 double g_firstEntry = 0.0;
+double g_dailyPoints = 0.0; // accumulated realized points for the day
+int    g_dailyDateKey = 0;  // YYYYMMDD
 
 //======================== Utilities ========================
 bool IsSpreadOk()
@@ -65,27 +69,32 @@ void DeleteOurPendingOrders()
 
             long ord_magic = 0;
             OrderGetInteger(ORDER_MAGIC, ord_magic);
-            if(ord_magic != (long)InpMagicNumber) continue;
+            string ord_comment = "";
+            OrderGetString(ORDER_COMMENT, ord_comment);
 
             ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
             if(t==ORDER_TYPE_BUY_LIMIT || t==ORDER_TYPE_SELL_LIMIT || t==ORDER_TYPE_BUY_STOP || t==ORDER_TYPE_SELL_STOP || t==ORDER_TYPE_BUY_STOP_LIMIT || t==ORDER_TYPE_SELL_STOP_LIMIT)
             {
-                foundOrder = true;
-                MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
-                req.action = TRADE_ACTION_REMOVE;
-                req.order  = ticket;
-                req.symbol = _Symbol;
-                req.magic  = InpMagicNumber;
-                
-                if(OrderSend(req, res))
+                // remove if it is ours by magic OR comment match
+                if(ord_magic == (long)InpMagicNumber || ord_comment == InpOrderComment)
                 {
-                    Print("Successfully removed pending order #", ticket);
+                    foundOrder = true;
+                    MqlTradeRequest req; MqlTradeResult res; ZeroMemory(req); ZeroMemory(res);
+                    req.action = TRADE_ACTION_REMOVE;
+                    req.order  = ticket;
+                    req.symbol = _Symbol;
+                    req.magic  = InpMagicNumber;
+                    
+                    if(OrderSend(req, res))
+                    {
+                        Print("Successfully removed pending order #", ticket);
+                    }
+                    else
+                    {
+                        Print("Failed to remove pending order #", ticket, " Error: ", res.retcode, " - ", res.comment);
+                    }
+                    // continue scanning to remove any other matches this pass
                 }
-                else
-                {
-                    Print("Failed to remove pending order #", ticket, " Error: ", res.retcode, " - ", res.comment);
-                }
-                break; // Exit inner loop and try again
             }
         }
         
@@ -244,6 +253,17 @@ bool M1Trigger()
     return (price > e14);
 }
 
+bool M5Filter()
+{
+	// Use last closed bar for EMAs
+	double e100 = GetEMA(InpTF_M5, InpEMA_Mid3, 1);
+	double e200 = GetEMA(InpTF_M5, InpEMA_Slow, 1);
+	if(e100==EMPTY_VALUE || e200==EMPTY_VALUE) return false;
+
+	double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+	return (bid > e100 && e100 > e200);
+}
+
 double NormalizePrice(double price)
 {
     return NormalizeDouble(price, g_digits);
@@ -291,11 +311,42 @@ bool PlaceMarketBuy(double &filled_price)
     return true;
 }
 
+int TodayKey()
+{
+	MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+	return dt.year*10000 + dt.mon*100 + dt.day;
+}
+
+double SumOurOpenPoints()
+{
+	double bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+	double askNow = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+	double sumPts = 0.0;
+	for(int j=0; j<PositionsTotal(); ++j)
+	{
+		string s = PositionGetSymbol(j);
+		if(s != _Symbol) continue;
+		if(!PositionSelect(s)) continue;
+		long pm = 0; PositionGetInteger(POSITION_MAGIC, pm);
+		if(pm != (long)InpMagicNumber) continue;
+		long ptype = PositionGetInteger(POSITION_TYPE);
+		double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+		if(ptype == POSITION_TYPE_BUY)
+			sumPts += (bidNow - openPrice) / g_point;
+		else
+			sumPts += (openPrice - askNow) / g_point;
+	}
+	return sumPts;
+}
+
 void TryTriggerSetup()
 {
     if(!IsSpreadOk()) return;
-    // Require only M1 trigger per spec
+	// Respect daily max TP cap
+	if(g_dailyPoints >= (double)InpMaxDailyTPPoints) return;
+	// Require M1 trigger and M5 filter
     if(!M1Trigger()) return;
+	if(!M5Filter()) return;
 
     // Only arm a new basket if nothing is active
     if(CountOurOrders() > 0) return;
@@ -343,12 +394,36 @@ int OnInit()
     g_symbol = _Symbol;
     g_point  = _Point;
     g_digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+    g_dailyDateKey = TodayKey();
+    g_dailyPoints = 0.0;
     return(INIT_SUCCEEDED);
 }
 
 void OnTick()
 {
     if(_Symbol != g_symbol) return;
+
+    // Daily reset
+    int tk = TodayKey();
+    if(tk != g_dailyDateKey)
+    {
+    	g_dailyDateKey = tk;
+    	g_dailyPoints = 0.0;
+    }
+
+    // If daily cap reached, immediately stop and clean up anything open
+    if(g_dailyPoints >= (double)InpMaxDailyTPPoints)
+    {
+    	if(CountOurOrders() > 0)
+    	{
+    		DeleteOurPendingOrders();
+    		if(CountOurOrders() > 0) DeleteOurPendingOrders();
+    		CloseOurOpenPositions();
+    		VerifyCleanup();
+    	}
+    	g_basketActive = false;
+    	return;
+    }
 
     // Basket management
     if(g_basketActive)
@@ -383,6 +458,8 @@ void OnTick()
         if(bid >= g_sharedTP)
         {
             Print("Case 2 triggered: TP hit, cleaning up...");
+            // add today's realized points from current opens before closing
+            g_dailyPoints += SumOurOpenPoints();
             DeleteOurPendingOrders();
             if(CountOurOrders() > 0) DeleteOurPendingOrders();
             CloseOurOpenPositions();
@@ -398,6 +475,8 @@ void OnTick()
             if(bid >= trigger)
             {
                 Print("Case 3 triggered: ", openPositions, " positions, price ", bid, " >= trigger ", trigger, ", cleaning up...");
+                // add today's realized points from current opens before closing
+                g_dailyPoints += SumOurOpenPoints();
                 DeleteOurPendingOrders();
                 if(CountOurOrders() > 0) DeleteOurPendingOrders();
                 CloseOurOpenPositions();
@@ -407,64 +486,39 @@ void OnTick()
             }
         }
 
-        // Case 4: if open positions >= 3 and sum of first three positions' profit >= threshold points
+        // Case 4: if open positions >= 3 and price >= first-entry + offset
         if(openPositions >= 3)
         {
-            // Track first three positions by open time
-            datetime t1 = LONG_MAX, t2 = LONG_MAX, t3 = LONG_MAX;
-            double p1 = 0.0, p2 = 0.0, p3 = 0.0;
-            double bidNow = bid;
-            for(int k=0; k<PositionsTotal(); ++k)
+            double trigger3 = g_firstEntry + InpCloseAllProfitOffsetPoints * g_point;
+            if(bid >= trigger3)
             {
-                string sy = PositionGetSymbol(k);
-                if(sy != _Symbol) continue;
-                if(!PositionSelect(sy)) continue;
-                long pm2 = 0; PositionGetInteger(POSITION_MAGIC, pm2);
-                if(pm2 != (long)InpMagicNumber) continue;
-
-                datetime ot = (datetime)PositionGetInteger(POSITION_TIME);
-                double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-                long ptype = PositionGetInteger(POSITION_TYPE);
-
-                // compute profit in points per position (buy only in this EA)
-                double pts = 0.0;
-                if(ptype == POSITION_TYPE_BUY)
-                    pts = (bidNow - openPrice) / g_point;
-                else
-                    pts = (openPrice - SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / g_point; // safety
-
-                // keep earliest three
-                if(ot < t1)
-                {
-                    // shift down
-                    t3 = t2; p3 = p2;
-                    t2 = t1; p2 = p1;
-                    t1 = ot; p1 = pts;
-                }
-                else if(ot < t2)
-                {
-                    t3 = t2; p3 = p2;
-                    t2 = ot; p2 = pts;
-                }
-                else if(ot < t3)
-                {
-                    t3 = ot; p3 = pts;
-                }
+                Print("Case 4 triggered: ", openPositions, " positions, price ", bid, " >= trigger ", trigger3, ", cleaning up...");
+                // add today's realized points from current opens before closing
+                g_dailyPoints += SumOurOpenPoints();
+                DeleteOurPendingOrders();
+                if(CountOurOrders() > 0) DeleteOurPendingOrders();
+                CloseOurOpenPositions();
+                VerifyCleanup();
+                g_basketActive = false;
+                return;
             }
-            // sum only if we actually found three entries
-            if(t3 != LONG_MAX)
+        }
+
+        // Case 5: if open positions >= 4 and price >= first-entry + offset
+        if(openPositions >= 4)
+        {
+            double trigger4 = g_firstEntry + InpCloseAllProfitOffsetPoints * g_point;
+            if(bid >= trigger4)
             {
-                double sumPts = p1 + p2 + p3;
-                if(sumPts >= (double)InpCase4SumPoints)
-                {
-                    Print("Case 4 triggered: ", openPositions, " positions, sum profit ", sumPts, " >= ", InpCase4SumPoints, " points, cleaning up...");
-                    DeleteOurPendingOrders();
-                    if(CountOurOrders() > 0) DeleteOurPendingOrders();
-                    CloseOurOpenPositions();
-                    VerifyCleanup();
-                    g_basketActive = false;
-                    return;
-                }
+                Print("Case 5 triggered: ", openPositions, " positions, price ", bid, " >= trigger ", trigger4, ", cleaning up...");
+                // add today's realized points from current opens before closing
+                g_dailyPoints += SumOurOpenPoints();
+                DeleteOurPendingOrders();
+                if(CountOurOrders() > 0) DeleteOurPendingOrders();
+                CloseOurOpenPositions();
+                VerifyCleanup();
+                g_basketActive = false;
+                return;
             }
         }
     }
@@ -477,7 +531,9 @@ void OnTick()
 
     if(CountOurOrders() == 0)
     {
-        TryTriggerSetup();
+        // Block new setups if daily cap reached
+        if(g_dailyPoints < (double)InpMaxDailyTPPoints)
+            TryTriggerSetup();
         return;
     }
 
