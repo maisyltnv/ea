@@ -12,12 +12,12 @@ enum ENUM_GRID_ORDER_TYPE
 
 input string TradeSymbol = "XAUUSDu";    // Symbol to trade (XAUUSDu, XAUUSD, GOLD, etc.)
 input ENUM_GRID_ORDER_TYPE OrderType = GRID_ORDER_BUY;  // Order Type: 0=BUY LIMIT, 1=SELL LIMIT
-input int    StartDistancePoints = 1000;  // Distance from current price (points)
+input double StartPrice = 4570;           // Starting price for first order (e.g. 4461.0 for exact price, 0 = auto calculate from current price)
 input int    NumberOfOrders = 8;          // Number of orders to place
 input int    GridSpacingPoints = 400;     // Distance between orders (points)
 input int    TPPoints = 400;              // TP distance from first order (points)
 input int    SLPoints = 400;              // SL distance from last order (points)
-input double LotSize = 0.01;              // Lot size for each order
+input double LotSize = 0.01;              // Base lot size (first order). Each subsequent order increases by this amount
 input int    MagicNumber = 123456;        // Magic number for orders
 
 void OnStart()
@@ -170,12 +170,30 @@ void OnStart()
    double tpPrice;
    double slPrice;
    
+   // If StartPrice is specified (> 0), use it directly; otherwise use default distance
+   if(StartPrice > 0.0)
+   {
+      // Use specified price directly
+      startPrice = NormalizeDouble(StartPrice, digits);
+   }
+   else
+   {
+      // Default behavior: calculate from current price
+      if(OrderType == GRID_ORDER_BUY)
+      {
+         // BUY LIMIT: orders below current price (default 1000 points)
+         startPrice = currentPrice - (1000 * point);
+      }
+      else
+      {
+         // SELL LIMIT: orders above current price (default 1000 points)
+         startPrice = currentPrice + (1000 * point);
+      }
+      startPrice = NormalizeDouble(startPrice, digits);
+   }
+   
    if(OrderType == GRID_ORDER_BUY)
    {
-      // BUY LIMIT: orders below current price
-      startPrice = currentPrice - (StartDistancePoints * point);
-      startPrice = NormalizeDouble(startPrice, digits);
-      
       // First order (highest price) and last order (lowest price)
       firstOrderPrice = startPrice;  // First order (i=0)
       lastOrderPrice = startPrice - ((NumberOfOrders - 1) * GridSpacingPoints * point);
@@ -187,10 +205,6 @@ void OnStart()
    }
    else // SELL LIMIT
    {
-      // SELL LIMIT: orders above current price
-      startPrice = currentPrice + (StartDistancePoints * point);
-      startPrice = NormalizeDouble(startPrice, digits);
-      
       // First order (lowest price) and last order (highest price)
       firstOrderPrice = startPrice;  // First order (i=0)
       lastOrderPrice = startPrice + ((NumberOfOrders - 1) * GridSpacingPoints * point);
@@ -205,13 +219,16 @@ void OnStart()
    slPrice = NormalizeDouble(slPrice, digits);
    
    Print("Current price: ", currentPrice);
-   Print("Starting price (first order): ", startPrice);
+   if(StartPrice > 0.0)
+      Print("Starting price (specified): ", startPrice);
+   else
+      Print("Starting price (calculated from current price): ", startPrice);
+   Print("First order price: ", firstOrderPrice);
    Print("Last order price: ", lastOrderPrice);
    Print("TP for all orders: ", tpPrice, " (", TPPoints, " points from first order)");
    Print("SL for all orders: ", slPrice, " (", SLPoints, " points from last order)");
-   Print("Start distance: ", StartDistancePoints, " points = ", (StartDistancePoints * point), " price units");
    Print("Grid spacing: ", GridSpacingPoints, " points = ", (GridSpacingPoints * point), " price units");
-   Print("Lot size: ", LotSize);
+   Print("Base lot size: ", LotSize, " (each order increases by ", LotSize, ": order 1 = ", LotSize, ", order 2 = ", (2*LotSize), ", etc.)");
    Print("Placing ", NumberOfOrders, " ", (OrderType == GRID_ORDER_BUY ? "BUY LIMIT" : "SELL LIMIT"), " orders...");
    
    int successCount = 0;
@@ -240,11 +257,12 @@ void OnStart()
       MqlTradeRequest request = {};
       MqlTradeResult result = {};
       
-      // Normalize volume first
+      // Normalize volume first - calculate lot size for this order (incremental: order 1 = 0.01, order 2 = 0.02, etc.)
       double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
       double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-      double normalizedVolume = MathMax(minLot, MathMin(maxLot, MathFloor(LotSize / lotStep) * lotStep));
+      double orderLotSize = (i + 1) * LotSize;  // Order 1 = 0.01, Order 2 = 0.02, Order 3 = 0.03, etc.
+      double normalizedVolume = MathMax(minLot, MathMin(maxLot, MathFloor(orderLotSize / lotStep) * lotStep));
       
       // Get filling mode
       int fillingMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
@@ -306,7 +324,7 @@ void OnStart()
          continue;
       }
       
-      Print("Attempting to place order ", i + 1, " at price: ", orderPrice, ", Volume: ", request.volume);
+      Print("Attempting to place order ", i + 1, " at price: ", orderPrice, ", Volume: ", request.volume, " (lot size: ", orderLotSize, ")");
       Print("  TP: ", request.tp, " | SL: ", request.sl);
       Print("  Request details: Symbol=", request.symbol, ", Type=", EnumToString(request.type), ", Filling=", EnumToString(request.type_filling));
       
