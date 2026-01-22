@@ -10,14 +10,14 @@ enum ENUM_GRID_ORDER_TYPE
    GRID_ORDER_SELL = 1   // SELL LIMIT (orders above current price)
 };
 
-input string TradeSymbol = "GOLDm#";    // Symbol to trade (XAUUSDu, XAUUSD, GOLD, etc.)
+input string TradeSymbol = "XAUUSDu";    // Symbol to trade (XAUUSDu, XAUUSD, GOLD, etc.)
 input ENUM_GRID_ORDER_TYPE OrderType = GRID_ORDER_BUY;  // Order Type: 0=BUY LIMIT, 1=SELL LIMIT
-input double StartPrice = 4750;           // Starting price for first order (e.g. 4461.0 for exact price, 0 = auto calculate from current price)
+input double StartPrice = 4570;           // Starting price for first order (e.g. 4461.0 for exact price, 0 = auto calculate from current price)
 input int    NumberOfOrders = 8;          // Number of orders to place
-input int    GridSpacingPoints = 500;     // Distance between orders (points)
-input int    TPPoints = 1000;              // TP distance from first order (points)
-input int    SLPoints = 1000;              // SL distance from last order (points)
-input double LotSize = 0.1;              // Base lot size (first order). Each subsequent order increases by this amount
+input int    GridSpacingPoints = 400;     // Distance between orders (points)
+input int    TPPoints = 400;              // TP distance from first order (points)
+input int    SLPoints = 400;              // SL distance from last order (points)
+input double LotSize = 0.01;              // Base lot size (first order). Each subsequent order increases by this amount
 input int    MagicNumber = 123456;        // Magic number for orders
 
 void OnStart()
@@ -74,7 +74,7 @@ void OnStart()
       Print("Warning: Symbol ", symbol, " not found. Searching for similar symbols...");
       
       // Try common gold symbol variations
-      string goldSymbols[] = {"XAUUSDu", "XAUUSD", "GOLD","GOLDm#", "XAUUSD.", "XAU/USD", "GOLD/USD", "XAUUSDm", "XAUUSDc"};
+      string goldSymbols[] = {"XAUUSDu", "XAUUSD", "GOLD", "XAUUSD.", "XAU/USD", "GOLD/USD", "XAUUSDm", "XAUUSDc"};
       bool found = false;
       
       for(int s = 0; s < ArraySize(goldSymbols); s++)
