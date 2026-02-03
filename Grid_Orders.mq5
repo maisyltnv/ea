@@ -74,7 +74,7 @@ void OnStart()
       Print("Warning: Symbol ", symbol, " not found. Searching for similar symbols...");
       
       // Try common gold symbol variations
-      string goldSymbols[] = {"XAUUSDu", "XAUUSD", "GOLD","GOLDm#", "XAUUSD.", "XAU/USD", "GOLD/USD", "XAUUSDm", "XAUUSDc"};
+      string goldSymbols[] = {"XAUUSDu", "XAUUSD", "GOLD", "XAUUSD.", "XAU/USD", "GOLD/USD", "XAUUSDm", "XAUUSDc"};
       bool found = false;
       
       for(int s = 0; s < ArraySize(goldSymbols); s++)
