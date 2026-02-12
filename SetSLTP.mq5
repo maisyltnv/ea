@@ -2,10 +2,12 @@
 //| SetSLTP EA                                                       |
 //| First position: set TP = TPPoints, SL = SLPoints from its entry. |
 //| Next positions: set TP and SL at the same PRICE as first position.|
+//| Sets only when position has no SL/TP yet; after that you can     |
+//| remove or change SL/TP manually and EA will not overwrite.        |
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetSLTP: first position gets TP/SL from entry; others get same price levels."
+#property description "SetSLTP: sets SL/TP once when position has none; then you can edit manually."
 #property version   "1.00"
 
 #include <Trade/Trade.mqh>
@@ -91,15 +93,15 @@ void OnTick() {
   double priceLow = MathMin(refSL, refTP);
   double priceHigh = MathMax(refSL, refTP);
 
-  // Set reference position first
+  // Set reference position only when it has no SL/TP yet (so you can change them later)
   double refCurSL = PositionGetDouble(POSITION_SL);
   double refCurTP = PositionGetDouble(POSITION_TP);
-  if (MathAbs(refCurSL - refSL) >= point * 0.5 || MathAbs(refCurTP - refTP) >= point * 0.5) {
+  if (refCurSL <= 0.0 && refCurTP <= 0.0) {
     if (trade.PositionModify(refTicket, refSL, refTP))
       Print("[SetSLTP] First position ", refTicket, " set SL=", refSL, " TP=", refTP);
   }
 
-  // All other positions: same price levels (BUY: SL=low TP=high; SELL: SL=high TP=low)
+  // All other positions: set same price levels only when they have no SL/TP yet
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     ulong ticket = PositionGetTicket(i);
     if (ticket == 0 || !IsOurPosition(ticket))
@@ -110,6 +112,11 @@ void OnTick() {
     if (!PositionSelectByTicket(ticket))
       continue;
 
+    double curSL = PositionGetDouble(POSITION_SL);
+    double curTP = PositionGetDouble(POSITION_TP);
+    if (curSL > 0.0 || curTP > 0.0)
+      continue; // already has SL or TP - do not overwrite (user may have set/customized)
+
     ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
     double sl, tp;
     if (type == POSITION_TYPE_BUY) {
@@ -119,11 +126,6 @@ void OnTick() {
       sl = priceHigh;
       tp = priceLow;
     }
-
-    double curSL = PositionGetDouble(POSITION_SL);
-    double curTP = PositionGetDouble(POSITION_TP);
-    if (MathAbs(curSL - sl) < point * 0.5 && MathAbs(curTP - tp) < point * 0.5)
-      continue;
 
     if (trade.PositionModify(ticket, sl, tp))
       Print("[SetSLTP] Position ", ticket, " set same levels SL=", sl, " TP=", tp);
