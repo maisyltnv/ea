@@ -61,11 +61,7 @@ enum HedgeStep
    STEP_2    = 2, // SELL #1 triggered, BUY STOP #1 placed
    STEP_3    = 3, // BUY #1 triggered, SELL STOP #2 placed
    STEP_4    = 4, // SELL #2 triggered, BUY STOP #2 placed
-   STEP_5    = 5, // BUY #2 triggered, SELL STOP #3 placed
-   STEP_6    = 6, // SELL #3 triggered, BUY STOP #3 placed
-   STEP_7    = 7, // BUY #3 triggered, SELL STOP #4 placed
-   STEP_8    = 8, // SELL #4 triggered, BUY STOP #4 placed
-   STEP_9    = 9  // BUY #4 triggered, SELL STOP #5 placed; wait for TP
+   STEP_5    = 5  // BUY #2 triggered, SELL STOP #3 placed; then wait for TP
   };
 
 int g_step = STEP_NONE;
@@ -547,95 +543,9 @@ void OnTick()
    }
    else if(g_step == STEP_5)
    {
-      // SELL STOP #3 triggered -> place BUY STOP #3
-      bool hasSell3 = GetPosition(POSITION_TYPE_SELL, Lots_Sell3, entryPrice);
-      bool hasBuyStop3 = HasPending(ORDER_TYPE_BUY_STOP, Lots_Buy3);
-
-      if(hasSell3 && !hasBuyStop3)
-      {
-         double buyStopPrice = entryPrice + DistancePoints * point;
-         double buyTP = buyStopPrice + TPPoints * point;
-         buyStopPrice = NormalizeDouble(buyStopPrice, digits);
-         buyTP        = NormalizeDouble(buyTP, digits);
-
-         if(trade.BuyStop(Lots_Buy3, buyStopPrice, symbol, 0.0, buyTP))
-         {
-            Print("BUY STOP #3 placed at ", buyStopPrice, " TP=", buyTP);
-            g_step = STEP_6;
-         }
-         else
-            Print("Failed to place BUY STOP #3. Error=", GetLastError());
-      }
-   }
-   else if(g_step == STEP_6)
-   {
-      // BUY STOP #3 triggered -> place SELL STOP #4
-      bool hasBuy3 = GetPosition(POSITION_TYPE_BUY, Lots_Buy3, entryPrice);
-      bool hasSellStop4 = HasPending(ORDER_TYPE_SELL_STOP, Lots_Sell4);
-
-      if(hasBuy3 && !hasSellStop4)
-      {
-         double sellStopPrice = entryPrice - DistancePoints * point;
-         double sellTP = sellStopPrice - TPPoints * point;
-         sellStopPrice = NormalizeDouble(sellStopPrice, digits);
-         sellTP        = NormalizeDouble(sellTP, digits);
-
-         if(trade.SellStop(Lots_Sell4, sellStopPrice, symbol, 0.0, sellTP))
-         {
-            Print("SELL STOP #4 placed at ", sellStopPrice, " TP=", sellTP);
-            g_step = STEP_7;
-         }
-         else
-            Print("Failed to place SELL STOP #4. Error=", GetLastError());
-      }
-   }
-   else if(g_step == STEP_7)
-   {
-      // SELL STOP #4 triggered -> place BUY STOP #4
-      bool hasSell4 = GetPosition(POSITION_TYPE_SELL, Lots_Sell4, entryPrice);
-      bool hasBuyStop4 = HasPending(ORDER_TYPE_BUY_STOP, Lots_Buy4);
-
-      if(hasSell4 && !hasBuyStop4)
-      {
-         double buyStopPrice = entryPrice + DistancePoints * point;
-         double buyTP = buyStopPrice + TPPoints * point;
-         buyStopPrice = NormalizeDouble(buyStopPrice, digits);
-         buyTP        = NormalizeDouble(buyTP, digits);
-
-         if(trade.BuyStop(Lots_Buy4, buyStopPrice, symbol, 0.0, buyTP))
-         {
-            Print("BUY STOP #4 placed at ", buyStopPrice, " TP=", buyTP);
-            g_step = STEP_8;
-         }
-         else
-            Print("Failed to place BUY STOP #4. Error=", GetLastError());
-      }
-   }
-   else if(g_step == STEP_8)
-   {
-      // BUY STOP #4 triggered -> place SELL STOP #5
-      bool hasBuy4 = GetPosition(POSITION_TYPE_BUY, Lots_Buy4, entryPrice);
-      bool hasSellStop5 = HasPending(ORDER_TYPE_SELL_STOP, Lots_Sell5);
-
-      if(hasBuy4 && !hasSellStop5)
-      {
-         double sellStopPrice = entryPrice - DistancePoints * point;
-         double sellTP = sellStopPrice - TPPoints * point;
-         sellStopPrice = NormalizeDouble(sellStopPrice, digits);
-         sellTP        = NormalizeDouble(sellTP, digits);
-
-         if(trade.SellStop(Lots_Sell5, sellStopPrice, symbol, 0.0, sellTP))
-         {
-            Print("SELL STOP #5 placed at ", sellStopPrice, " TP=", sellTP);
-            g_step = STEP_9;
-         }
-         else
-            Print("Failed to place SELL STOP #5. Error=", GetLastError());
-      }
-   }
-   else if(g_step == STEP_9)
-   {
-      // All steps done; wait for any TP to be hit (handled at top of OnTick)
+      // After SELL STOP #3 is placed in STEP_4, STEP_5 is the final state:
+      // do not place further hedge orders, just wait for any TP to be hit
+      // (handled at the top of OnTick via TP detection and reset logic).
    }
 }
 

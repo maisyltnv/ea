@@ -32,17 +32,12 @@
 
 //--- inputs
 input double Lots_Initial   = 0.01;  // Step 1 BUY lot, Total Buy:0.01
-input double Lots_Sell1     = 0.02;  // SELL STOP #1 lot, Total Sell:0.02
-input double Lots_Buy1      = 0.02;  // BUY STOP #1 lot, Total Buy:0.03
-input double Lots_Sell2     = 0.03;  // SELL STOP #2 lot, Total Sell:0.05
-input double Lots_Buy2      = 0.05;  // BUY STOP #2 lot, Total Buy:0.08
+input double Lots_Sell1     = 0.03;  // SELL STOP #1 lot, Total Sell:0.02
+input double Lots_Buy1      = 0.06;  // BUY STOP #1 lot, Total Buy:0.03
+input double Lots_Sell2     = 0.17;  // SELL STOP #2 lot, Total Sell:0.05
+input double Lots_Buy2      = 0.4;  // BUY STOP #2 lot, Total Buy:0.08
 
-input double Lots_Sell3     = 0.1;  // SELL STOP #1 lot, Total Sell:0.15
-input double Lots_Buy3      = 0.12;  // BUY STOP #1 lot, Total Buy:0.2
-input double Lots_Sell4     = 0.1;  // SELL STOP #2 lot, Total Sell:0.25
-input double Lots_Buy4      = 0.2;  // BUY STOP #2 lot, Total Buy:0.4
-
-input int    DistancePoints = 200;   // Distance between hedge orders (points)
+input int    DistancePoints = 300;   // Distance between hedge orders (points)
 input int    TPPoints       = 400;   // Take profit distance (points)
 input int    SlippagePoints = 20;    // Slippage (points)
 input int    MagicNumber    = 246810; // Magic number for this EA
