@@ -35,6 +35,8 @@ input double Lots_Initial = 0.01; // Step 1 BUY lot, Total Buy:0.01
 input double Lots_Sell1 = 0.03;   // SELL STOP #1 lot, Total Sell:0.02
 input double Lots_Buy1 = 0.06;    // BUY STOP #1 lot, Total Buy:0.03
 input double Lots_Sell2 = 0.17;   // SELL STOP #2 lot, Total Sell:0.05
+input double Lots_Buy2 = 0.4;     // BUY STOP #2 lot, Total Buy:0.08
+
 input int DistancePoints = 100; // Distance between hedge orders (points)
 input int TPPoints = 200;       // Take profit distance (points)
 input int SlippagePoints = 20;  // Slippage (points)
@@ -483,7 +485,7 @@ void OnTick() {
     // SELL STOP #2 should have triggered if there is a SELL 0.03 and
     // no BUY STOP #2 yet
     bool hasSell2 = GetPosition(POSITION_TYPE_SELL, Lots_Sell2, entryPrice);
-    bool hasBuyStop2 = HasPending(ORDER_TYPE_BUY_STOP, 0.4);
+    bool hasBuyStop2 = HasPending(ORDER_TYPE_BUY_STOP, Lots_Buy2);
 
     if (hasSell2 && !hasBuyStop2) {
       double buyStopPrice = entryPrice + DistancePoints * point;
@@ -491,7 +493,7 @@ void OnTick() {
       buyStopPrice = NormalizeDouble(buyStopPrice, digits);
       buyTP = NormalizeDouble(buyTP, digits);
 
-      if (trade.BuyStop(0.4, buyStopPrice, symbol, 0.0, buyTP,
+      if (trade.BuyStop(Lots_Buy2, buyStopPrice, symbol, 0.0, buyTP,
                         ORDER_TIME_GTC, 0, "Hedge BUY STOP #2")) {
         Print("BUY STOP #2 placed at ", buyStopPrice, " TP=", buyTP);
         g_step = STEP_4;
