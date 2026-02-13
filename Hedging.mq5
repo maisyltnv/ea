@@ -25,8 +25,7 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description                                                          \
-    "Hedging EA with fixed sequence of hedge orders and reset on TP."
+#property description "Hedging EA with fixed sequence of hedge orders and reset on TP."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
@@ -38,19 +37,29 @@ input double Lots_Buy1 = 0.06;    // BUY STOP #1 lot, Total Buy:0.03
 input double Lots_Sell2 = 0.17;   // SELL STOP #2 lot, Total Sell:0.05
 input double Lots_Buy2 = 0.4;     // BUY STOP #2 lot, Total Buy:0.08
 
-input int DistancePoints = 300; // Distance between hedge orders (points)
-input int TPPoints = 400;       // Take profit distance (points)
+input int DistancePoints = 100; // Distance between hedge orders (points)
+input int TPPoints = 200;       // Take profit distance (points)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 246810; // Magic number for this EA
 
-input double DailyProfitPercent = 5.0; // Daily profit target (% of balance) -
-                                       // stop trading for the day when reached
-input double DailyLossPercent = 30.0;  // Daily loss limit (% of balance) - stop
-                                       // trading for the day when reached
-input bool UseDailyLimits = true;      // Enable daily profit/loss stop
+input double DailyProfitPercent = 10.0; // Daily profit target (% of balance) -
+                                        // stop trading for the day when reached
+input double DailyLossPercent = 40.0; // Daily loss limit (% of balance) - stop
+                                      // trading for the day when reached
+input bool UseDailyLimits = true;     // Enable daily profit/loss stop
+
+input bool   UseMacdFilter   = true;  // Only open when MACD > threshold high or < threshold low
+input int    MacdFast        = 12;    // MACD fast EMA
+input int    MacdSlow        = 26;    // MACD slow EMA
+input int    MacdSignal      = 9;     // MACD signal period
+input double MacdThresholdHigh = 2.0;  // Open allowed when MACD line > this (e.g. 0.0002 for forex)
+input double MacdThresholdLow  = -2.0; // Open allowed when MACD line < this (e.g. -0.0002 for forex)
 
 //--- trade object
 CTrade trade;
+
+//--- MACD indicator handle
+int g_handleMACD = INVALID_HANDLE;
 
 //--- step state
 enum HedgeStep {
@@ -72,6 +81,27 @@ bool g_stoppedForDay = false; // true when daily profit target or loss limit hit
 //| Helper: approximate comparison of lots                           |
 //+------------------------------------------------------------------+
 bool LotEquals(double v, double t) { return (MathAbs(v - t) < 1e-8); }
+
+//+------------------------------------------------------------------+
+//| Helper: true if MACD(12,26,9) > threshold high or < threshold low |
+//| Only open new cycle when this is true (at start and after TP).   |
+//+------------------------------------------------------------------+
+bool MacdAllowed() {
+  if (!UseMacdFilter)
+    return (true);
+  if (g_handleMACD == INVALID_HANDLE)
+    return (false);
+
+  double macdBuf[];
+  ArraySetAsSeries(macdBuf, true);
+  if (CopyBuffer(g_handleMACD, 0, 1, 1, macdBuf) <= 0)  // buffer 0 = MACD line, bar 1 = last closed
+    return (false);
+
+  double macd = macdBuf[0];
+  if (macd > MacdThresholdHigh || macd < MacdThresholdLow)
+    return (true);
+  return (false);
+}
 
 //+------------------------------------------------------------------+
 //| Helper: close all EA positions and pending orders                |
@@ -285,15 +315,39 @@ void DoInitialSetup() {
 //| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit() {
+  if (_Period != PERIOD_M1) {
+    Print("Hedging EA works on M1 only. Please switch chart to M1 timeframe.");
+    return (INIT_FAILED);
+  }
+
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
   g_step = STEP_NONE;
   g_startOfDayBalance = AccountInfoDouble(ACCOUNT_BALANCE);
   g_lastDay = (int)(TimeCurrent() / 86400);
   g_stoppedForDay = false;
+
+  if (UseMacdFilter) {
+    g_handleMACD = iMACD(_Symbol, PERIOD_M1, MacdFast, MacdSlow, MacdSignal, PRICE_CLOSE);
+    if (g_handleMACD == INVALID_HANDLE) {
+      Print("MACD indicator create failed. Error=", GetLastError());
+      return (INIT_FAILED);
+    }
+  }
+
   Print("Hedging EA initialized on symbol ", _Symbol,
         " | Start-of-day balance: ", g_startOfDayBalance);
   return (INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+  if (g_handleMACD != INVALID_HANDLE) {
+    IndicatorRelease(g_handleMACD);
+    g_handleMACD = INVALID_HANDLE;
+  }
 }
 
 //+------------------------------------------------------------------+
@@ -372,9 +426,11 @@ void OnTick() {
     totalOrd++;
   }
 
-  // 2) If nothing exists -> start Step 1
+  // 2) If nothing exists -> start Step 1 (only when MACD allows)
   if (totalPos == 0 && totalOrd == 0 && g_step == STEP_NONE) {
-    DoInitialSetup();
+    if (MacdAllowed()) {
+      DoInitialSetup();
+    }
     return;
   }
 
@@ -450,3 +506,4 @@ void OnTick() {
     // No further hedge steps defined in the specification.
   }
 }
+ 
