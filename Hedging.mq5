@@ -271,7 +271,7 @@ void DoInitialSetup()
       sellPrice = NormalizeDouble(sellPrice, digits);
       sellTP    = NormalizeDouble(sellTP, digits);
 
-      if(trade.SellStop(Lots_Sell1, sellPrice, symbol, 0.0, sellTP, SlippagePoints, 0, ORDER_FILLING_RETURN))
+      if(trade.SellStop(Lots_Sell1, sellPrice, symbol, 0.0, sellTP, ORDER_TIME_GTC, 0, "Hedge SELL STOP #1"))
       {
          Print("SELL STOP #1 placed at ", sellPrice, " TP=", sellTP);
          g_step = STEP_1;
@@ -370,7 +370,7 @@ void OnTick()
          buyStopPrice = NormalizeDouble(buyStopPrice, digits);
          buyTP        = NormalizeDouble(buyTP, digits);
 
-         if(trade.BuyStop(Lots_Buy1, buyStopPrice, symbol, 0.0, buyTP, SlippagePoints, 0, ORDER_FILLING_RETURN))
+         if(trade.BuyStop(Lots_Buy1, buyStopPrice, symbol, 0.0, buyTP, ORDER_TIME_GTC, 0, "Hedge BUY STOP #1"))
          {
             Print("BUY STOP #1 placed at ", buyStopPrice, " TP=", buyTP);
             g_step = STEP_2;
@@ -395,7 +395,7 @@ void OnTick()
          sellStopPrice = NormalizeDouble(sellStopPrice, digits);
          sellTP        = NormalizeDouble(sellTP, digits);
 
-         if(trade.SellStop(Lots_Sell2, sellStopPrice, symbol, 0.0, sellTP, SlippagePoints, 0, ORDER_FILLING_RETURN))
+         if(trade.SellStop(Lots_Sell2, sellStopPrice, symbol, 0.0, sellTP, ORDER_TIME_GTC, 0, "Hedge SELL STOP #2"))
          {
             Print("SELL STOP #2 placed at ", sellStopPrice, " TP=", sellTP);
             g_step = STEP_3;
@@ -420,7 +420,7 @@ void OnTick()
          buyStopPrice = NormalizeDouble(buyStopPrice, digits);
          buyTP        = NormalizeDouble(buyTP, digits);
 
-         if(trade.BuyStop(Lots_Buy2, buyStopPrice, symbol, 0.0, buyTP, SlippagePoints, 0, ORDER_FILLING_RETURN))
+         if(trade.BuyStop(Lots_Buy2, buyStopPrice, symbol, 0.0, buyTP, ORDER_TIME_GTC, 0, "Hedge BUY STOP #2"))
          {
             Print("BUY STOP #2 placed at ", buyStopPrice, " TP=", buyTP);
             g_step = STEP_4;
