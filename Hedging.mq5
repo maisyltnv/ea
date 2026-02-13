@@ -25,7 +25,8 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "Hedging EA with fixed sequence of hedge orders and reset on TP."
+#property description                                                          \
+    "Hedging EA with fixed sequence of hedge orders and reset on TP."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
@@ -35,23 +36,28 @@ input double Lots_Initial = 0.01; // Step 1 BUY lot, Total Buy:0.01
 input double Lots_Sell1 = 0.03;   // SELL STOP #1 lot, Total Sell:0.02
 input double Lots_Buy1 = 0.06;    // BUY STOP #1 lot, Total Buy:0.03
 input double Lots_Sell2 = 0.17;   // SELL STOP #2 lot, Total Sell:0.05
-input int DistancePoints = 100; // Distance between hedge orders (points)
-input int TPPoints = 200;       // Take profit distance (points)
-input int SlippagePoints = 20;  // Slippage (points)
+input int DistancePoints = 100;   // Distance between hedge orders (points)
+input int TPPoints = 200;         // Take profit distance (points)
+input int SlippagePoints = 20;    // Slippage (points)
+input int TPHitTolerancePoints =
+    5; // TP detection tolerance (points) - larger = catch TP sooner
 input int MagicNumber = 246810; // Magic number for this EA
 
-input double DailyProfitPercent = 10.0; // Daily profit target (% of balance) -
-                                        // stop trading for the day when reached
-input double DailyLossPercent = 40.0; // Daily loss limit (% of balance) - stop
-                                      // trading for the day when reached
-input bool UseDailyLimits = true;     // Enable daily profit/loss stop
+input double DailyProfitPercent = 5.0; // Daily profit target (% of balance) -
+                                       // stop trading for the day when reached
+input double DailyLossPercent = 30.0;  // Daily loss limit (% of balance) - stop
+                                       // trading for the day when reached
+input bool UseDailyLimits = true;      // Enable daily profit/loss stop
 
-input bool   UseMacdFilter   = true;  // Only open when MACD > threshold high or < threshold low
-input int    MacdFast        = 12;    // MACD fast EMA
-input int    MacdSlow        = 26;    // MACD slow EMA
-input int    MacdSignal      = 9;     // MACD signal period
-input double MacdThresholdHigh = 2.0;  // Open allowed when MACD line > this (e.g. 0.0002 for forex)
-input double MacdThresholdLow  = -2.0; // Open allowed when MACD line < this (e.g. -0.0002 for forex)
+input bool UseMacdFilter =
+    true; // Only open when MACD > threshold high or < threshold low
+input int MacdFast = 12;  // MACD fast EMA
+input int MacdSlow = 26;  // MACD slow EMA
+input int MacdSignal = 9; // MACD signal period
+input double MacdThresholdHigh =
+    2.0; // Open allowed when MACD line > this (e.g. 0.0002 for forex)
+input double MacdThresholdLow =
+    -2.0; // Open allowed when MACD line < this (e.g. -0.0002 for forex)
 
 //--- trade object
 CTrade trade;
@@ -67,6 +73,9 @@ enum HedgeStep {
   STEP_3 = 3,    // BUY #1 triggered, SELL STOP #2 placed
   STEP_4 = 4     // SELL #2 triggered, BUY STOP #2 placed
 };
+
+//--- when TP hit we close all; keep trying until no EA positions left
+bool g_tpHitClosing = false;
 
 int g_step = STEP_NONE;
 
@@ -92,7 +101,8 @@ bool MacdAllowed() {
 
   double macdBuf[];
   ArraySetAsSeries(macdBuf, true);
-  if (CopyBuffer(g_handleMACD, 0, 1, 1, macdBuf) <= 0)  // buffer 0 = MACD line, bar 1 = last closed
+  if (CopyBuffer(g_handleMACD, 0, 1, 1, macdBuf) <=
+      0) // buffer 0 = MACD line, bar 1 = last closed
     return (false);
 
   double macd = macdBuf[0];
@@ -169,8 +179,9 @@ bool AnyTPHit() {
     if (tp <= 0.0)
       continue;
 
-    // Small tolerance of 0.1 point
-    double tol = point * 0.1;
+    // Tolerance in points so we catch TP before broker closes (avoid missing
+    // tick)
+    double tol = point * (double)MathMax(TPHitTolerancePoints, 1);
 
     if (type == POSITION_TYPE_BUY && bid >= tp - tol)
       return (true);
@@ -326,7 +337,8 @@ int OnInit() {
   g_stoppedForDay = false;
 
   if (UseMacdFilter) {
-    g_handleMACD = iMACD(_Symbol, PERIOD_M1, MacdFast, MacdSlow, MacdSignal, PRICE_CLOSE);
+    g_handleMACD =
+        iMACD(_Symbol, PERIOD_M1, MacdFast, MacdSlow, MacdSignal, PRICE_CLOSE);
     if (g_handleMACD == INVALID_HANDLE) {
       Print("MACD indicator create failed. Error=", GetLastError());
       return (INIT_FAILED);
@@ -391,9 +403,31 @@ void OnTick() {
     }
   }
 
-  // 1) If any TP is hit -> close everything and reset
+  // 1) If we are in "TP hit - close all" mode, keep closing until no EA
+  // positions left
+  if (g_tpHitClosing) {
+    int eaPosCount = 0;
+    for (int i = 0; i < PositionsTotal(); i++) {
+      ulong ticket = PositionGetTicket(i);
+      if (ticket == 0 || !PositionSelectByTicket(ticket))
+        continue;
+      if (PositionGetString(POSITION_SYMBOL) != symbol)
+        continue;
+      if ((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+        continue;
+      eaPosCount++;
+    }
+    if (eaPosCount > 0) {
+      CloseAllAndReset();
+      return;
+    }
+    g_tpHitClosing = false;
+  }
+
+  // 2) If any TP is hit -> close everything and reset
   if (AnyTPHit()) {
     Print("TP reached for one of the positions. Closing all and resetting.");
+    g_tpHitClosing = true;
     CloseAllAndReset();
     return;
   }
@@ -424,7 +458,7 @@ void OnTick() {
     totalOrd++;
   }
 
-  // 2) If nothing exists -> start Step 1 (only when MACD allows)
+  // 3) If nothing exists -> start Step 1 (only when MACD allows)
   if (totalPos == 0 && totalOrd == 0 && g_step == STEP_NONE) {
     if (MacdAllowed()) {
       DoInitialSetup();
@@ -491,8 +525,8 @@ void OnTick() {
       buyStopPrice = NormalizeDouble(buyStopPrice, digits);
       buyTP = NormalizeDouble(buyTP, digits);
 
-      if (trade.BuyStop(0.4, buyStopPrice, symbol, 0.0, buyTP,
-                        ORDER_TIME_GTC, 0, "Hedge BUY STOP #2")) {
+      if (trade.BuyStop(0.4, buyStopPrice, symbol, 0.0, buyTP, ORDER_TIME_GTC,
+                        0, "Hedge BUY STOP #2")) {
         Print("BUY STOP #2 placed at ", buyStopPrice, " TP=", buyTP);
         g_step = STEP_4;
       } else {
@@ -504,4 +538,3 @@ void OnTick() {
     // No further hedge steps defined in the specification.
   }
 }
- 
