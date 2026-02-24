@@ -11,11 +11,12 @@
 #include <Trade/Trade.mqh>
 
 //--- inputs
-input int GridCount = 10; // Number of pending orders in grid
-input int GridDistancePoints =
-    100;                        // Distance between each pending order (points)
-input int SlippagePoints = 20;  // Slippage (points)
-input int MagicNumber = 111222; // Magic for EA grid orders
+input int GridCount = 20;        // Number of pending orders in grid
+input int GridDistancePoints =   //
+    100;                         // Distance between each pending order (points)
+input double GridLotStep = 0.05; // Increment lot size for each grid order
+input int SlippagePoints = 20;   // Slippage (points)
+input int MagicNumber = 111222;  // Magic for EA grid orders
 input int CloseAllProfitPoints =
     500; // If price moves this many points in favor, close all positions/orders
 
@@ -200,8 +201,8 @@ void PlaceGrid(ulong firstTicket) {
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-  double lots =
-      PositionGetDouble(POSITION_VOLUME); // same lot as first position
+  double baseLots =
+      PositionGetDouble(POSITION_VOLUME); // lot size of the first position
   ENUM_POSITION_TYPE type =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
@@ -209,13 +210,28 @@ void PlaceGrid(ulong firstTicket) {
   double currentSL = PositionGetDouble(POSITION_SL);
   double currentTP = PositionGetDouble(POSITION_TP);
   if (currentTP > 0.0 && !trade.PositionModify(firstTicket, currentSL, 0.0))
-    Print("[SetGridManually] Could not clear TP on first position. Error=", GetLastError());
+    Print("[SetGridManually] Could not clear TP on first position. Error=",
+          GetLastError());
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
+  double volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+  double volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+  double volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+
   for (int i = 1; i <= GridCount; i++) {
     double price;
+    // lot size for this grid level: first level = baseLots + GridLotStep
+    double lots = baseLots + GridLotStep * i;
+
+    // Normalize lots to broker step and limits
+    if (volStep > 0.0)
+      lots = MathRound(lots / volStep) * volStep;
+    if (volMin > 0.0 && lots < volMin)
+      lots = volMin;
+    if (volMax > 0.0 && lots > volMax)
+      lots = volMax;
     if (type == POSITION_TYPE_BUY) {
       // BUY LIMIT below entry (add on pullback), no TP
       price = NormalizeDouble(entry - GridDistancePoints * point * i, digits);
@@ -230,7 +246,8 @@ void PlaceGrid(ulong firstTicket) {
               " Error=", GetLastError());
     }
   }
-  Print("[SetGridManually] Grid placed: ", GridCount, " orders, lot ", lots,
+  Print("[SetGridManually] Grid placed: ", GridCount,
+        " orders, base lot ", baseLots, ", lot step ", GridLotStep,
         ", distance ", GridDistancePoints, " pts (no TP).");
 }
 
