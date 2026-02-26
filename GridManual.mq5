@@ -5,20 +5,21 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: one manual position -> add grid of pending orders (no TP)."
+#property description "SetGridManually: one manual position -> add grid of pending orders."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
 
 //--- inputs
-input int GridCount = 20;        // Number of pending orders in grid
-input int GridDistancePoints =   //
-    100;                         // Distance between each pending order (points)
-input double GridLotStep = 0.05; // Increment lot size for each grid order
-input int SlippagePoints = 20;   // Slippage (points)
-input int MagicNumber = 111222;  // Magic for EA grid orders
-input int CloseAllProfitPoints =
-    500; // If price moves this many points in favor, close all positions/orders
+input int GridCount = 4;       // Number of pending orders in grid
+input int GridDistancePoints = //
+    1000;                      // Distance between each pending order (points)
+input double GridLotSize =
+    0.01; // Fixed lot size for all grid orders (no martingale)
+input int SlippagePoints = 20;  // Slippage (points)
+input int MagicNumber = 111222; // Magic for EA grid orders
+input int SLPoints = 4000;      // Stop Loss (points) for grid orders; editable after set
+input int TPPoints = 1000;      // Take Profit (points) for grid orders; editable after set
 
 //--- trade object
 CTrade trade;
@@ -106,26 +107,37 @@ bool GetReferencePosition(double &entryPrice, ENUM_POSITION_TYPE &type) {
 }
 
 //+------------------------------------------------------------------+
-//| Check if TOTAL net profit in points >= CloseAllProfitPoints      |
-//| (sum of all open positions on this symbol, in points)            |
+//| Sync SL/TP on all positions to same levels as first (earliest) order |
 //+------------------------------------------------------------------+
-void CheckCloseAllOnProfit() {
-  if (CloseAllProfitPoints <= 0)
+void SyncSLTPToFirstOrder() {
+  if (CountPositionsOnSymbol() <= 0)
+    return;
+  if (SLPoints <= 0 && TPPoints <= 0)
     return;
 
-  if (CountPositionsOnSymbol() <= 0)
+  double entry;
+  ENUM_POSITION_TYPE type;
+  if (!GetReferencePosition(entry, type))
     return;
 
   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-  if (point <= 0)
+  int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+  if (point <= 0.0)
     return;
 
-  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  double slPrice = 0.0, tpPrice = 0.0;
+  if (type == POSITION_TYPE_BUY) {
+    slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits) : 0.0;
+    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits) : 0.0;
+  } else {
+    slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits) : 0.0;
+    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits) : 0.0;
+  }
 
-  double totalPoints = 0.0;
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
 
-  // Sum net profit in points over all positions on this symbol
+  // Only set SL/TP when not yet set (0/0); never overwrite after user or system has set them
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     ulong t = PositionGetTicket(i);
     if (t == 0 || !PositionSelectByTicket(t))
@@ -133,27 +145,34 @@ void CheckCloseAllOnProfit() {
     if (PositionGetString(POSITION_SYMBOL) != _Symbol)
       continue;
 
-    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-    ENUM_POSITION_TYPE type =
-        (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double curSL = PositionGetDouble(POSITION_SL);
+    double curTP = PositionGetDouble(POSITION_TP);
+    if (curSL != 0.0 || curTP != 0.0)
+      continue;  // already set (by EA or manually) — do not overwrite
 
-    double posPoints = 0.0;
-    if (type == POSITION_TYPE_BUY) {
-      posPoints = (bid - entry) / point;
-    } else if (type == POSITION_TYPE_SELL) {
-      posPoints = (entry - ask) / point;
-    } else {
-      continue;
-    }
-
-    totalPoints += posPoints;
+    if (!trade.PositionModify(t, slPrice, tpPrice))
+      Print("[SetGridManually] SyncSLTP failed for ticket ", t, " Error=", GetLastError());
   }
 
-  if (totalPoints >= CloseAllProfitPoints) {
-    Print("[SetGridManually] CloseAllProfitPoints reached. Total points = ",
-          totalPoints, " >= ", CloseAllProfitPoints,
-          ". Closing all positions and orders on symbol ", _Symbol);
-    CloseAllPositionsAndOrdersOnSymbol();
+  // Same for pending orders: only set when SL/TP are both unset
+  for (int i = OrdersTotal() - 1; i >= 0; i--) {
+    ulong ot = OrderGetTicket(i);
+    if (ot == 0 || !OrderSelect(ot))
+      continue;
+    if (OrderGetString(ORDER_SYMBOL) != _Symbol)
+      continue;
+
+    double curSL = OrderGetDouble(ORDER_SL);
+    double curTP = OrderGetDouble(ORDER_TP);
+    if (curSL != 0.0 || curTP != 0.0)
+      continue;  // already set — do not overwrite
+
+    double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
+    ENUM_ORDER_TYPE_TIME typeTime = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+    datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+
+    if (!trade.OrderModify(ot, orderPrice, slPrice, tpPrice, typeTime, exp))
+      Print("[SetGridManually] SyncSLTP pending failed for order ", ot, " Error=", GetLastError());
   }
 }
 
@@ -201,16 +220,25 @@ void PlaceGrid(ulong firstTicket) {
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-  double baseLots =
-      PositionGetDouble(POSITION_VOLUME); // lot size of the first position
   ENUM_POSITION_TYPE type =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-  // Remove TP from first (manual) position if it had one
-  double currentSL = PositionGetDouble(POSITION_SL);
-  double currentTP = PositionGetDouble(POSITION_TP);
-  if (currentTP > 0.0 && !trade.PositionModify(firstTicket, currentSL, 0.0))
-    Print("[SetGridManually] Could not clear TP on first position. Error=",
+  // SL/TP from first order's entry (same levels for first position and all grid orders)
+  double slPrice = 0.0, tpPrice = 0.0;
+  if (SLPoints > 0 || TPPoints > 0) {
+    if (type == POSITION_TYPE_BUY) {
+      slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits) : 0.0;
+      tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits) : 0.0;
+    } else {
+      slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits) : 0.0;
+      tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits) : 0.0;
+    }
+  }
+
+  // Set SL/TP on the first (open) position
+  if ((slPrice > 0.0 || tpPrice > 0.0) &&
+      !trade.PositionModify(firstTicket, slPrice, tpPrice))
+    Print("[SetGridManually] Could not set SL/TP on first position. Error=",
           GetLastError());
 
   trade.SetExpertMagicNumber(MagicNumber);
@@ -222,8 +250,8 @@ void PlaceGrid(ulong firstTicket) {
 
   for (int i = 1; i <= GridCount; i++) {
     double price;
-    // lot size for this grid level: first level = baseLots + GridLotStep
-    double lots = baseLots + GridLotStep * i;
+    // Fixed lot size for all grid orders (no martingale)
+    double lots = GridLotSize;
 
     // Normalize lots to broker step and limits
     if (volStep > 0.0)
@@ -233,22 +261,22 @@ void PlaceGrid(ulong firstTicket) {
     if (volMax > 0.0 && lots > volMax)
       lots = volMax;
     if (type == POSITION_TYPE_BUY) {
-      // BUY LIMIT below entry (add on pullback), no TP
+      // BUY LIMIT below entry; same SL/TP levels as first order
       price = NormalizeDouble(entry - GridDistancePoints * point * i, digits);
-      if (!trade.BuyLimit(lots, price, symbol, 0.0, 0.0))
+      if (!trade.BuyLimit(lots, price, symbol, slPrice, tpPrice))
         Print("[SetGridManually] BuyLimit failed #", i,
               " Error=", GetLastError());
     } else {
-      // SELL LIMIT above entry (add on bounce), no TP
+      // SELL LIMIT above entry; same SL/TP levels as first order
       price = NormalizeDouble(entry + GridDistancePoints * point * i, digits);
-      if (!trade.SellLimit(lots, price, symbol, 0.0, 0.0))
+      if (!trade.SellLimit(lots, price, symbol, slPrice, tpPrice))
         Print("[SetGridManually] SellLimit failed #", i,
               " Error=", GetLastError());
     }
   }
-  Print("[SetGridManually] Grid placed: ", GridCount,
-        " orders, base lot ", baseLots, ", lot step ", GridLotStep,
-        ", distance ", GridDistancePoints, " pts (no TP).");
+  Print("[SetGridManually] Grid placed: ", GridCount, " orders, fixed lot ",
+        GridLotSize, "; first order + all grid use same SL/TP (", SLPoints, "/",
+        TPPoints, " pts from first entry).");
 }
 
 //+------------------------------------------------------------------+
@@ -258,7 +286,7 @@ int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
   Print("SetGridManually EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
-        " Dist=", GridDistancePoints, " (no TP)");
+        " Dist=", GridDistancePoints, " SL=", SLPoints, " TP=", TPPoints);
   return (INIT_SUCCEEDED);
 }
 
@@ -266,10 +294,10 @@ int OnInit() {
 //| Expert tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick() {
-  // First, check if overall move is in profit enough to close everything
-  CheckCloseAllOnProfit();
+  // Always sync SL/TP on all positions to same levels as first order (e.g. when you open another order)
+  SyncSLTPToFirstOrder();
 
-  // Only act when exactly one position on symbol and no EA pending orders yet
+  // Only place grid when exactly one position on symbol and no EA pending orders yet
   if (CountPositionsOnSymbol() != 1)
     return;
   if (CountEAPendingOnSymbol() > 0)

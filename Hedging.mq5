@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| Hedging EA                                                       |
+//| Hedging EA    version1.0                                                   |
 //| Step-based hedge sequence with reset on any TP hit               |
 //|                                                                  |
 //| Step 1:                                                          |
@@ -25,8 +25,7 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description                                                          \
-    "Hedging EA with fixed sequence of hedge orders and reset on TP."
+#property description "Hedging EA with fixed sequence of hedge orders and reset on TP."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
@@ -36,6 +35,7 @@ input double Lots_Initial = 0.01; // Step 1 BUY lot, Total Buy:0.01
 input double Lots_Sell1 = 0.03;   // SELL STOP #1 lot, Total Sell:0.02
 input double Lots_Buy1 = 0.06;    // BUY STOP #1 lot, Total Buy:0.03
 input double Lots_Sell2 = 0.17;   // SELL STOP #2 lot, Total Sell:0.05
+
 input int DistancePoints = 100;   // Distance between hedge orders (points)
 input int TPPoints = 200;         // Take profit distance (points)
 input int SlippagePoints = 20;    // Slippage (points)
@@ -49,21 +49,8 @@ input double DailyLossPercent = 30.0;  // Daily loss limit (% of balance) - stop
                                        // trading for the day when reached
 input bool UseDailyLimits = true;      // Enable daily profit/loss stop
 
-input bool UseMacdFilter =
-    true; // Only open when MACD > threshold high or < threshold low
-input int MacdFast = 12;  // MACD fast EMA
-input int MacdSlow = 26;  // MACD slow EMA
-input int MacdSignal = 9; // MACD signal period
-input double MacdThresholdHigh =
-    2.0; // Open allowed when MACD line > this (e.g. 0.0002 for forex)
-input double MacdThresholdLow =
-    -2.0; // Open allowed when MACD line < this (e.g. -0.0002 for forex)
-
 //--- trade object
 CTrade trade;
-
-//--- MACD indicator handle
-int g_handleMACD = INVALID_HANDLE;
 
 //--- step state
 enum HedgeStep {
@@ -76,6 +63,7 @@ enum HedgeStep {
 
 //--- when TP hit we close all; keep trying until no EA positions left
 bool g_tpHitClosing = false;
+datetime g_lastTPDealTime = 0; // last TP-closing deal time we processed
 
 int g_step = STEP_NONE;
 
@@ -88,28 +76,6 @@ bool g_stoppedForDay = false; // true when daily profit target or loss limit hit
 //| Helper: approximate comparison of lots                           |
 //+------------------------------------------------------------------+
 bool LotEquals(double v, double t) { return (MathAbs(v - t) < 1e-8); }
-
-//+------------------------------------------------------------------+
-//| Helper: true if MACD(12,26,9) > threshold high or < threshold low |
-//| Only open new cycle when this is true (at start and after TP).   |
-//+------------------------------------------------------------------+
-bool MacdAllowed() {
-  if (!UseMacdFilter)
-    return (true);
-  if (g_handleMACD == INVALID_HANDLE)
-    return (false);
-
-  double macdBuf[];
-  ArraySetAsSeries(macdBuf, true);
-  if (CopyBuffer(g_handleMACD, 0, 1, 1, macdBuf) <=
-      0) // buffer 0 = MACD line, bar 1 = last closed
-    return (false);
-
-  double macd = macdBuf[0];
-  if (macd > MacdThresholdHigh || macd < MacdThresholdLow)
-    return (true);
-  return (false);
-}
 
 //+------------------------------------------------------------------+
 //| Helper: close all EA positions and pending orders                |
@@ -153,41 +119,60 @@ void CloseAllAndReset() {
 }
 
 //+------------------------------------------------------------------+
-//| Helper: check if any TP has been hit (price reached TP)          |
+//| Helper: check if any TP-closing deal occurred since last check   |
+//| Uses trading history (robust even if broker closed TP earlier).  |
 //+------------------------------------------------------------------+
 bool AnyTPHit() {
+  datetime fromTime = 0;
+  datetime toTime = TimeCurrent();
+
+  if (!HistorySelect(fromTime, toTime))
+    return (false);
+
   string symbol = _Symbol;
-  double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-  double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-  double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
-  int totalPos = PositionsTotal();
-  for (int i = 0; i < totalPos; i++) {
-    ulong ticket = PositionGetTicket(i);
-    if (ticket == 0 || !PositionSelectByTicket(ticket))
+  datetime newestTPTime = g_lastTPDealTime;
+  bool found = false;
+
+  int deals = HistoryDealsTotal();
+  for (int i = deals - 1; i >= 0; i--) {
+    ulong dealTicket = HistoryDealGetTicket(i);
+    if (dealTicket == 0)
       continue;
 
-    if (PositionGetString(POSITION_SYMBOL) != symbol)
+    string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+    if (dealSymbol != symbol)
       continue;
 
-    if ((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+    long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+    if ((int)dealMagic != MagicNumber)
       continue;
 
-    ENUM_POSITION_TYPE type =
-        (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double tp = PositionGetDouble(POSITION_TP);
-    if (tp <= 0.0)
+    ENUM_DEAL_ENTRY entry =
+        (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+    if (entry != DEAL_ENTRY_OUT) // closing deal only
       continue;
 
-    // Tolerance in points so we catch TP before broker closes (avoid missing
-    // tick)
-    double tol = point * (double)MathMax(TPHitTolerancePoints, 1);
+    ENUM_DEAL_REASON reason =
+        (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+    if (reason != DEAL_REASON_TP)
+      continue;
 
-    if (type == POSITION_TYPE_BUY && bid >= tp - tol)
-      return (true);
-    if (type == POSITION_TYPE_SELL && ask <= tp + tol)
-      return (true);
+    datetime dTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+    if (dTime <= g_lastTPDealTime)
+      break; // deals are in time order; older ones can be skipped
+
+    if (dTime > newestTPTime) {
+      newestTPTime = dTime;
+      found = true;
+    }
   }
+
+  if (found) {
+    g_lastTPDealTime = newestTPTime;
+    return (true);
+  }
+
   return (false);
 }
 
@@ -336,28 +321,42 @@ int OnInit() {
   g_lastDay = (int)(TimeCurrent() / 86400);
   g_stoppedForDay = false;
 
-  if (UseMacdFilter) {
-    g_handleMACD =
-        iMACD(_Symbol, PERIOD_M1, MacdFast, MacdSlow, MacdSignal, PRICE_CLOSE);
-    if (g_handleMACD == INVALID_HANDLE) {
-      Print("MACD indicator create failed. Error=", GetLastError());
-      return (INIT_FAILED);
+  // Initialize last TP deal time so we only react to NEW TP hits after EA start
+  g_lastTPDealTime = 0;
+  if (HistorySelect(0, TimeCurrent())) {
+    int deals = HistoryDealsTotal();
+    for (int i = deals - 1; i >= 0; i--) {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if (dealTicket == 0)
+        continue;
+
+      string dealSymbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+      if (dealSymbol != _Symbol)
+        continue;
+
+      long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      if ((int)dealMagic != MagicNumber)
+        continue;
+
+      ENUM_DEAL_ENTRY entry =
+          (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+      if (entry != DEAL_ENTRY_OUT)
+        continue;
+
+      ENUM_DEAL_REASON reason =
+          (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+      if (reason != DEAL_REASON_TP)
+        continue;
+
+      g_lastTPDealTime =
+          (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      break; // most recent TP for this EA/symbol
     }
   }
 
   Print("Hedging EA initialized on symbol ", _Symbol,
         " | Start-of-day balance: ", g_startOfDayBalance);
   return (INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| Expert deinitialization                                           |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason) {
-  if (g_handleMACD != INVALID_HANDLE) {
-    IndicatorRelease(g_handleMACD);
-    g_handleMACD = INVALID_HANDLE;
-  }
 }
 
 //+------------------------------------------------------------------+
@@ -458,11 +457,9 @@ void OnTick() {
     totalOrd++;
   }
 
-  // 3) If nothing exists -> start Step 1 (only when MACD allows)
+  // 3) If nothing exists -> start Step 1
   if (totalPos == 0 && totalOrd == 0 && g_step == STEP_NONE) {
-    if (MacdAllowed()) {
-      DoInitialSetup();
-    }
+    DoInitialSetup();
     return;
   }
 
