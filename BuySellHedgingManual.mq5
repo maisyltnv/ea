@@ -3,15 +3,11 @@
 //| Manual start (user opens first BUY or SELL), EA builds hedge     |
 //| ladder of pending stops and closes everything on any TP.         |
 //|                                                                  |
-//| 5-step hedge ladder (lots: 0.01, 0.03, 0.06, 0.17, 0.4)          |
-//| BUY-START (user manually opens BUY):                             |
-//|  - EA sets TP on BUY, places SELL STOP #1 (Step1 = 0.01) below   |
-//|  - Step 1→2: SELL #1 triggers → place BUY STOP #1 (Step2 = 0.03)  |
-//|  - Step 2→3: BUY #1 triggers → place SELL STOP #2 (Step3 = 0.06) |
-//|  - Step 3→4: SELL #2 triggers → place BUY STOP #2 (Step4 = 0.17) |
-//|  - Step 4→5: BUY #2 triggers → place SELL STOP #3 (Step5 = 0.4)  |
-//|  - Step 5: wait; any TP closes all & resets                      |
-//| SELL-START (user manually opens SELL): mirror (BUY/SELL alternates)|
+//| Ladder by lot order: 0.01, 0.03, 0.06, 0.17, 0.40                 |
+//| BUY-START: BUY 0.01 -> SELL STOP 0.03 -> BUY STOP 0.06 ->         |
+//|            SELL STOP 0.17 -> BUY STOP 0.40 -> wait TP             |
+//| SELL-START: SELL 0.01 -> BUY STOP 0.03 -> SELL STOP 0.06 ->       |
+//|             BUY STOP 0.17 -> SELL STOP 0.40 -> wait TP (mirror)   |
 //+------------------------------------------------------------------+
 
 #property strict
@@ -28,10 +24,15 @@ input double Lots_Step2 = 0.03; // Step 2 hedge lot
 input double Lots_Step3 = 0.06; // Step 3 hedge lot
 input double Lots_Step4 = 0.17; // Step 4 hedge lot
 input double Lots_Step5 = 0.40; // Step 5 hedge lot (final)
-input int DistancePoints = 100; // Distance between hedge orders (points)
-input int TPPoints = 230;       // Take profit distance (points) from each entry
+input int DistancePoints = 200; // Distance between hedge orders (points)
+input int TPPoints = 430;       // Take profit distance (points) from each entry
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 987654; // Magic for EA-created orders
+input double StartLot = 0.01;   // Lot when starting via BUY/SELL button
+
+//--- chart button names (for start BUY / start SELL)
+#define BTN_BUY_NAME "HedgingManualBtnBUY"
+#define BTN_SELL_NAME "HedgingManualBtnSELL"
 
 //--- trade object
 CTrade trade;
@@ -249,7 +250,8 @@ void StartBuyCycle(ulong manualTicket) {
   // Set TP for manual BUY
   trade.PositionModify(manualTicket, sl, tp);
 
-  // Place SELL STOP #1 (lot = Step1 = 0.01)
+  // Place SELL STOP #1 (lot = 0.03 = Step2; order: 0.01 buy -> 0.03 sell ->
+  // 0.06 buy -> 0.17 sell -> 0.40 buy)
   double sellPrice = entry - DistancePoints * point;
   double sellTP = sellPrice - TPPoints * point;
   sellPrice = NormalizeDouble(sellPrice, digits);
@@ -258,9 +260,9 @@ void StartBuyCycle(ulong manualTicket) {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  if (trade.SellStop(Lots_Step1, sellPrice, symbol, 0.0, sellTP)) {
-    Print("[HedgingManual] BUY-start: SELL STOP #1 placed at ", sellPrice,
-          " TP=", sellTP);
+  if (trade.SellStop(Lots_Step2, sellPrice, symbol, 0.0, sellTP)) {
+    Print("[HedgingManual] BUY-start: SELL STOP #1 (", Lots_Step2,
+          ") placed at ", sellPrice, " TP=", sellTP);
     g_mode = MODE_BUY_START;
     g_step = STEP_1;
   } else {
@@ -288,7 +290,8 @@ void StartSellCycle(ulong manualTicket) {
   // Set TP for manual SELL
   trade.PositionModify(manualTicket, sl, tp);
 
-  // Place BUY STOP #1 (lot = Step1 = 0.01)
+  // Place BUY STOP #1 (lot = 0.03 = Step2; order: 0.01 sell -> 0.03 buy -> 0.06
+  // sell -> 0.17 buy -> 0.40 sell)
   double buyPrice = entry + DistancePoints * point;
   double buyTP = buyPrice + TPPoints * point;
   buyPrice = NormalizeDouble(buyPrice, digits);
@@ -297,15 +300,51 @@ void StartSellCycle(ulong manualTicket) {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  if (trade.BuyStop(Lots_Step1, buyPrice, symbol, 0.0, buyTP)) {
-    Print("[HedgingManual] SELL-start: BUY STOP #1 placed at ", buyPrice,
-          " TP=", buyTP);
+  if (trade.BuyStop(Lots_Step2, buyPrice, symbol, 0.0, buyTP)) {
+    Print("[HedgingManual] SELL-start: BUY STOP #1 (", Lots_Step2,
+          ") placed at ", buyPrice, " TP=", buyTP);
     g_mode = MODE_SELL_START;
     g_step = STEP_1;
   } else {
     Print("[HedgingManual] SELL-start: failed to place BUY STOP #1. Error=",
           GetLastError());
   }
+}
+
+//+------------------------------------------------------------------+
+//| Create BUY / SELL start buttons on chart                         |
+//+------------------------------------------------------------------+
+void CreateStartButtons() {
+  int x = 10;
+  int y = 30;
+  int w = 70;
+  int h = 24;
+
+  ObjectCreate(0, BTN_BUY_NAME, OBJ_BUTTON, 0, 0, 0);
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_XDISTANCE, x);
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_YDISTANCE, y);
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_XSIZE, w);
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_YSIZE, h);
+  ObjectSetString(0, BTN_BUY_NAME, OBJPROP_TEXT, "BUY");
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_SELECTABLE, false);
+  ObjectSetInteger(0, BTN_BUY_NAME, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+  ObjectCreate(0, BTN_SELL_NAME, OBJ_BUTTON, 0, 0, 0);
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_XDISTANCE, x + w + 5);
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_YDISTANCE, y);
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_XSIZE, w);
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_YSIZE, h);
+  ObjectSetString(0, BTN_SELL_NAME, OBJPROP_TEXT, "SELL");
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_SELECTABLE, false);
+  ObjectSetInteger(0, BTN_SELL_NAME, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+
+  ChartRedraw(0);
+}
+
+void DeleteStartButtons() {
+  ObjectDelete(0, BTN_BUY_NAME);
+  ObjectDelete(0, BTN_SELL_NAME);
+  ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -316,8 +355,60 @@ int OnInit() {
   trade.SetDeviationInPoints(SlippagePoints);
   g_mode = MODE_NONE;
   g_step = STEP_IDLE;
-  Print("HedgingManual EA initialized on symbol ", _Symbol);
+  CreateStartButtons();
+  Print("HedgingManual EA initialized on symbol ", _Symbol,
+        " | BUY/SELL buttons added.");
   return (INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) { DeleteStartButtons(); }
+
+//+------------------------------------------------------------------+
+//| Chart event: handle BUY / SELL button click                      |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam,
+                  const string &sparam) {
+  if (id != CHARTEVENT_OBJECT_CLICK)
+    return;
+  if (sparam != BTN_BUY_NAME && sparam != BTN_SELL_NAME)
+    return;
+
+  string symbol = _Symbol;
+  double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+  int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+  double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+  double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+  double vol = MathMax(SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN), StartLot);
+  double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+  if (step > 0.0)
+    vol = MathRound(vol / step) * step;
+
+  // Open with magic 0 so EA treats it as "manual" and starts cycle
+  trade.SetExpertMagicNumber(0);
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  if (sparam == BTN_BUY_NAME) {
+    if (trade.Buy(vol, symbol, ask, 0.0, 0.0, "Hedging Start BUY")) {
+      Print("[HedgingManual] BUY button: market BUY ", vol,
+            " opened. Cycle will start on next tick.");
+    } else {
+      Print("[HedgingManual] BUY button failed. Error=", GetLastError());
+    }
+  } else if (sparam == BTN_SELL_NAME) {
+    if (trade.Sell(vol, symbol, bid, 0.0, 0.0, "Hedging Start SELL")) {
+      Print("[HedgingManual] SELL button: market SELL ", vol,
+            " opened. Cycle will start on next tick.");
+    } else {
+      Print("[HedgingManual] SELL button failed. Error=", GetLastError());
+    }
+  }
+
+  trade.SetExpertMagicNumber(MagicNumber);
+  ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -387,18 +478,18 @@ void OnTick() {
   trade.SetExpertMagicNumber(MagicNumber);
 
   if (g_mode == MODE_BUY_START) {
-    // BUY-based cycle: manual BUY -> SELL(Step1) -> BUY(Step2) -> SELL(Step3)
-    // -> BUY(Step4) -> SELL(Step5) -> wait TP
+    // Order: BUY 0.01 -> SELL STOP 0.03 -> BUY STOP 0.06 -> SELL STOP 0.17 ->
+    // BUY STOP 0.40 -> wait TP
     if (g_step == STEP_1) {
-      bool hasSell1 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step1, entryPrice);
-      bool hasBuyStop1 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step2);
+      bool hasSell1 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step2, entryPrice);
+      bool hasBuyStop1 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step3);
       if (hasSell1 && !hasBuyStop1) {
         double buyPrice = entryPrice + DistancePoints * point;
         double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
         buyTP = NormalizeDouble(buyTP, digits);
-        if (trade.BuyStop(Lots_Step2, buyPrice, symbol, 0.0, buyTP)) {
-          Print("[HedgingManual] BUY-start: BUY STOP #1 (", Lots_Step2, ") at ",
+        if (trade.BuyStop(Lots_Step3, buyPrice, symbol, 0.0, buyTP)) {
+          Print("[HedgingManual] BUY-start: BUY STOP #1 (", Lots_Step3, ") at ",
                 buyPrice);
           g_step = STEP_2;
         } else
@@ -406,15 +497,15 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_2) {
-      bool hasBuy2 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step2, entryPrice);
-      bool hasSellStop2 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step3);
+      bool hasBuy2 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step3, entryPrice);
+      bool hasSellStop2 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step4);
       if (hasBuy2 && !hasSellStop2) {
         double sellPrice = entryPrice - DistancePoints * point;
         double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
         sellTP = NormalizeDouble(sellTP, digits);
-        if (trade.SellStop(Lots_Step3, sellPrice, symbol, 0.0, sellTP)) {
-          Print("[HedgingManual] BUY-start: SELL STOP #2 (", Lots_Step3,
+        if (trade.SellStop(Lots_Step4, sellPrice, symbol, 0.0, sellTP)) {
+          Print("[HedgingManual] BUY-start: SELL STOP #2 (", Lots_Step4,
                 ") at ", sellPrice);
           g_step = STEP_3;
         } else
@@ -422,15 +513,15 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_3) {
-      bool hasSell3 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step3, entryPrice);
-      bool hasBuyStop3 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step4);
+      bool hasSell3 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step4, entryPrice);
+      bool hasBuyStop3 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step5);
       if (hasSell3 && !hasBuyStop3) {
         double buyPrice = entryPrice + DistancePoints * point;
         double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
         buyTP = NormalizeDouble(buyTP, digits);
-        if (trade.BuyStop(Lots_Step4, buyPrice, symbol, 0.0, buyTP)) {
-          Print("[HedgingManual] BUY-start: BUY STOP #2 (", Lots_Step4, ") at ",
+        if (trade.BuyStop(Lots_Step5, buyPrice, symbol, 0.0, buyTP)) {
+          Print("[HedgingManual] BUY-start: BUY STOP #2 (", Lots_Step5, ") at ",
                 buyPrice);
           g_step = STEP_4;
         } else
@@ -438,37 +529,21 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_4) {
-      bool hasBuy4 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step4, entryPrice);
-      bool hasSellStop4 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step5);
-      if (hasBuy4 && !hasSellStop4) {
-        double sellPrice = entryPrice - DistancePoints * point;
-        double sellTP = sellPrice - TPPoints * point;
-        sellPrice = NormalizeDouble(sellPrice, digits);
-        sellTP = NormalizeDouble(sellTP, digits);
-        if (trade.SellStop(Lots_Step5, sellPrice, symbol, 0.0, sellTP)) {
-          Print("[HedgingManual] BUY-start: SELL STOP #3 (", Lots_Step5,
-                ") at ", sellPrice);
-          g_step = STEP_5;
-        } else
-          Print("[HedgingManual] BUY-start: failed SELL STOP #3. Error=",
-                GetLastError());
-      }
-    } else if (g_step == STEP_5) {
-      // Final: all 5 steps placed; wait for TP (handled at top)
+      // Final: BUY 0.40 in market; wait for TP (handled at top)
     }
   } else if (g_mode == MODE_SELL_START) {
-    // SELL-based cycle: manual SELL -> BUY(Step1) -> SELL(Step2) -> BUY(Step3)
-    // -> SELL(Step4) -> BUY(Step5) -> wait TP
+    // Order: SELL 0.01 -> BUY STOP 0.03 -> SELL STOP 0.06 -> BUY STOP 0.17 ->
+    // SELL STOP 0.40 -> wait TP (mirror of BUY)
     if (g_step == STEP_1) {
-      bool hasBuy1 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step1, entryPrice);
-      bool hasSellStop1 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step2);
+      bool hasBuy1 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step2, entryPrice);
+      bool hasSellStop1 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step3);
       if (hasBuy1 && !hasSellStop1) {
         double sellPrice = entryPrice - DistancePoints * point;
         double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
         sellTP = NormalizeDouble(sellTP, digits);
-        if (trade.SellStop(Lots_Step2, sellPrice, symbol, 0.0, sellTP)) {
-          Print("[HedgingManual] SELL-start: SELL STOP #1 (", Lots_Step2,
+        if (trade.SellStop(Lots_Step3, sellPrice, symbol, 0.0, sellTP)) {
+          Print("[HedgingManual] SELL-start: SELL STOP #1 (", Lots_Step3,
                 ") at ", sellPrice);
           g_step = STEP_2;
         } else
@@ -476,15 +551,15 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_2) {
-      bool hasSell2 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step2, entryPrice);
-      bool hasBuyStop2 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step3);
+      bool hasSell2 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step3, entryPrice);
+      bool hasBuyStop2 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step4);
       if (hasSell2 && !hasBuyStop2) {
         double buyPrice = entryPrice + DistancePoints * point;
         double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
         buyTP = NormalizeDouble(buyTP, digits);
-        if (trade.BuyStop(Lots_Step3, buyPrice, symbol, 0.0, buyTP)) {
-          Print("[HedgingManual] SELL-start: BUY STOP #2 (", Lots_Step3,
+        if (trade.BuyStop(Lots_Step4, buyPrice, symbol, 0.0, buyTP)) {
+          Print("[HedgingManual] SELL-start: BUY STOP #2 (", Lots_Step4,
                 ") at ", buyPrice);
           g_step = STEP_3;
         } else
@@ -492,15 +567,15 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_3) {
-      bool hasBuy3 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step3, entryPrice);
-      bool hasSellStop3 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step4);
+      bool hasBuy3 = GetEAPosition(POSITION_TYPE_BUY, Lots_Step4, entryPrice);
+      bool hasSellStop3 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step5);
       if (hasBuy3 && !hasSellStop3) {
         double sellPrice = entryPrice - DistancePoints * point;
         double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
         sellTP = NormalizeDouble(sellTP, digits);
-        if (trade.SellStop(Lots_Step4, sellPrice, symbol, 0.0, sellTP)) {
-          Print("[HedgingManual] SELL-start: SELL STOP #2 (", Lots_Step4,
+        if (trade.SellStop(Lots_Step5, sellPrice, symbol, 0.0, sellTP)) {
+          Print("[HedgingManual] SELL-start: SELL STOP #2 (", Lots_Step5,
                 ") at ", sellPrice);
           g_step = STEP_4;
         } else
@@ -508,23 +583,7 @@ void OnTick() {
                 GetLastError());
       }
     } else if (g_step == STEP_4) {
-      bool hasSell4 = GetEAPosition(POSITION_TYPE_SELL, Lots_Step4, entryPrice);
-      bool hasBuyStop4 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step5);
-      if (hasSell4 && !hasBuyStop4) {
-        double buyPrice = entryPrice + DistancePoints * point;
-        double buyTP = buyPrice + TPPoints * point;
-        buyPrice = NormalizeDouble(buyPrice, digits);
-        buyTP = NormalizeDouble(buyTP, digits);
-        if (trade.BuyStop(Lots_Step5, buyPrice, symbol, 0.0, buyTP)) {
-          Print("[HedgingManual] SELL-start: BUY STOP #3 (", Lots_Step5,
-                ") at ", buyPrice);
-          g_step = STEP_5;
-        } else
-          Print("[HedgingManual] SELL-start: failed BUY STOP #3. Error=",
-                GetLastError());
-      }
-    } else if (g_step == STEP_5) {
-      // Final: all 5 steps placed; wait for TP (handled at top)
+      // Final: SELL 0.40 in market; wait for TP (handled at top)
     }
   }
 }

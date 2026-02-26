@@ -35,6 +35,7 @@ input double Lots_Initial = 0.01; // Step 1 BUY lot, Total Buy:0.01
 input double Lots_Sell1 = 0.03;   // SELL STOP #1 lot, Total Sell:0.02
 input double Lots_Buy1 = 0.06;    // BUY STOP #1 lot, Total Buy:0.03
 input double Lots_Sell2 = 0.17;   // SELL STOP #2 lot, Total Sell:0.05
+input double Lots_Buy2 = 0.40;    // BUY STOP #2 lot (was hardcoded 0.4)
 
 input int DistancePoints = 100;   // Distance between hedge orders (points)
 input int TPPoints = 200;         // Take profit distance (points)
@@ -75,7 +76,23 @@ bool g_stoppedForDay = false; // true when daily profit target or loss limit hit
 //+------------------------------------------------------------------+
 //| Helper: approximate comparison of lots                           |
 //+------------------------------------------------------------------+
-bool LotEquals(double v, double t) { return (MathAbs(v - t) < 1e-8); }
+bool LotEquals(double v, double t) { return (MathAbs(v - t) < 1e-5); }
+
+//+------------------------------------------------------------------+
+//| Normalize lot to symbol step and min/max                          |
+//+------------------------------------------------------------------+
+double NormalizeLot(string symbol, double lots) {
+  double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+  double minVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+  double maxVol = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+  if (step > 0.0)
+    lots = MathRound(lots / step) * step;
+  if (minVol > 0.0 && lots < minVol)
+    lots = minVol;
+  if (maxVol > 0.0 && lots > maxVol)
+    lots = maxVol;
+  return (lots);
+}
 
 //+------------------------------------------------------------------+
 //| Helper: close all EA positions and pending orders                |
@@ -123,8 +140,8 @@ void CloseAllAndReset() {
 //| Uses trading history (robust even if broker closed TP earlier).  |
 //+------------------------------------------------------------------+
 bool AnyTPHit() {
-  datetime fromTime = 0;
   datetime toTime = TimeCurrent();
+  datetime fromTime = toTime - 86400 * 31; // last 31 days (0 can fail on some brokers)
 
   if (!HistorySelect(fromTime, toTime))
     return (false);
@@ -277,6 +294,9 @@ void DoInitialSetup() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
+  double lotBuy = NormalizeLot(symbol, Lots_Initial);
+  double lotSell1 = NormalizeLot(symbol, Lots_Sell1);
+
   // Open initial BUY
   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
   double buyPrice = ask;
@@ -284,7 +304,7 @@ void DoInitialSetup() {
   buyPrice = NormalizeDouble(buyPrice, digits);
   buyTP = NormalizeDouble(buyTP, digits);
 
-  if (trade.Buy(Lots_Initial, symbol, buyPrice, 0.0, buyTP, "Hedge BUY #0")) {
+  if (trade.Buy(lotBuy, symbol, buyPrice, 0.0, buyTP, "Hedge BUY #0")) {
     Print("Initial BUY opened at ", buyPrice, " TP=", buyTP);
 
     // Place SELL STOP #1
@@ -293,7 +313,7 @@ void DoInitialSetup() {
     sellPrice = NormalizeDouble(sellPrice, digits);
     sellTP = NormalizeDouble(sellTP, digits);
 
-    if (trade.SellStop(Lots_Sell1, sellPrice, symbol, 0.0, sellTP,
+    if (trade.SellStop(lotSell1, sellPrice, symbol, 0.0, sellTP,
                        ORDER_TIME_GTC, 0, "Hedge SELL STOP #1")) {
       Print("SELL STOP #1 placed at ", sellPrice, " TP=", sellTP);
       g_step = STEP_1;
@@ -309,10 +329,8 @@ void DoInitialSetup() {
 //| Expert initialization                                             |
 //+------------------------------------------------------------------+
 int OnInit() {
-  if (_Period != PERIOD_M1) {
-    Print("Hedging EA works on M1 only. Please switch chart to M1 timeframe.");
-    return (INIT_FAILED);
-  }
+  if (_Period != PERIOD_M1)
+    Print("Hedging EA: M1 recommended. Running on ", EnumToString((ENUM_TIMEFRAMES)_Period), ".");
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
@@ -323,7 +341,8 @@ int OnInit() {
 
   // Initialize last TP deal time so we only react to NEW TP hits after EA start
   g_lastTPDealTime = 0;
-  if (HistorySelect(0, TimeCurrent())) {
+  datetime toNow = TimeCurrent();
+  if (HistorySelect(toNow - 86400 * 31, toNow)) {
     int deals = HistoryDealsTotal();
     for (int i = deals - 1; i >= 0; i--) {
       ulong dealTicket = HistoryDealGetTicket(i);
@@ -481,8 +500,9 @@ void OnTick() {
       double buyTP = buyStopPrice + TPPoints * point;
       buyStopPrice = NormalizeDouble(buyStopPrice, digits);
       buyTP = NormalizeDouble(buyTP, digits);
+      double lotBuy1 = NormalizeLot(symbol, Lots_Buy1);
 
-      if (trade.BuyStop(Lots_Buy1, buyStopPrice, symbol, 0.0, buyTP,
+      if (trade.BuyStop(lotBuy1, buyStopPrice, symbol, 0.0, buyTP,
                         ORDER_TIME_GTC, 0, "Hedge BUY STOP #1")) {
         Print("BUY STOP #1 placed at ", buyStopPrice, " TP=", buyTP);
         g_step = STEP_2;
@@ -501,8 +521,9 @@ void OnTick() {
       double sellTP = sellStopPrice - TPPoints * point;
       sellStopPrice = NormalizeDouble(sellStopPrice, digits);
       sellTP = NormalizeDouble(sellTP, digits);
+      double lotSell2 = NormalizeLot(symbol, Lots_Sell2);
 
-      if (trade.SellStop(Lots_Sell2, sellStopPrice, symbol, 0.0, sellTP,
+      if (trade.SellStop(lotSell2, sellStopPrice, symbol, 0.0, sellTP,
                          ORDER_TIME_GTC, 0, "Hedge SELL STOP #2")) {
         Print("SELL STOP #2 placed at ", sellStopPrice, " TP=", sellTP);
         g_step = STEP_3;
@@ -511,18 +532,18 @@ void OnTick() {
       }
     }
   } else if (g_step == STEP_3) {
-    // SELL STOP #2 should have triggered if there is a SELL 0.03 and
-    // no BUY STOP #2 yet
+    // SELL STOP #2 triggered -> we have SELL Lots_Sell2; place BUY STOP #2
     bool hasSell2 = GetPosition(POSITION_TYPE_SELL, Lots_Sell2, entryPrice);
-    bool hasBuyStop2 = HasPending(ORDER_TYPE_BUY_STOP, 0.4);
+    bool hasBuyStop2 = HasPending(ORDER_TYPE_BUY_STOP, Lots_Buy2);
 
     if (hasSell2 && !hasBuyStop2) {
       double buyStopPrice = entryPrice + DistancePoints * point;
       double buyTP = buyStopPrice + TPPoints * point;
       buyStopPrice = NormalizeDouble(buyStopPrice, digits);
       buyTP = NormalizeDouble(buyTP, digits);
+      double lotBuy2 = NormalizeLot(symbol, Lots_Buy2);
 
-      if (trade.BuyStop(0.4, buyStopPrice, symbol, 0.0, buyTP, ORDER_TIME_GTC,
+      if (trade.BuyStop(lotBuy2, buyStopPrice, symbol, 0.0, buyTP, ORDER_TIME_GTC,
                         0, "Hedge BUY STOP #2")) {
         Print("BUY STOP #2 placed at ", buyStopPrice, " TP=", buyTP);
         g_step = STEP_4;
