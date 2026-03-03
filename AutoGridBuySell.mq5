@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: one manual position -> add grid of pending orders (no TP)."
+#property description "AutoGridBuySell: EMA-based auto BUY/SELL grid (no TP)."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
@@ -14,11 +14,12 @@
 input int GridCount = 20;        // Number of pending orders in grid
 input int GridDistancePoints =   //
     200;                         // Distance between each pending order (points)
-input double GridLotStep = 0.05; // Increment lot size for each grid order
+input double GridLotStep = 0.01; // Increment lot size for each grid order
+input double InitialLot = 0.01;  // First position lot for each side
 input int SlippagePoints = 20;   // Slippage (points)
 input int MagicNumber = 111222;  // Magic for EA grid orders
-input int CloseAllProfitPoints =
-    500; // If price moves this many points in favor, close all positions/orders
+input int CloseAllProfitPoints = 500; // Per-side: if total points >= this,
+                                      // close all positions/orders of that side
 
 //--- trade object
 CTrade trade;
@@ -135,13 +136,12 @@ int CountEAPendingBySide(ENUM_POSITION_TYPE side) {
       continue;
 
     ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    bool isBuySide = (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
-                      otype == ORDER_TYPE_BUY_STOP ||
-                      otype == ORDER_TYPE_BUY_STOP_LIMIT);
-    bool isSellSide = (otype == ORDER_TYPE_SELL ||
-                       otype == ORDER_TYPE_SELL_LIMIT ||
-                       otype == ORDER_TYPE_SELL_STOP ||
-                       otype == ORDER_TYPE_SELL_STOP_LIMIT);
+    bool isBuySide =
+        (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
+         otype == ORDER_TYPE_BUY_STOP || otype == ORDER_TYPE_BUY_STOP_LIMIT);
+    bool isSellSide =
+        (otype == ORDER_TYPE_SELL || otype == ORDER_TYPE_SELL_LIMIT ||
+         otype == ORDER_TYPE_SELL_STOP || otype == ORDER_TYPE_SELL_STOP_LIMIT);
 
     if (side == POSITION_TYPE_BUY && isBuySide)
       n++;
@@ -173,8 +173,9 @@ void CloseSidePositionsAndOrders(ENUM_POSITION_TYPE side) {
       continue;
 
     if (!trade.PositionClose(t)) {
-      Print("[SetGridManually] Failed to close ", (side == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-            " position ticket ", t, " Error=", GetLastError());
+      Print("[SetGridManually] Failed to close ",
+            (side == POSITION_TYPE_BUY ? "BUY" : "SELL"), " position ticket ",
+            t, " Error=", GetLastError());
     }
   }
 
@@ -187,13 +188,12 @@ void CloseSidePositionsAndOrders(ENUM_POSITION_TYPE side) {
       continue;
 
     ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    bool isBuySide = (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
-                      otype == ORDER_TYPE_BUY_STOP ||
-                      otype == ORDER_TYPE_BUY_STOP_LIMIT);
-    bool isSellSide = (otype == ORDER_TYPE_SELL ||
-                       otype == ORDER_TYPE_SELL_LIMIT ||
-                       otype == ORDER_TYPE_SELL_STOP ||
-                       otype == ORDER_TYPE_SELL_STOP_LIMIT);
+    bool isBuySide =
+        (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
+         otype == ORDER_TYPE_BUY_STOP || otype == ORDER_TYPE_BUY_STOP_LIMIT);
+    bool isSellSide =
+        (otype == ORDER_TYPE_SELL || otype == ORDER_TYPE_SELL_LIMIT ||
+         otype == ORDER_TYPE_SELL_STOP || otype == ORDER_TYPE_SELL_STOP_LIMIT);
 
     if (side == POSITION_TYPE_BUY && !isBuySide)
       continue;
@@ -251,7 +251,8 @@ void CheckCloseSideOnProfit(ENUM_POSITION_TYPE side) {
     Print("[SetGridManually] CloseAllProfitPoints reached for ",
           (side == POSITION_TYPE_BUY ? "BUY" : "SELL"),
           " side. Total points = ", totalPoints, " >= ", CloseAllProfitPoints,
-          ". Closing all positions and orders for that side on symbol ", _Symbol);
+          ". Closing all positions and orders for that side on symbol ",
+          _Symbol);
     CloseSidePositionsAndOrders(side);
   }
 }
@@ -365,8 +366,12 @@ void PlaceGrid(ulong firstTicket) {
 int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
-  Print("SetGridManually EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
-        " Dist=", GridDistancePoints, " (no TP)");
+  if (_Period != PERIOD_M1) {
+    Print("AutoGridBuySell EA is designed for M1. Current timeframe = ",
+          EnumToString((ENUM_TIMEFRAMES)_Period));
+  }
+  Print("AutoGridBuySell EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
+        " Dist=", GridDistancePoints, " InitialLot=", InitialLot);
   return (INIT_SUCCEEDED);
 }
 
@@ -378,14 +383,86 @@ void OnTick() {
   CheckCloseSideOnProfit(POSITION_TYPE_BUY);
   CheckCloseSideOnProfit(POSITION_TYPE_SELL);
 
-  // BUY side: if we have at least one BUY position and no BUY-side EA pendings, place BUY grid
+  string symbol = _Symbol;
+  double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+  double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+  double mid = (bid + ask) * 0.5;
+
+  // Calculate EMA9 and EMA50 on M1 timeframe (MQL5: iMA returns handle)
+  int ema9Handle = iMA(symbol, PERIOD_M1, 9, 0, MODE_EMA, PRICE_CLOSE);
+  int ema50Handle = iMA(symbol, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE);
+  if (ema9Handle == INVALID_HANDLE || ema50Handle == INVALID_HANDLE)
+    return;
+
+  double ema9Buf[1], ema50Buf[1];
+  if (CopyBuffer(ema9Handle, 0, 0, 1, ema9Buf) <= 0 ||
+      CopyBuffer(ema50Handle, 0, 0, 1, ema50Buf) <= 0)
+    return;
+
+  double ema9 = ema9Buf[0];
+  double ema50 = ema50Buf[0];
+
+  if (ema9 == 0.0 || ema50 == 0.0)
+    return;
+
+  // Auto-open first BUY position for grid when bullish condition holds:
+  // price > EMA9 and EMA9 > EMA50, and no BUY positions or BUY-side pendings
+  // yet.
+  if (mid > ema9 && ema9 > ema50 &&
+      CountPositionsByType(POSITION_TYPE_BUY) == 0 &&
+      CountEAPendingBySide(POSITION_TYPE_BUY) == 0) {
+    double lot = InitialLot;
+    double volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+    double volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+    double volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+    if (volStep > 0.0)
+      lot = MathRound(lot / volStep) * volStep;
+    if (volMin > 0.0 && lot < volMin)
+      lot = volMin;
+    if (volMax > 0.0 && lot > volMax)
+      lot = volMax;
+
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(SlippagePoints);
+    if (trade.Buy(lot, symbol, 0.0, 0.0, 0.0))
+      Print("[AutoGridBuySell] Opened initial BUY ", lot,
+            " based on EMA condition (price>EMA9>EMA50).");
+  }
+
+  // Auto-open first SELL position for grid when bearish condition holds:
+  // price < EMA9 and EMA9 < EMA50, and no SELL positions or SELL-side pendings
+  // yet.
+  if (mid < ema9 && ema9 < ema50 &&
+      CountPositionsByType(POSITION_TYPE_SELL) == 0 &&
+      CountEAPendingBySide(POSITION_TYPE_SELL) == 0) {
+    double lot = InitialLot;
+    double volStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+    double volMin = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+    double volMax = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+    if (volStep > 0.0)
+      lot = MathRound(lot / volStep) * volStep;
+    if (volMin > 0.0 && lot < volMin)
+      lot = volMin;
+    if (volMax > 0.0 && lot > volMax)
+      lot = volMax;
+
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(SlippagePoints);
+    if (trade.Sell(lot, symbol, 0.0, 0.0, 0.0))
+      Print("[AutoGridBuySell] Opened initial SELL ", lot,
+            " based on EMA condition (price<EMA9<EMA50).");
+  }
+
+  // BUY side: if we have at least one BUY position and no BUY-side EA pendings,
+  // place BUY grid
   ulong buyTicket;
   if (GetReferencePositionBySide(POSITION_TYPE_BUY, buyTicket) &&
       CountEAPendingBySide(POSITION_TYPE_BUY) == 0) {
     PlaceGrid(buyTicket);
   }
 
-  // SELL side: if we have at least one SELL position and no SELL-side EA pendings, place SELL grid
+  // SELL side: if we have at least one SELL position and no SELL-side EA
+  // pendings, place SELL grid
   ulong sellTicket;
   if (GetReferencePositionBySide(POSITION_TYPE_SELL, sellTicket) &&
       CountEAPendingBySide(POSITION_TYPE_SELL) == 0) {

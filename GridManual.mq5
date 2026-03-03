@@ -5,21 +5,26 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: one manual position -> add grid of pending orders."
+#property description
+"SetGridManually: one manual position -> add grid of pending orders."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
 
-//--- inputs
-input int GridCount = 4;       // Number of pending orders in grid
+    //--- inputs
+    input int GridCount = 4;   // Number of pending orders in grid
 input int GridDistancePoints = //
     1000;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.01; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
-input int SLPoints = 4000;      // Stop Loss (points) for grid orders; editable after set
-input int TPPoints = 1000;      // Take Profit (points) for grid orders; editable after set
+input int SLPoints =
+    4500; // Stop Loss (points) for grid orders; editable after set
+input int TPPoints =
+    1000; // Take Profit (points) for grid orders; editable after set
+input double MaxFloatingLossUSD =
+    180.0; // If total floating loss <= -this, close all
 
 //--- trade object
 CTrade trade;
@@ -127,17 +132,22 @@ void SyncSLTPToFirstOrder() {
 
   double slPrice = 0.0, tpPrice = 0.0;
   if (type == POSITION_TYPE_BUY) {
-    slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits) : 0.0;
-    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits) : 0.0;
+    slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits)
+                             : 0.0;
+    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits)
+                             : 0.0;
   } else {
-    slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits) : 0.0;
-    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits) : 0.0;
+    slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits)
+                             : 0.0;
+    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits)
+                             : 0.0;
   }
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  // Only set SL/TP when not yet set (0/0); never overwrite after user or system has set them
+  // Only set SL/TP when not yet set (0/0); never overwrite after user or system
+  // has set them
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     ulong t = PositionGetTicket(i);
     if (t == 0 || !PositionSelectByTicket(t))
@@ -148,10 +158,11 @@ void SyncSLTPToFirstOrder() {
     double curSL = PositionGetDouble(POSITION_SL);
     double curTP = PositionGetDouble(POSITION_TP);
     if (curSL != 0.0 || curTP != 0.0)
-      continue;  // already set (by EA or manually) — do not overwrite
+      continue; // already set (by EA or manually) — do not overwrite
 
     if (!trade.PositionModify(t, slPrice, tpPrice))
-      Print("[SetGridManually] SyncSLTP failed for ticket ", t, " Error=", GetLastError());
+      Print("[SetGridManually] SyncSLTP failed for ticket ", t,
+            " Error=", GetLastError());
   }
 
   // Same for pending orders: only set when SL/TP are both unset
@@ -165,14 +176,16 @@ void SyncSLTPToFirstOrder() {
     double curSL = OrderGetDouble(ORDER_SL);
     double curTP = OrderGetDouble(ORDER_TP);
     if (curSL != 0.0 || curTP != 0.0)
-      continue;  // already set — do not overwrite
+      continue; // already set — do not overwrite
 
     double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-    ENUM_ORDER_TYPE_TIME typeTime = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+    ENUM_ORDER_TYPE_TIME typeTime =
+        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
     datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
 
     if (!trade.OrderModify(ot, orderPrice, slPrice, tpPrice, typeTime, exp))
-      Print("[SetGridManually] SyncSLTP pending failed for order ", ot, " Error=", GetLastError());
+      Print("[SetGridManually] SyncSLTP pending failed for order ", ot,
+            " Error=", GetLastError());
   }
 }
 
@@ -223,15 +236,24 @@ void PlaceGrid(ulong firstTicket) {
   ENUM_POSITION_TYPE type =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
-  // SL/TP from first order's entry (same levels for first position and all grid orders)
+  // SL/TP from first order's entry (same levels for first position and all grid
+  // orders)
   double slPrice = 0.0, tpPrice = 0.0;
   if (SLPoints > 0 || TPPoints > 0) {
     if (type == POSITION_TYPE_BUY) {
-      slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits) : 0.0;
-      tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits) : 0.0;
+      slPrice = (SLPoints > 0)
+                    ? NormalizeDouble(entry - SLPoints * point, digits)
+                    : 0.0;
+      tpPrice = (TPPoints > 0)
+                    ? NormalizeDouble(entry + TPPoints * point, digits)
+                    : 0.0;
     } else {
-      slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits) : 0.0;
-      tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits) : 0.0;
+      slPrice = (SLPoints > 0)
+                    ? NormalizeDouble(entry + SLPoints * point, digits)
+                    : 0.0;
+      tpPrice = (TPPoints > 0)
+                    ? NormalizeDouble(entry - TPPoints * point, digits)
+                    : 0.0;
     }
   }
 
@@ -294,10 +316,34 @@ int OnInit() {
 //| Expert tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick() {
-  // Always sync SL/TP on all positions to same levels as first order (e.g. when you open another order)
+  // Emergency: close everything if floating loss exceeds threshold (in USD)
+  if (MaxFloatingLossUSD > 0.0) {
+    double totalProfit = 0.0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong t = PositionGetTicket(i);
+      if (t == 0 || !PositionSelectByTicket(t))
+        continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+        continue;
+
+      totalProfit += PositionGetDouble(POSITION_PROFIT);
+    }
+    if (totalProfit <= -MaxFloatingLossUSD) {
+      Print("[SetGridManually] Floating loss reached ",
+            DoubleToString(totalProfit, 2), " USD (threshold = -",
+            DoubleToString(MaxFloatingLossUSD, 2),
+            "). Closing all positions and orders on symbol ", _Symbol);
+      CloseAllPositionsAndOrdersOnSymbol();
+      return;
+    }
+  }
+
+  // Always sync SL/TP on all positions to same levels as first order (e.g. when
+  // you open another order)
   SyncSLTPToFirstOrder();
 
-  // Only place grid when exactly one position on symbol and no EA pending orders yet
+  // Only place grid when exactly one position on symbol and no EA pending
+  // orders yet
   if (CountPositionsOnSymbol() != 1)
     return;
   if (CountEAPendingOnSymbol() > 0)
