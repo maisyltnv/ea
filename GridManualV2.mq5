@@ -5,16 +5,15 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description                                                          \
-    "SetGridManually: one manual position -> add grid of pending orders."
+#property description "SetGridManually: one manual position -> add grid of pending orders."
 #property version "1.00"
 
 #include <Trade/Trade.mqh>
 
 //--- inputs
-input int GridCount = 3; // Number of pending orders in grid
-input int GridDistancePoints =
-    1000; // Distance between each pending order (points)
+input int GridCount = 4;       // Number of pending orders in grid
+input int GridDistancePoints = //
+    1000;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.01; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
@@ -22,7 +21,7 @@ input int MagicNumber = 111222; // Magic for EA grid orders
 input int SLPoints =
     4500; // Stop Loss (points) for grid orders; editable after set
 input int TPPoints =
-    2000; // Take Profit (points) for grid orders; editable after set
+    1000; // Take Profit (points) for grid orders; editable after set
 input double MaxFloatingLossUSD =
     180.0; // If total floating loss <= -this, close all
 
@@ -31,15 +30,6 @@ CTrade trade;
 // Remember which position ticket already had its grid placed,
 // so if user deletes pending orders manually we don't place grid again
 ulong g_lastGridTicket = 0;
-
-// Track previous SL/TP per position ticket so we can detect
-// when the user has manually changed SL/TP on one position
-// and then sync all other open positions accordingly.
-#define MAX_TRACKED_POSITIONS 100
-int g_prevPosCount = 0;
-ulong g_prevPosTickets[MAX_TRACKED_POSITIONS];
-double g_prevPosTP[MAX_TRACKED_POSITIONS];
-double g_prevPosSL[MAX_TRACKED_POSITIONS];
 
 //+------------------------------------------------------------------+
 //| Count positions and EA pending orders for symbol                  |
@@ -56,60 +46,43 @@ int CountPositionsOnSymbol() {
   return n;
 }
 
-// Count all pending orders on symbol (any magic) for emergency-close check
-int CountPendingOrdersOnSymbol() {
-  int n = 0;
-  for (int i = OrdersTotal() - 1; i >= 0; i--) {
-    ulong t = OrderGetTicket(i);
-    if (t == 0 || !OrderSelect(t))
-      continue;
-    if (OrderGetString(ORDER_SYMBOL) == _Symbol)
-      n++;
-  }
-  return n;
-}
-
 //+------------------------------------------------------------------+
 //| Close all positions and pending orders on this symbol             |
-//| Order: close OPEN positions first, then delete ALL pending orders  |
-//| (during this, EA must not place any new orders)                  |
 //+------------------------------------------------------------------+
 void CloseAllPositionsAndOrdersOnSymbol() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  // 1) Close open orders (positions) first — retry until none left
-  for (int retry = 0; retry < 5; retry++) {
-    int closed = 0;
-    for (int i = PositionsTotal() - 1; i >= 0; i--) {
-      ulong t = PositionGetTicket(i);
-      if (t == 0 || !PositionSelectByTicket(t))
-        continue;
-      if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-        continue;
-      double volume = PositionGetDouble(POSITION_VOLUME);
-      if (volume <= 0.0)
-        continue;
-      if (trade.PositionClose(t))
-        closed++;
-      else
-        Print("[SetGridManually] Failed to close position ticket ", t,
-              " Error=", GetLastError());
+  // Close all positions on this symbol
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong t = PositionGetTicket(i);
+    if (t == 0 || !PositionSelectByTicket(t))
+      continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+      continue;
+
+    double volume = PositionGetDouble(POSITION_VOLUME);
+    if (volume <= 0.0)
+      continue;
+
+    if (!trade.PositionClose(t)) {
+      Print("[SetGridManually] Failed to close position ticket ", t,
+            " Error=", GetLastError());
     }
-    if (closed == 0)
-      break;
   }
 
-  // 2) Then delete ALL pending orders on this symbol at once
+  // Delete all pending orders on this symbol
   for (int i = OrdersTotal() - 1; i >= 0; i--) {
     ulong ot = OrderGetTicket(i);
     if (ot == 0 || !OrderSelect(ot))
       continue;
     if (OrderGetString(ORDER_SYMBOL) != _Symbol)
       continue;
-    if (!trade.OrderDelete(ot))
+
+    if (!trade.OrderDelete(ot)) {
       Print("[SetGridManually] Failed to delete order ticket ", ot,
             " Error=", GetLastError());
+    }
   }
 }
 
@@ -138,241 +111,6 @@ bool GetReferencePosition(double &entryPrice, ENUM_POSITION_TYPE &type) {
   }
 
   return found;
-}
-
-//+------------------------------------------------------------------+
-//| If user changes SL on one open position, copy/delete SL on all   |
-//| other open positions and all pendings on this symbol.            |
-//| - If SL moved to a new price  > 0  -> set same SL everywhere.    |
-//| - If SL deleted (set to 0)       -> remove SL everywhere.        |
-//+------------------------------------------------------------------+
-void SyncSLFromUserChange() {
-  double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-  if (point <= 0.0)
-    return;
-  double eps = point / 2.0; // tolerance for SL comparison
-
-  // Collect current positions for this symbol
-  ulong curTickets[MAX_TRACKED_POSITIONS];
-  double curSL[MAX_TRACKED_POSITIONS];
-  double curTPDummy[MAX_TRACKED_POSITIONS];
-  int curCount = 0;
-
-  for (int i = PositionsTotal() - 1; i >= 0 && curCount < MAX_TRACKED_POSITIONS;
-       i--) {
-    ulong t = PositionGetTicket(i);
-    if (t == 0 || !PositionSelectByTicket(t))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-      continue;
-
-    double volume = PositionGetDouble(POSITION_VOLUME);
-    if (volume <= 0.0)
-      continue;
-
-    curTickets[curCount] = t;
-    curSL[curCount] = PositionGetDouble(POSITION_SL);
-    curTPDummy[curCount] = PositionGetDouble(POSITION_TP);
-    curCount++;
-  }
-
-  if (curCount <= 1)
-    return;
-
-  // Detect a ticket whose SL changed (including deletion) since last tick
-  ulong changedTicket = 0;
-  double newSL = 0.0;
-
-  for (int i = 0; i < curCount; i++) {
-    double sl = curSL[i];
-
-    bool foundPrev = false;
-    double prevSl = 0.0;
-    for (int j = 0; j < g_prevPosCount; j++) {
-      if (g_prevPosTickets[j] == curTickets[i]) {
-        foundPrev = true;
-        prevSl = g_prevPosSL[j];
-        break;
-      }
-    }
-    if (!foundPrev)
-      continue; // new position; no previous SL to compare
-
-    if (MathAbs(prevSl - sl) > eps) {
-      changedTicket = curTickets[i];
-      newSL = sl; // may be >0 (move) or 0 (delete)
-      break;
-    }
-  }
-
-  if (changedTicket == 0)
-    return; // no SL change detected
-
-  trade.SetExpertMagicNumber(MagicNumber);
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  // 1) Apply SL change to all other open positions on this symbol
-  for (int i = 0; i < curCount; i++) {
-    ulong t = curTickets[i];
-    if (t == changedTicket)
-      continue;
-
-    double curSl = curSL[i];
-    double curTp = curTPDummy[i];
-
-    if (newSL > 0.0) {
-      if (MathAbs(curSl - newSL) <= eps)
-        continue; // already at desired SL
-      if (!trade.PositionModify(t, newSL, curTp))
-        Print(
-            "[SetGridManually] SyncSLFromUserChange (move) failed for ticket ",
-            t, " Error=", GetLastError());
-    } else { // newSL == 0.0 -> delete SL everywhere
-      if (curSl == 0.0)
-        continue;
-      if (!trade.PositionModify(t, 0.0, curTp))
-        Print("[SetGridManually] SyncSLFromUserChange (delete) failed for "
-              "ticket ",
-              t, " Error=", GetLastError());
-    }
-  }
-
-  // 2) Apply SL change to all pending orders on this symbol
-  for (int i = OrdersTotal() - 1; i >= 0; i--) {
-    ulong ot = OrderGetTicket(i);
-    if (ot == 0 || !OrderSelect(ot))
-      continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol)
-      continue;
-
-    double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
-    ENUM_ORDER_TYPE_TIME typeTime =
-        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
-    datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
-
-    double curSl = OrderGetDouble(ORDER_SL);
-    double curTp = OrderGetDouble(ORDER_TP);
-
-    if (newSL > 0.0) {
-      if (MathAbs(curSl - newSL) <= eps)
-        continue;
-      if (!trade.OrderModify(ot, orderPrice, newSL, curTp, typeTime, exp))
-        Print("[SetGridManually] SyncSLFromUserChange (move) failed for order ",
-              ot, " Error=", GetLastError());
-    } else { // delete SL
-      if (curSl == 0.0)
-        continue;
-      if (!trade.OrderModify(ot, orderPrice, 0.0, curTp, typeTime, exp))
-        Print(
-            "[SetGridManually] SyncSLFromUserChange (delete) failed for order ",
-            ot, " Error=", GetLastError());
-    }
-  }
-}
-
-//+------------------------------------------------------------------+
-//| If user changes TP on one open position, copy that TP to others  |
-//| (only for open positions on this symbol, not for pending orders) |
-//+------------------------------------------------------------------+
-void SyncTPFromUserChange() {
-  double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-  if (point <= 0.0)
-    return;
-  double eps = point / 2.0; // tolerance for TP comparison
-
-  // Collect current positions for this symbol
-  ulong curTickets[MAX_TRACKED_POSITIONS];
-  double curTP[MAX_TRACKED_POSITIONS];
-  double curSL[MAX_TRACKED_POSITIONS];
-  int curCount = 0;
-
-  for (int i = PositionsTotal() - 1; i >= 0 && curCount < MAX_TRACKED_POSITIONS;
-       i--) {
-    ulong t = PositionGetTicket(i);
-    if (t == 0 || !PositionSelectByTicket(t))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-      continue;
-
-    double volume = PositionGetDouble(POSITION_VOLUME);
-    if (volume <= 0.0)
-      continue;
-
-    curTickets[curCount] = t;
-    curSL[curCount] = PositionGetDouble(POSITION_SL);
-    curTP[curCount] = PositionGetDouble(POSITION_TP);
-    curCount++;
-  }
-
-  if (curCount <= 1) {
-    // Nothing to sync, just snapshot current state
-    g_prevPosCount = curCount;
-    for (int i = 0; i < curCount && i < MAX_TRACKED_POSITIONS; i++) {
-      g_prevPosTickets[i] = curTickets[i];
-      g_prevPosTP[i] = curTP[i];
-      g_prevPosSL[i] = curSL[i];
-    }
-    return;
-  }
-
-  // Detect a ticket whose TP changed (non‑zero) since last tick
-  ulong changedTicket = 0;
-  double newTP = 0.0;
-
-  for (int i = 0; i < curCount; i++) {
-    double tp = curTP[i];
-    if (tp <= 0.0)
-      continue; // we don't propagate deletions (TP=0 means user wants no TP)
-
-    bool foundPrev = false;
-    double prevTp = 0.0;
-    for (int j = 0; j < g_prevPosCount; j++) {
-      if (g_prevPosTickets[j] == curTickets[i]) {
-        foundPrev = true;
-        prevTp = g_prevPosTP[j];
-        break;
-      }
-    }
-    if (!foundPrev)
-      continue; // new position; no previous TP to compare
-
-    if (MathAbs(prevTp - tp) > eps) {
-      changedTicket = curTickets[i];
-      newTP = tp;
-      break;
-    }
-  }
-
-  if (changedTicket != 0 && newTP > 0.0) {
-    trade.SetExpertMagicNumber(MagicNumber);
-    trade.SetDeviationInPoints(SlippagePoints);
-
-    for (int i = 0; i < curCount; i++) {
-      ulong t = curTickets[i];
-      if (t == changedTicket)
-        continue;
-
-      double tp = curTP[i];
-      if (tp <= 0.0)
-        continue; // skip positions where user removed TP
-
-      if (MathAbs(tp - newTP) <= eps)
-        continue; // already at desired TP
-
-      double sl = curSL[i];
-      if (!trade.PositionModify(t, sl, newTP))
-        Print("[SetGridManually] SyncTPFromUserChange failed for ticket ", t,
-              " Error=", GetLastError());
-    }
-  }
-
-  // Snapshot current state for next tick's comparison
-  g_prevPosCount = curCount;
-  for (int i = 0; i < curCount && i < MAX_TRACKED_POSITIONS; i++) {
-    g_prevPosTickets[i] = curTickets[i];
-    g_prevPosTP[i] = curTP[i];
-    g_prevPosSL[i] = curSL[i];
-  }
 }
 
 //+------------------------------------------------------------------+
@@ -410,8 +148,7 @@ void SyncSLTPToFirstOrder() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  // Only set SL/TP for positions that have neither SL nor TP yet (both 0).
-  // Once SL/TP are set or edited by user, do not touch them here.
+  // If user deleted SL (curSL==0) or TP (curTP==0), never set it again; otherwise sync to first order
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     ulong t = PositionGetTicket(i);
     if (t == 0 || !PositionSelectByTicket(t))
@@ -421,15 +158,15 @@ void SyncSLTPToFirstOrder() {
 
     double curSL = PositionGetDouble(POSITION_SL);
     double curTP = PositionGetDouble(POSITION_TP);
-    if (curSL != 0.0 || curTP != 0.0)
-      continue; // already has SL and/or TP — leave as is
+    double setSL = (curSL == 0.0) ? 0.0 : slPrice;
+    double setTP = (curTP == 0.0) ? 0.0 : tpPrice;
 
-    if (!trade.PositionModify(t, slPrice, tpPrice))
+    if (!trade.PositionModify(t, setSL, setTP))
       Print("[SetGridManually] SyncSLTP failed for ticket ", t,
             " Error=", GetLastError());
   }
 
-  // Same for pending orders: only set when both SL and TP are unset
+  // Same for pending orders: if user deleted SL or TP, do not set it again
   for (int i = OrdersTotal() - 1; i >= 0; i--) {
     ulong ot = OrderGetTicket(i);
     if (ot == 0 || !OrderSelect(ot))
@@ -437,17 +174,17 @@ void SyncSLTPToFirstOrder() {
     if (OrderGetString(ORDER_SYMBOL) != _Symbol)
       continue;
 
+    double curSL = OrderGetDouble(ORDER_SL);
+    double curTP = OrderGetDouble(ORDER_TP);
+    double setSL = (curSL == 0.0) ? 0.0 : slPrice;
+    double setTP = (curTP == 0.0) ? 0.0 : tpPrice;
+
     double orderPrice = OrderGetDouble(ORDER_PRICE_OPEN);
     ENUM_ORDER_TYPE_TIME typeTime =
         (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
     datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
 
-    double curSL = OrderGetDouble(ORDER_SL);
-    double curTP = OrderGetDouble(ORDER_TP);
-    if (curSL != 0.0 || curTP != 0.0)
-      continue; // already has SL/TP — leave as is
-
-    if (!trade.OrderModify(ot, orderPrice, slPrice, tpPrice, typeTime, exp))
+    if (!trade.OrderModify(ot, orderPrice, setSL, setTP, typeTime, exp))
       Print("[SetGridManually] SyncSLTP pending failed for order ", ot,
             " Error=", GetLastError());
   }
@@ -580,9 +317,7 @@ int OnInit() {
 //| Expert tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick() {
-  // Emergency: when loss reaches MaxFloatingLossUSD — close open orders first,
-  // then pendings. During closing: do NOT place any new orders; only close
-  // until positions + pendings = 0.
+  // Emergency: close everything if floating loss exceeds threshold (in USD)
   if (MaxFloatingLossUSD > 0.0) {
     double totalProfit = 0.0;
     for (int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -591,29 +326,18 @@ void OnTick() {
         continue;
       if (PositionGetString(POSITION_SYMBOL) != _Symbol)
         continue;
+
       totalProfit += PositionGetDouble(POSITION_PROFIT);
     }
-    bool overThreshold = (totalProfit <= -MaxFloatingLossUSD);
-    bool stillHasPosOrOrders =
-        (CountPositionsOnSymbol() > 0 || CountPendingOrdersOnSymbol() > 0);
-    if (overThreshold && stillHasPosOrOrders) {
+    if (totalProfit <= -MaxFloatingLossUSD) {
       Print("[SetGridManually] Floating loss reached ",
             DoubleToString(totalProfit, 2), " USD (threshold = -",
             DoubleToString(MaxFloatingLossUSD, 2),
             "). Closing all positions and orders on symbol ", _Symbol);
       CloseAllPositionsAndOrdersOnSymbol();
-      return; // No SyncSLTP, no new grid — cannot place orders until close is
-              // done
+      return;
     }
   }
-
-  // If user changed SL on one order, sync SL (or deletion of SL) to all
-  // other open positions and all pendings on this symbol.
-  SyncSLFromUserChange();
-
-  // If user changed TP on one open position, sync all other open positions'
-  // TP to the same price (only affects open positions, not pending orders).
-  SyncTPFromUserChange();
 
   // Always sync SL/TP on all positions to same levels as first order (e.g. when
   // you open another order)
