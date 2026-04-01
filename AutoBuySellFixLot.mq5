@@ -1,374 +1,348 @@
 //+------------------------------------------------------------------+
-//|                                                   AutoBuySell.mq5 |
-//|  Hedge + Grid EA with independent BUY/SELL sides, daily stops   |
+//| AutoBuySell EA                                                   |
 //+------------------------------------------------------------------+
 #property strict
-#property version "1.00"
-#property description                                                          \
-    "AutoBuySell: Hedge + Grid (3 pending per side), lot +0.01 progression, side reset by points, daily profit/loss stops."
 
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-//--------------------------- Inputs --------------------------------
-input double InitialLot = 0.01;
-input int    GridLevelsPerSide = 2;
-input int    GridDistancePoints = 200;
-input int    SideTargetProfitPoints = 300;
+// INPUT PARAMETERS
+input double InitialLot=0.01;          // ຂະໜາດ lot ຄົງທີ່ (fixed)
+input int GridLevelsPerSide=3;
+input int GridDistancePoints=200;      // ຄວາມຫ່າງ
+input int SideTargetProfitPoints=200;  // ກຳໄລເປັນຈຸດ
 
-input double DailyProfitTargetUSD = 100.0;
-input double DailyLossLimitUSD = 300.0;
+input double DailyProfitTargetUSD=100; // ກຳໄລຕໍ່ມື້ ເປັນ$
+input double DailyLossLimitUSD=300;    // ເສຍຕໍ່ມື້ ເປັນ$
 
-input int SlippagePoints = 20;
+input int MagicBuy=1111;
+input int MagicSell=2222;
 
-input int MagicBuy = 11001;
-input int MagicSell = 11002;
+datetime todayStart;
+bool stopTrading=false;
 
-//--------------------------- Globals -------------------------------
-datetime g_todayStart = 0;
-bool     g_stopToday  = false;
+//+------------------------------------------------------------------+
 
-//---------------------- Utility / Helpers -------------------------
-double PointValue() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
-int DigitsCount() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
-
-double NormalizeLot(double lots) {
-  double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-  double minv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-  double maxv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-  if (step > 0)
-    lots = MathRound(lots / step) * step;
-  if (lots < minv)
-    lots = minv;
-  if (lots > maxv)
-    lots = maxv;
-  return lots;
+double PointValue()
+{
+   return SymbolInfoDouble(_Symbol,SYMBOL_POINT);
 }
 
-void SetTradeContext(int magic) {
-  trade.SetExpertMagicNumber(magic);
-  trade.SetDeviationInPoints(SlippagePoints);
+//+------------------------------------------------------------------+
+
+int CountBuyPendings()
+{
+   int c=0;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i);
+      if(!OrderSelect(t)) continue;
+
+      if(OrderGetInteger(ORDER_MAGIC)==MagicBuy &&
+         OrderGetInteger(ORDER_TYPE)==ORDER_TYPE_BUY_LIMIT)
+         c++;
+   }
+   return c;
 }
 
-//-------------------- Day Profit / Loss Tracking -------------------
-void ResetDayIfNeeded() {
-  datetime d = iTime(_Symbol, PERIOD_D1, 0);
-  if (g_todayStart == 0) {
-    g_todayStart = d;
-    g_stopToday = false;
-  }
-  if (d != g_todayStart) {
-    // new day
-    g_todayStart = d;
-    g_stopToday = false;
-  }
+//+------------------------------------------------------------------+
+
+int CountSellPendings()
+{
+   int c=0;
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i);
+      if(!OrderSelect(t)) continue;
+
+      if(OrderGetInteger(ORDER_MAGIC)==MagicSell &&
+         OrderGetInteger(ORDER_TYPE)==ORDER_TYPE_SELL_LIMIT)
+         c++;
+   }
+   return c;
 }
 
-double CalcTodayProfitUSD() {
-  double p = 0.0;
-  for (int i = HistoryDealsTotal() - 1; i >= 0; --i) {
-    ulong tk = HistoryDealGetTicket(i);
-    if (tk == 0)
-      continue;
-    datetime t = (datetime)HistoryDealGetInteger(tk, DEAL_TIME);
-    if (t < g_todayStart)
-      break;
-    p += HistoryDealGetDouble(tk, DEAL_PROFIT);
-  }
-  return p;
+//+------------------------------------------------------------------+
+
+double GetLowestBuyPrice()
+{
+   double lowest=0;
+   bool found=false;
+
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i);
+      if(!OrderSelect(t)) continue;
+
+      if(OrderGetInteger(ORDER_MAGIC)!=MagicBuy) continue;
+      if(OrderGetInteger(ORDER_TYPE)!=ORDER_TYPE_BUY_LIMIT) continue;
+
+      double p=OrderGetDouble(ORDER_PRICE_OPEN);
+
+      if(!found || p<lowest)
+      {
+         lowest=p;
+         found=true;
+      }
+   }
+
+   return lowest;
 }
 
-bool CheckDailyStops() {
-  if (g_stopToday)
-    return true;
+//+------------------------------------------------------------------+
 
-  double todayP = CalcTodayProfitUSD();
-  if (todayP >= DailyProfitTargetUSD || todayP <= -DailyLossLimitUSD) {
-    Print("[AutoBuySell] Daily stop reached. Profit=", todayP);
-    CloseAllPositions();
-    DeleteAllPendings();
-    g_stopToday = true;
-    return true;
-  }
-  return false;
+double GetHighestSellPrice()
+{
+   double highest=0;
+   bool found=false;
+
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i);
+      if(!OrderSelect(t)) continue;
+
+      if(OrderGetInteger(ORDER_MAGIC)!=MagicSell) continue;
+      if(OrderGetInteger(ORDER_TYPE)!=ORDER_TYPE_SELL_LIMIT) continue;
+
+      double p=OrderGetDouble(ORDER_PRICE_OPEN);
+
+      if(!found || p>highest)
+      {
+         highest=p;
+         found=true;
+      }
+   }
+
+   return highest;
 }
 
-//------------------------- Positions / Orders ----------------------
-bool IsBuyPosition(ulong ticket) {
-  if (!PositionSelectByTicket(ticket))
-    return false;
-  if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-    return false;
-  if ((int)PositionGetInteger(POSITION_MAGIC) != MagicBuy)
-    return false;
-  if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) !=
-      POSITION_TYPE_BUY)
-    return false;
-  return true;
+//+------------------------------------------------------------------+
+
+void PlaceBuyPending(double price,double lot)
+{
+   trade.SetExpertMagicNumber(MagicBuy);
+   trade.BuyLimit(lot,price,_Symbol);
 }
 
-bool IsSellPosition(ulong ticket) {
-  if (!PositionSelectByTicket(ticket))
-    return false;
-  if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-    return false;
-  if ((int)PositionGetInteger(POSITION_MAGIC) != MagicSell)
-    return false;
-  if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) !=
-      POSITION_TYPE_SELL)
-    return false;
-  return true;
+//+------------------------------------------------------------------+
+
+void PlaceSellPending(double price,double lot)
+{
+   trade.SetExpertMagicNumber(MagicSell);
+   trade.SellLimit(lot,price,_Symbol);
 }
 
-bool IsBuyPending(ulong ticket) {
-  if (!OrderSelect(ticket))
-    return false;
-  if (OrderGetString(ORDER_SYMBOL) != _Symbol)
-    return false;
-  if ((int)OrderGetInteger(ORDER_MAGIC) != MagicBuy)
-    return false;
-  ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-  return (t == ORDER_TYPE_BUY_LIMIT);
+//+------------------------------------------------------------------+
+
+void MaintainBuyGrid()
+{
+   while(CountBuyPendings()<GridLevelsPerSide)
+   {
+      double base=GetLowestBuyPrice();
+
+      if(base==0)
+         base=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+      double price=base-GridDistancePoints*PointValue();
+
+      // ເປີດ pending buy ດ້ວຍ lot ຄົງທີ່
+      PlaceBuyPending(price,InitialLot);
+   }
 }
 
-bool IsSellPending(ulong ticket) {
-  if (!OrderSelect(ticket))
-    return false;
-  if (OrderGetString(ORDER_SYMBOL) != _Symbol)
-    return false;
-  if ((int)OrderGetInteger(ORDER_MAGIC) != MagicSell)
-    return false;
-  ENUM_ORDER_TYPE t = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-  return (t == ORDER_TYPE_SELL_LIMIT);
+//+------------------------------------------------------------------+
+
+void MaintainSellGrid()
+{
+   while(CountSellPendings()<GridLevelsPerSide)
+   {
+      double base=GetHighestSellPrice();
+
+      if(base==0)
+         base=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+      double price=base+GridDistancePoints*PointValue();
+
+      // ເປີດ pending sell ດ້ວຍ lot ຄົງທີ່
+      PlaceSellPending(price,InitialLot);
+   }
 }
 
-void CloseAllPositions() {
-  SetTradeContext(0);
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-      continue;
-    trade.PositionClose(tk);
-  }
+//+------------------------------------------------------------------+
+
+void OpenInitialOrders()
+{
+   trade.SetExpertMagicNumber(MagicBuy);
+   trade.Buy(InitialLot);
+
+   trade.SetExpertMagicNumber(MagicSell);
+   trade.Sell(InitialLot);
+
+   MaintainBuyGrid();
+   MaintainSellGrid();
 }
 
-void DeleteAllPendings() {
-  for (int i = OrdersTotal() - 1; i >= 0; --i) {
-    ulong tk = OrderGetTicket(i);
-    if (tk == 0 || !OrderSelect(tk))
-      continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol)
-      continue;
-    trade.OrderDelete(tk);
-  }
+//+------------------------------------------------------------------+
+
+double BuySidePoints()
+{
+   double points=0;
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(t)) continue;
+
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicBuy) continue;
+
+      double open=PositionGetDouble(POSITION_PRICE_OPEN);
+
+      points+=(bid-open)/PointValue();
+   }
+
+   return points;
 }
 
-void CloseSidePositions(int magic) {
-  SetTradeContext(magic);
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-      continue;
-    if ((int)PositionGetInteger(POSITION_MAGIC) != magic)
-      continue;
-    trade.PositionClose(tk);
-  }
+//+------------------------------------------------------------------+
+
+double SellSidePoints()
+{
+   double points=0;
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(t)) continue;
+
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicSell) continue;
+
+      double open=PositionGetDouble(POSITION_PRICE_OPEN);
+
+      points+=(open-ask)/PointValue();
+   }
+
+   return points;
 }
 
-void DeleteSidePendings(int magic) {
-  for (int i = OrdersTotal() - 1; i >= 0; --i) {
-    ulong tk = OrderGetTicket(i);
-    if (tk == 0 || !OrderSelect(tk))
-      continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol)
-      continue;
-    if ((int)OrderGetInteger(ORDER_MAGIC) != magic)
-      continue;
-    trade.OrderDelete(tk);
-  }
+//+------------------------------------------------------------------+
+
+void CloseSide(int magic)
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);
+
+      if(!PositionSelectByTicket(t)) continue;
+
+      if(PositionGetInteger(POSITION_MAGIC)!=magic) continue;
+
+      trade.PositionClose(t);
+   }
+
+   for(int i=OrdersTotal()-1;i>=0;i--)
+   {
+      ulong t=OrderGetTicket(i);
+
+      if(!OrderSelect(t)) continue;
+
+      if(OrderGetInteger(ORDER_MAGIC)!=magic) continue;
+
+      trade.OrderDelete(t);
+   }
 }
 
-//----------------------- Profit in Points per Side -----------------
-double CalcBuySidePoints() {
-  double pts = 0.0;
-  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (!IsBuyPosition(tk))
-      continue;
-    double open = PositionGetDouble(POSITION_PRICE_OPEN);
-    pts += (bid - open) / PointValue();
-  }
-  return pts;
+//+------------------------------------------------------------------+
+
+void ResetBuySide()
+{
+   CloseSide(MagicBuy);
+
+   trade.SetExpertMagicNumber(MagicBuy);
+   trade.Buy(InitialLot);
+   MaintainBuyGrid();
 }
 
-double CalcSellSidePoints() {
-  double pts = 0.0;
-  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (!IsSellPosition(tk))
-      continue;
-    double open = PositionGetDouble(POSITION_PRICE_OPEN);
-    pts += (open - ask) / PointValue();
-  }
-  return pts;
+//+------------------------------------------------------------------+
+
+void ResetSellSide()
+{
+   CloseSide(MagicSell);
+
+   trade.SetExpertMagicNumber(MagicSell);
+   trade.Sell(InitialLot);
+   MaintainSellGrid();
 }
 
-//----------------------- Initial Hedge Orders ----------------------
-void OpenInitialHedge() {
-  SetTradeContext(MagicBuy);
-  trade.Buy(NormalizeLot(InitialLot), _Symbol);
+//+------------------------------------------------------------------+
 
-  SetTradeContext(MagicSell);
-  trade.Sell(NormalizeLot(InitialLot), _Symbol);
+void CheckDailyProfit()
+{
+   double profit=0;
+
+   for(int i=HistoryDealsTotal()-1;i>=0;i--)
+   {
+      ulong t=HistoryDealGetTicket(i);
+
+      datetime time=HistoryDealGetInteger(t,DEAL_TIME);
+
+      if(time<todayStart) break;
+
+      profit+=HistoryDealGetDouble(t,DEAL_PROFIT);
+   }
+
+   if(profit>=DailyProfitTargetUSD || profit<=-DailyLossLimitUSD)
+   {
+      stopTrading=true;
+
+      CloseSide(MagicBuy);
+      CloseSide(MagicSell);
+   }
 }
 
-//--------------------------- Grid Placement ------------------------
-void PlaceBuyPending(double price, double lots) {
-  SetTradeContext(MagicBuy);
-  double p = NormalizeDouble(price, DigitsCount());
-  trade.BuyLimit(NormalizeLot(lots), p, _Symbol);
+//+------------------------------------------------------------------+
+
+int OnInit()
+{
+   todayStart=iTime(_Symbol,PERIOD_D1,0);
+
+   OpenInitialOrders();
+
+   return INIT_SUCCEEDED;
 }
 
-void PlaceSellPending(double price, double lots) {
-  SetTradeContext(MagicSell);
-  double p = NormalizeDouble(price, DigitsCount());
-  trade.SellLimit(NormalizeLot(lots), p, _Symbol);
+//+------------------------------------------------------------------+
+
+void OnTick()
+{
+   if(stopTrading) return;
+
+   CheckDailyProfit();
+
+   MaintainBuyGrid();
+   MaintainSellGrid();
+
+   if(BuySidePoints()>=SideTargetProfitPoints)
+      ResetBuySide();
+
+   if(SellSidePoints()>=SideTargetProfitPoints)
+      ResetSellSide();
 }
 
-int CountBuyPendings() {
-  int n = 0;
-  for (int i = OrdersTotal() - 1; i >= 0; --i) {
-    ulong tk = OrderGetTicket(i);
-    if (IsBuyPending(tk))
-      n++;
-  }
-  return n;
-}
+//+------------------------------------------------------------------+
 
-int CountSellPendings() {
-  int n = 0;
-  for (int i = OrdersTotal() - 1; i >= 0; --i) {
-    ulong tk = OrderGetTicket(i);
-    if (IsSellPending(tk))
-      n++;
-  }
-  return n;
-}
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD)
+      return;
 
-double ReferenceBuyEntry() {
-  // earliest BUY entry as reference
-  datetime earliest = LONG_MAX;
-  double entry = 0.0;
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (!IsBuyPosition(tk))
-      continue;
-    datetime t = (datetime)PositionGetInteger(POSITION_TIME);
-    if (t < earliest) {
-      earliest = t;
-      entry = PositionGetDouble(POSITION_PRICE_OPEN);
-    }
-  }
-  return entry;
-}
+   if(stopTrading) return;
 
-double ReferenceSellEntry() {
-  datetime earliest = LONG_MAX;
-  double entry = 0.0;
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    ulong tk = PositionGetTicket(i);
-    if (!IsSellPosition(tk))
-      continue;
-    datetime t = (datetime)PositionGetInteger(POSITION_TIME);
-    if (t < earliest) {
-      earliest = t;
-      entry = PositionGetDouble(POSITION_PRICE_OPEN);
-    }
-  }
-  return entry;
-}
-
-// maintain exactly GridLevelsPerSide pendings per side
-void MaintainBuyGrid() {
-  int need = GridLevelsPerSide - CountBuyPendings();
-  if (need <= 0)
-    return;
-
-  double ref = ReferenceBuyEntry();
-  if (ref <= 0.0)
-    ref = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-  for (int i = 0; i < need; i++) {
-    double price =
-        ref - (GridDistancePoints * PointValue()) * (CountBuyPendings() + 1);
-    // Fixed lot for all grid BUY orders (no martingale)
-    PlaceBuyPending(price, InitialLot);
-  }
-}
-
-void MaintainSellGrid() {
-  int need = GridLevelsPerSide - CountSellPendings();
-  if (need <= 0)
-    return;
-
-  double ref = ReferenceSellEntry();
-  if (ref <= 0.0)
-    ref = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-  for (int i = 0; i < need; i++) {
-    double price =
-        ref + (GridDistancePoints * PointValue()) * (CountSellPendings() + 1);
-    // Fixed lot for all grid SELL orders (no martingale)
-    PlaceSellPending(price, InitialLot);
-  }
-}
-
-//--------------------------- Side Reset ----------------------------
-void ResetBuySide() {
-  CloseSidePositions(MagicBuy);
-  DeleteSidePendings(MagicBuy);
-
-  SetTradeContext(MagicBuy);
-  trade.Buy(NormalizeLot(InitialLot), _Symbol);
-}
-
-void ResetSellSide() {
-  CloseSidePositions(MagicSell);
-  DeleteSidePendings(MagicSell);
-
-  SetTradeContext(MagicSell);
-  trade.Sell(NormalizeLot(InitialLot), _Symbol);
-}
-
-//------------------------------ MT5 Events -------------------------
-int OnInit() {
-  ResetDayIfNeeded();
-  OpenInitialHedge();
-  return (INIT_SUCCEEDED);
-}
-
-void OnTick() {
-  ResetDayIfNeeded();
-  if (CheckDailyStops())
-    return;
-
-  // maintain grids
-  MaintainBuyGrid();
-  MaintainSellGrid();
-
-  // side profit checks
-  double buyPts = CalcBuySidePoints();
-  double sellPts = CalcSellSidePoints();
-
-  if (buyPts >= SideTargetProfitPoints)
-    ResetBuySide();
-
-  if (sellPts >= SideTargetProfitPoints)
-    ResetSellSide();
+   MaintainBuyGrid();
+   MaintainSellGrid();
 }

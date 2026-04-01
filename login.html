@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="lo">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Login</title>
+    <style>
+        body { font-family: 'Phetsarath OT', Arial, sans-serif; background: #f4f4f9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .box { background: white; padding: 30px; border-radius: 12px; width: 360px; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        button:disabled { opacity: 0.6; }
+        .status { margin-top: 15px; text-align: center; font-size: 13px; color: #666; }
+        iframe { display: none; }
+    </style>
+</head>
+<body>
+<div class="box">
+    <h3>ລົງທະບຽນໃຊ້ WiFi</h3>
+    <p style="font-size: 14px; color: #666;">ກະລຸນາປ້ອນຂໍ້ມູນເພື່ອເຂົ້າໃຊ້ງານ</p>
+    <form id="wifiForm">
+        <input type="text" id="name" placeholder="ຊື່ຂອງທ່ານ" required>
+        <input type="tel" id="phone" placeholder="ເບີໂທລະສັບ" required>
+        <button type="submit" id="btn">ເຂົ້າໃຊ້ງານ</button>
+    </form>
+    <p class="status" id="statusMsg"></p>
+</div>
+
+<iframe id="hiddenFrame" name="hiddenFrame" style="display:none"></iframe>
+
+<script>
+document.getElementById('wifiForm').addEventListener('submit', function(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn');
+    const statusMsg = document.getElementById('statusMsg');
+    btn.disabled = true;
+    btn.innerText = 'ກຳລັງອະນຸຍາດ...';
+    statusMsg.innerHTML = 'ກຳລັງເຊື່ອມຕໍ່...';
+
+    const params = new URLSearchParams(window.location.search);
+    
+    // ໃຊ້ HTTPS ຕາມທີ່ Aruba ຕ້ອງການ
+    const arubaUrl = 'https://10.150.12.253:4343/cgi-bin/Login';
+    
+    const userName = document.getElementById('name').value;
+    const userPhone = document.getElementById('phone').value;
+    
+    // ບັນທຶກຂໍ້ມູນຜູ້ໃຊ້
+    fetch('http://62.171.159.75:8082/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+            name: userName, 
+            phone: userPhone, 
+            mac: params.get('mac') || '',
+            ip: params.get('ip') || '',
+            timestamp: new Date().toISOString() 
+        })
+    }).catch(err => console.log('Save error:', err));
+    
+    // ສ້າງ form ທີ່ຈະສົ່ງໄປຫາ Aruba ຜ່ານ iframe
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = arubaUrl;
+    form.target = 'hiddenFrame';  // ສົ່ງໄປທີ່ iframe ເພື່ອບໍ່ໃຫ້ໜ້າຈໍປ່ຽນ
+    form.style.display = 'none';
+
+    const fields = {
+        'username': 'guest',
+        'password': 'nopassword',
+        'cmd': 'authenticate'
+    };
+    
+    for (const key in fields) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = key;
+        input.value = fields[key];
+        form.appendChild(input);
+    }
+    
+    document.body.appendChild(form);
+    
+    // ຕັ້ງຟັງຊັນເພື່ອຮັບຜົນການຕອບກັບຈາກ iframe
+    const iframe = document.getElementById('hiddenFrame');
+    iframe.onload = function() {
+        console.log('Form submitted to Aruba');
+        statusMsg.innerHTML = 'ສຳເລັດ! ກຳລັງເຊື່ອມຕໍ່ເນັດ...';
+        
+        // ລໍຖ້າ 2 ວິນາທີ ແລ້ວ reload ໜ້າ ຫຼື redirect
+        setTimeout(() => {
+            // ລອງໂຫຼດໜ້າ success ຫຼື reload ໜ້າປັດຈຸບັນ
+            window.location.href = 'http://captive.apple.com/hotspot-detect.html';
+        }, 2000);
+    };
+    
+    // ຕັ້ງ timeout ຖ້າບໍ່ມີການຕອບກັບ
+    setTimeout(() => {
+        if (btn.disabled) {
+            statusMsg.innerHTML = 'ການເຊື່ອມຕໍ່ຊ້າ ກະລຸນາລໍຖ້າ...';
+            btn.disabled = false;
+            btn.innerText = 'ເຂົ້າໃຊ້ງານ';
+        }
+    }, 15000);
+    
+    form.submit();
+    console.log('Form submitted to:', arubaUrl);
+});
+</script>
+</body>
+</html>

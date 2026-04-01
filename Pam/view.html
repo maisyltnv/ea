@@ -1,0 +1,192 @@
+@model WebApplication1.Models.WifiLoginViewModel
+@{
+    ViewBag.Title = "Login";
+}
+
+<link href="~/Content/bootstrap.min.css" rel="stylesheet" />
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+
+<style>
+    body {
+        background-color: #f8f9fa;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+
+    .login-container {
+        max-width: 400px;
+        margin: 50px auto;
+        padding: 20px;
+    }
+
+    .card {
+        border: none;
+        border-radius: 15px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        overflow: hidden;
+    }
+
+    .card-header {
+        background: #ffc107;
+        color: #000;
+        text-align: center;
+        padding: 30px 10px;
+        border: none;
+    }
+
+        .card-header i {
+            font-size: 3rem;
+            margin-bottom: 10px;
+        }
+
+        .card-header h2 {
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin: 0;
+        }
+
+    .form-control {
+        border-radius: 8px;
+        padding: 12px;
+        border: 1px solid #ddd;
+        margin-bottom: 15px;
+    }
+
+        .form-control:focus {
+            box-shadow: 0 0 0 3px rgba(255, 193, 7, 0.2);
+            border-color: #ffc107;
+        }
+
+    .btn-connect {
+        background: #000;
+        color: #ffc107;
+        border: none;
+        padding: 15px;
+        width: 100%;
+        font-weight: bold;
+        border-radius: 8px;
+        font-size: 1.1rem;
+        transition: 0.3s;
+    }
+
+        .btn-connect:hover {
+            background: #333;
+            color: #fff;
+        }
+
+        .btn-connect:disabled {
+            background: #ccc;
+            color: #666;
+            cursor: not-allowed;
+        }
+
+    .footer-text {
+        font-size: 0.8rem;
+        color: #888;
+        margin-top: 20px;
+        text-align: center;
+    }
+</style>
+
+<div class="container login-container">
+    <div class="card">
+        <div class="card-header">
+
+            <h2>Free WiFi</h2>
+            <p class="mb-0">Fast & Free Internet Connection</p>
+        </div>
+
+        <div class="card-body p-4">
+            <div class="mb-3">
+                <label class="form-label small fw-bold">Full Name</label>
+                <input type="text" id="ui_name" class="form-control" placeholder="kolao group" required />
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label small fw-bold">Phone Number</label>
+                <input type="tel" id="ui_phone" class="form-control" placeholder="20xxxxxx" required />
+            </div>
+
+            <div class="mb-4">
+                <label class="form-label small fw-bold">Destination/Address (Optional)</label>
+                <input type="text" id="ui_address" class="form-control" placeholder="" />
+            </div>
+
+            <button id="btnEnter" class="btn-connect">
+                <i class="fas fa-wifi me-2"></i> CONNECT TO INTERNET
+            </button>
+
+            <p class="footer-text">By connecting, you agree to our Terms of Service.</p>
+        </div>
+    </div>
+    @*<form id="arubaPost" method="POST" action="http://captiveportal-login.arubanetworks.com/swarm.cgi" style="display:none;">*@
+<form id="arubaPost" method="POST" action="http://securelogin.arubanetworks.com/swarm.cgi" style="display:none;">
+@*<form id="arubaPost" method="POST" action="https://@Html.Raw(Model.switchip)/swarm.cgi" style="display:none;">*@
+    
+    <input type="hidden" name="cmd" value="authenticate" />
+    <input type="hidden" name="mac" value="@Model.Mac" />
+    <input type="hidden" name="ip" value="@Model.Ip" />
+    <input type="hidden" id="apname" name="apname" value="@Model.ApName" />
+
+
+    <!-- Aruba user -->
+    <input type="hidden" name="user" value="guest" />
+    <input type="hidden" name="password" value="Admin123" />
+
+    <!-- Redirect after login -->
+    <input type="hidden" name="url" value="https://www.google.com" />
+</form>
+</div>
+
+<script>
+    document.getElementById('btnEnter').onclick = function() {
+        const nameVal = document.getElementById('ui_name').value;
+        const phoneVal = document.getElementById('ui_phone').value;
+        const addressVal = document.getElementById('ui_address').value;
+        const apnameVal = document.getElementById('apname').value;
+
+
+        if(!nameVal || !phoneVal) {
+            alert("Please fill in your name and phone number.");
+            return;
+        }
+
+        // UI Feedback
+        this.disabled = true;
+        this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> SECURING CONNECTION...';
+
+        // 1. Sync values to the hidden Aruba form
+        document.getElementById('ui_name').value = nameVal;
+        document.getElementById('ui_phone').value = phoneVal;
+        document.getElementById('ui_address').value = addressVal;
+        document.getElementById('apname').value = apnameVal;
+        // 2. Send data to your ASP.NET backend
+        fetch('http://10.150.1.47/Wifi/SaveAndConnect', {
+            
+            method: 'POST',
+            mode: 'no-cors',
+            keepalive: true,
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                'mac': '@Model.Mac',
+                'ip': '@Model.Ip',
+                'name': nameVal,
+                'phone': phoneVal,
+                'address': addressVal,
+                'apname': apnameVal
+            })
+        }).then(response => {
+            if (response.ok) {
+                document.getElementById('arubaPost').submit();
+            } else {
+                alert(response.status);
+                this.disabled = false;
+            }
+        }).catch(err => {
+            console.error(err);
+            this.disabled = false;
+            this.innerText = "RETRY CONNECTION";
+        });
+    };
+</script>

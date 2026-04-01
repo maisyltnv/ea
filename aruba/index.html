@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="lo">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Free WiFi - Kolao Group</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    /* ADS SCREEN */
+    .ads-screen {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #000000, #1c1c1c);
+      color: #fff;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .ads-card {
+      width: 100%;
+      max-width: 650px;
+      background: linear-gradient(145deg, #7f1017, #b21d2b);
+      border-radius: 26px;
+      padding: 30px;
+      text-align: center;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.35);
+    }
+    .ads-badge {
+      display: inline-block;
+      background: #ff9f1c;
+      color: #221718;
+      font-weight: 700;
+      padding: 8px 16px;
+      border-radius: 999px;
+      margin-bottom: 18px;
+    }
+    .ads-title {
+      font-size: 2rem;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+    .ads-subtitle {
+      font-size: 1rem;
+      color: rgba(255,255,255,0.92);
+      margin-bottom: 24px;
+    }
+    .ads-banner {
+      background: #fff3dd;
+      border-radius: 20px;
+      color: #221718;
+      padding: 26px 20px;
+      margin-bottom: 24px;
+    }
+    .ads-banner h2 {
+      font-size: 1.85rem;
+      font-weight: 800;
+      margin-bottom: 8px;
+      color: #b21d2b;
+    }
+    .ads-countdown {
+      font-size: 1.1rem;
+      margin-bottom: 18px;
+    }
+    .count-circle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 54px;
+      height: 54px;
+      border-radius: 50%;
+      background: #ff9f1c;
+      color: #221718;
+      font-weight: 800;
+      font-size: 1.3rem;
+      margin-left: 8px;
+    }
+    .btn-skip {
+      border-radius: 12px;
+      padding: 12px 20px;
+      font-weight: 700;
+      background: #fff;
+      border: none;
+      color: #b21d2b;
+    }
+    .ads-footer {
+      color: #ffe6e7;
+      font-size: 0.9rem;
+      margin-top: 16px;
+    }
+    
+    /* LOGIN SCREEN */
+    .login-container {
+      min-height: 100vh;
+      background: linear-gradient(135deg, #6677ff, #8b4fd0);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .login-card {
+      width: 100%;
+      max-width: 450px;
+      background: #fff;
+      border-radius: 24px;
+      overflow: hidden;
+      box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+    }
+    .card-header {
+      background: linear-gradient(135deg, #b21d2b, #e6353f);
+      text-align: center;
+      padding: 30px 20px;
+      color: #fff;
+    }
+    .card-header h2 {
+      font-weight: 800;
+      margin: 0;
+    }
+    .card-body {
+      padding: 30px;
+    }
+    .info-card {
+      background: #f8f9fa;
+      border-radius: 12px;
+      padding: 12px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      border-left: 4px solid #b21d2b;
+    }
+    .form-control {
+      border-radius: 12px;
+      padding: 12px 16px;
+      margin-bottom: 15px;
+      width: 100%;
+      border: 1px solid #ddd;
+    }
+    .btn-connect {
+      background: linear-gradient(135deg, #b21d2b, #e6353f);
+      color: #fff;
+      border: none;
+      padding: 14px;
+      width: 100%;
+      font-weight: bold;
+      border-radius: 12px;
+      font-size: 1rem;
+    }
+    .btn-connect:disabled {
+      opacity: 0.6;
+    }
+    .spinner {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      border: 2px solid #fff;
+      border-top: 2px solid #b21d2b;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .footer-text {
+      font-size: 0.75rem;
+      color: #9c5f63;
+      text-align: center;
+      margin-top: 20px;
+    }
+    .toast {
+      position: fixed;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.85);
+      color: white;
+      padding: 10px 24px;
+      border-radius: 40px;
+      display: none;
+      z-index: 1000;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ADS SCREEN -->
+<div id="adsScreen" class="ads-screen">
+  <div class="ads-card">
+    <div class="ads-badge">
+      <i class="fas fa-star me-1"></i> Sponsored Advertisement
+    </div>
+    <div class="ads-title">Welcome to Free WiFi</div>
+    <div class="ads-subtitle">
+      Enjoy fast and secure internet access after viewing this short promotion.
+    </div>
+    <div class="ads-banner">
+      <h2>Kolao Group Promotion</h2>
+      <p>Discover our latest services, offers, and customer benefits.</p>
+      <img
+        data-ads="1"
+        src="https://ithq.file.kokkoksole.com/buckets/LCC/ads-posting-016960c1-14e1-44a3-b78e-94177461306c.png"
+        alt="Promotion"
+        style="width: 100%; max-height: 240px; object-fit: cover; border-radius: 14px; margin-top: 12px;"
+      />
+      <img
+        data-ads="1"
+        src="https://ithq.file.kokkoksole.com/buckets/KKL_ADVERTISE/12ad0e32d6b444a0812cb9045a350b69.png.png"
+        alt="Promotion"
+        style="width: 100%; max-height: 240px; object-fit: cover; border-radius: 14px; margin-top: 12px;"
+      />
+    </div>
+    <div class="ads-countdown">
+      Please wait
+      <span id="countdown" class="count-circle">10</span>
+    </div>
+    <button id="skipBtn" class="btn-skip" type="button">
+      <i class="fas fa-forward me-2"></i> Skip Now
+    </button>
+    <div class="ads-footer mt-3">
+      You will be redirected to the WiFi login form automatically.
+    </div>
+  </div>
+</div>
+
+
+
+<!-- LOGIN SCREEN -->
+<div id="loginScreen" class="login-container" style="display: none;">
+  <div class="login-card">
+    <div class="card-header">
+      <i class="fas fa-wifi fa-3x"></i>
+      <h2>Free WiFi</h2>
+      <p>Fast & Free Internet Connection</p>
+    </div>
+    <div class="card-body">
+      <div class="info-card" id="deviceInfo">
+        <strong>📱 ຂໍ້ມູນອຸປະກອນ:</strong><br>
+        MAC Address: <span id="macDisplay">ກຳລັງອ່ານ...</span><br>
+        IP Address: <span id="ipDisplay">ກຳລັງອ່ານ...</span>
+      </div>
+
+      <input type="text" id="fullName" class="form-control" placeholder="ຊື່-ນາມສະກຸນ" required>
+      <input type="tel" id="phoneNumber" class="form-control" placeholder="ເບີໂທລະສັບ" required>
+      <input type="text" id="address" class="form-control" placeholder="ທີ່ຢູ່ (ຖ້າມີ)">
+
+      <button id="submitBtn" class="btn-connect">
+        <i class="fas fa-wifi me-2"></i> CONNECT TO INTERNET
+      </button>
+      <p class="footer-text">By connecting, you agree to our Terms of Service.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Aruba Post Form (hidden) -->
+<form id="arubaPost" method="POST" action="http://securelogin.arubanetworks.com/swarm.cgi" style="display: none;">
+  <input type="hidden" name="cmd" value="authenticate" />
+  <input type="hidden" name="mac" id="arubaMac" value="" />
+  <input type="hidden" name="ip" id="arubaIp" value="" />
+  <input type="hidden" name="user" value="guest1" />
+  <input type="hidden" name="password" value="1234" />
+  <input type="hidden" name="url" value="https://kolaogroup.la" />
+</form>
+
+<div id="toast" class="toast"></div>
+
+<script>
+// ======================= ADS SCREEN COUNTDOWN =======================
+(function() {
+  const adsScreen = document.getElementById('adsScreen');
+  const loginScreen = document.getElementById('loginScreen');
+  const countdownEl = document.getElementById('countdown');
+  const skipBtn = document.getElementById('skipBtn');
+
+  // Load ads images from API, then randomize (show 1 image only).
+  // Falls back to the existing hardcoded <img> tags if API fails.
+  async function loadAndRandomizeAdsImage() {
+    const banner = document.querySelector('.ads-banner');
+    if (!banner) return;
+
+    const existingImgs = Array.from(banner.querySelectorAll('img[data-ads="1"]'));
+
+    function randomizeExisting() {
+      if (existingImgs.length === 0) return;
+      existingImgs.forEach((img) => { img.style.display = 'none'; });
+      const chosen = existingImgs[Math.floor(Math.random() * existingImgs.length)];
+      chosen.style.display = '';
+    }
+
+    function setImages(urls) {
+      // Ensure we have enough <img> elements for the URLs
+      for (let i = existingImgs.length; i < urls.length; i++) {
+        const img = document.createElement('img');
+        img.setAttribute('data-ads', '1');
+        img.alt = 'Promotion';
+        img.style.cssText = 'width: 100%; max-height: 240px; object-fit: cover; border-radius: 14px; margin-top: 12px;';
+        banner.appendChild(img);
+        existingImgs.push(img);
+      }
+
+      existingImgs.forEach((img, idx) => {
+        if (idx < urls.length) {
+          img.src = urls[idx];
+          img.style.display = 'none';
+        } else {
+          // Hide any extra existing fallback images
+          img.style.display = 'none';
+        }
+      });
+
+      if (urls.length > 0) {
+        const chosen = existingImgs[Math.floor(Math.random() * urls.length)];
+        chosen.style.display = '';
+      }
+    }
+
+    // Try to fetch from API (with timeout). If it fails, keep old behavior.
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+
+      const res = await fetch('http://10.150.1.85:3095/api/v1/public/ads-active', {
+        signal: controller.signal,
+        cache: 'no-store'
+      });
+
+      clearTimeout(timeout);
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const payload = await res.json();
+      const items = Array.isArray(payload?.data) ? payload.data : [];
+      const urls = items
+        .map((x) => x?.image)
+        .filter((u) => typeof u === 'string' && u.trim().length > 0);
+
+      if (urls.length === 0) {
+        randomizeExisting();
+        return;
+      }
+
+      setImages(urls);
+    } catch (e) {
+      // If API is blocked (CORS/offline/timeout), fall back to old random image logic.
+      randomizeExisting();
+    }
+  }
+
+  // Run once on load/refresh.
+  loadAndRandomizeAdsImage();
+
+  let timeLeft = 10;
+  let switched = false;
+  if (countdownEl) countdownEl.innerText = timeLeft;
+
+  function showLoginScreen() {
+    if (switched) return;
+    switched = true;
+    if (adsScreen) adsScreen.style.display = 'none';
+    if (loginScreen) loginScreen.style.display = 'flex';
+  }
+
+  const timer = setInterval(function() {
+    timeLeft--;
+    if (timeLeft <= 0) {
+      if (countdownEl) countdownEl.innerText = 0;
+      clearInterval(timer);
+      showLoginScreen();
+    } else {
+      if (countdownEl) countdownEl.innerText = timeLeft;
+    }
+  }, 1000);
+
+  if (skipBtn) {
+    skipBtn.addEventListener('click', function() {
+      clearInterval(timer);
+      showLoginScreen();
+    });
+  }
+})();
+
+// ======================= GET MAC & IP FROM URL =======================
+const urlParams = new URLSearchParams(window.location.search);
+const mac = urlParams.get('mac') || urlParams.get('client_mac') || '00:00:00:00:00:00';
+const ip = urlParams.get('ip') || urlParams.get('client_ip') || '192.168.1.100';
+
+document.getElementById('macDisplay').innerText = mac;
+document.getElementById('ipDisplay').innerText = ip;
+
+// ເອົາ MAC/IP ໃສ່ FORM Aruba ນຳ
+document.getElementById('arubaMac').value = mac;
+document.getElementById('arubaIp').value = ip;
+
+// ======================= UTILITIES =======================
+function showToast(msg, duration = 3000) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.style.display = 'block';
+  setTimeout(() => { toast.style.display = 'none'; }, duration);
+}
+
+// ======================= MAIN LOGIC =======================
+document.getElementById('submitBtn').onclick = async function() {
+  const btn = this;
+  const fullName = document.getElementById('fullName').value.trim();
+  const phoneNumber = document.getElementById('phoneNumber').value.trim();
+  const address = document.getElementById('address').value.trim();
+
+  if (!fullName || !phoneNumber) {
+    showToast('❌ ກະລຸນາປ້ອນຊື່ ແລະ ເບີໂທລະສັບ', 3000);
+    return;
+  }
+  
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> CONNECTING...';
+
+  try {
+    // BYPASS: ທົດລອງ Aruba ກ່ອນ (ບໍ່ຍິງ API ບັນທຶກຂໍ້ມູນ)
+    // ຂັ້ນຕອນ: ສົ່ງ FORM ໄປ Aruba ເພື່ອປ່ອຍເນັດ
+    document.getElementById('arubaPost').submit();
+    setTimeout(() => {
+      window.location.href = 'https://kolaogroup.la';
+    }, 2500);
+
+  } catch (err) {
+    console.error(err);
+    showToast('❌ ' + err.message, 4000);
+    btn.disabled = false;
+    btn.innerHTML = '<i class="fas fa-wifi me-2"></i> RETRY CONNECTION';
+  }
+};
+</script>
+</body>
+</html>

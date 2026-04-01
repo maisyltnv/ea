@@ -15,9 +15,9 @@ input double InitialLot = 0.01;
 input int GridLevelsPerSide = 2;
 input int GridDistancePoints = 200;
 input double LotIncrement = 0.01;
-input int SideTargetProfitPoints = 300;
+input int SideTargetProfitPoints = 500;
 
-input double DailyProfitTargetUSD = 100.0;
+input double DailyProfitTargetUSD = 10.0;
 input double DailyLossLimitUSD = 300.0;
 
 input int SlippagePoints = 20;

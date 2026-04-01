@@ -1,0 +1,74 @@
+using Microsoft.AspNetCore.Mvc;
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Web;
+using System.Web.Mvc;
+using WebApplication1.Models;
+using Microsoft.Extensions.Configuration;
+
+namespace WebApplication1.Controllers
+{
+    public class WifiController : Controller
+    {
+
+        // GET: Wifi
+        public ActionResult Index()
+        {
+            return View();
+        }
+
+        [HttpGet]
+        public ActionResult Login(string mac, string ip, string apname, string switchip)
+        {
+            var model = new WifiLoginViewModel
+            {
+                Mac = mac,
+                Ip = ip,
+                ApName = apname,
+                switchip = switchip
+            };
+            return View(model);
+        }
+
+
+        [HttpPost]
+        public JsonResult SaveAndConnect(string mac,string ip,string apname,string name,string phone,string address)
+        {
+            Response.Headers.Add("Access-Control-Allow-Origin", "*");
+            string connectionString = System.Configuration.ConfigurationManager.ConnectionStrings["DefaultConnection"].ConnectionString;
+            try
+            {
+                using (SqlConnection conn = new SqlConnection(connectionString))
+                {
+                    string sql = @"INSERT INTO Wifi_Customers (Name, Phone, Address, Mac, IP,ApName) 
+                           VALUES (@name,@phone,@address,@mac,@ip,@apname)";
+
+                    using (SqlCommand cmd = new SqlCommand(sql, conn))
+                    {
+                        // 3. Add Parameters (Prevents SQL Injection)
+                        cmd.Parameters.AddWithValue("@name", (object)name ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@phone", (object)phone ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@address", (object)address ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@mac", (object)mac ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@ip", (object)ip ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@apname", (object)apname ?? DBNull.Value);
+
+                        conn.Open();
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+
+                return Json(new { success = true, message = "User saved successfully" });
+            }
+            catch (Exception ex)
+            {
+                // Log the error (ex.Message)
+                return Json(new { success = false, message = "Database error" });
+            }
+
+        }
+    }
+}

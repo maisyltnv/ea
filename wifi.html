@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="lo">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Login</title>
+    <style>
+        body { font-family: 'Phetsarath OT', Arial, sans-serif; background: #f4f4f9; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .box { background: white; padding: 30px; border-radius: 12px; width: 360px; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        input { width: 100%; padding: 12px; margin: 10px 0; border: 1px solid #ddd; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; }
+        button:disabled { opacity: 0.6; }
+        .status { margin-top: 15px; text-align: center; font-size: 13px; color: #666; }
+        .success { color: green; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+<div class="box">
+    <h3>ລົງທະບຽນໃຊ້ WiFi</h3>
+    <p style="font-size: 14px; color: #666;">ກະລຸນາປ້ອນຂໍ້ມູນເພື່ອເຂົ້າໃຊ້ງານ</p>
+    <form id="wifiForm">
+        <input type="text" id="name" placeholder="ຊື່ຂອງທ່ານ" required>
+        <input type="tel" id="phone" placeholder="ເບີໂທລະສັບ" required>
+        <button type="submit" id="btn">ເຂົ້າໃຊ້ງານ</button>
+    </form>
+    <p class="status" id="statusMsg"></p>
+</div>
+
+<script>
+document.getElementById('wifiForm').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const btn = document.getElementById('btn');
+    const statusMsg = document.getElementById('statusMsg');
+    btn.disabled = true;
+    btn.innerText = 'ກຳລັງອະນຸຍາດ...';
+    statusMsg.innerHTML = 'ກຳລັງກວດສອບ...';
+
+    const params = new URLSearchParams(window.location.search);
+    const userName = document.getElementById('name').value;
+    const userPhone = document.getElementById('phone').value;
+    
+    try {
+        // ສົ່ງຂໍ້ມູນໄປຫາ server ຂອງເຈົ້າ
+        const response = await fetch('http://62.171.159.75:8082/api/auth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                name: userName, 
+                phone: userPhone,
+                mac: params.get('mac') || '',
+                ip: params.get('ip') || '',
+                switch_url: params.get('switch_url') || ''
+            })
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            statusMsg.innerHTML = 'ສຳເລັດ! ກຳລັງເຊື່ອມຕໍ່ເນັດ...';
+            statusMsg.className = 'status success';
+            
+            // ລອງເປີດໜ້າ success ເພື່ອໃຫ້ iPad ຮູ້ວ່າ login ສຳເລັດ
+            setTimeout(() => {
+                window.location.href = 'http://captive.apple.com/hotspot-detect.html';
+            }, 1500);
+        } else {
+            statusMsg.innerHTML = result.message || 'ການຢືນຢັນລົ້ມເຫລວ ກະລຸນາລອງໃໝ່';
+            statusMsg.className = 'status error';
+            btn.disabled = false;
+            btn.innerText = 'ເຂົ້າໃຊ້ງານ';
+        }
+    } catch (error) {
+        console.error('Error:', error);
+        statusMsg.innerHTML = 'ບໍ່ສາມາດເຊື່ອມຕໍ່ກັບເຊີຟເວີ ກະລຸນາລອງໃໝ່';
+        statusMsg.className = 'status error';
+        btn.disabled = false;
+        btn.innerText = 'ເຂົ້າໃຊ້ງານ';
+    }
+});
+</script>
+</body>
+</html>
