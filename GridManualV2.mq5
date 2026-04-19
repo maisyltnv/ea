@@ -23,7 +23,7 @@ input int SLPoints =
 input int TPPoints =
     1000; // Take Profit (points) for grid orders; editable after set
 input double MaxFloatingLossUSD =
-    180.0; // If total floating loss <= -this, close all
+    1800.0; // If total floating loss <= -this, close all
 
 //--- trade object
 CTrade trade;
