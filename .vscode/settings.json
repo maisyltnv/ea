@@ -1,0 +1,14 @@
+{
+  "files.associations": {
+    "*.mq5": "cpp",
+    "*.mqh": "cpp",
+    "*.mq4": "cpp"
+  },
+  "scm.diffDecorations": "all",
+  "scm.diffDecorationsGutterVisibility": "always",
+  "git.decorations.enabled": true,
+  "git.enableStatusBarSync": true,
+  "scm.alwaysShowRepositories": true,
+  "workbench.editor.enablePreview": false,
+  "timeline.excludeSources": []
+}

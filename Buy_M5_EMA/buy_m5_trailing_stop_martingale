@@ -1,0 +1,444 @@
+//+------------------------------------------------------------------+
+//| Buy_EMA_Trail_EMA200_M1_M5_Martingale_Fixed.mq5                 |
+//| ຂາດທຶນ (ກຳໄລລົບ) => +InpLotStep ຕໍ່ຄັ້ງ | ກຳໄລບວກ => ກັບ Base |
+//+------------------------------------------------------------------+
+#property copyright "Forex Trader"
+#property version   "1.13"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| ຕົວແປທີ່ສາມາດປັບໄດ້ (Input Parameters)                    |
+//+------------------------------------------------------------------+
+input double InpLotsBase           = 0.01;      // Lot ເລີ່ມຕົ້ນ
+input double InpLotStep            = 0.01;      // ຂັ້ນຕອນການເພີ່ມ/ລົດ Lot
+input double InpMaxLots            = 1.00;      // Lot ສູງສຸດ
+input ulong  InpMagic              = 202504201; // Magic Number
+input int    InpSlippage           = 30;        // Slippage (points)
+
+input int    InpEMAFast            = 50;        // EMA ສາຍໄວ
+input int    InpEMASlow            = 200;       // EMA ສາຍຊ້າ
+
+//+------------------------------------------------------------------+
+//| ຕົວແປລະດັບ Global                                           |
+//+------------------------------------------------------------------+
+int g_ema50_m5   = INVALID_HANDLE;
+int g_ema200_m5  = INVALID_HANDLE;
+int g_ema50_m1   = INVALID_HANDLE;
+int g_ema200_m1  = INVALID_HANDLE;
+
+datetime g_lastBarM1 = 0;
+double g_currentLots = 0.01;
+ulong  g_lastClosedTicket = 0;       // Ticket ຫຼ້າສຸດທີ່ປິດໄປ
+
+//+------------------------------------------------------------------+
+//| ຄ່າ Point ແລະ Digits                                         |
+//+------------------------------------------------------------------+
+double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
+int Dg() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
+
+void ClampLotsToSymbol(double &lots)
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(step > 0.0)
+      lots = NormalizeDouble(MathFloor(lots / step + 1e-12) * step, 8);
+   if(lots < vmin)
+      lots = vmin;
+   if(lots > vmax)
+      lots = vmax;
+}
+
+//+------------------------------------------------------------------+
+//| ໂຫຼດຄ່າ Lot ແລະ ຈຳນວນການສູນເສຍຕິດຕໍ່ກັນ                   |
+//+------------------------------------------------------------------+
+void LoadDataFromFile()
+{
+   string filename = _Symbol + "_" + IntegerToString(InpMagic) + "_data.bin";
+   int handle = FileOpen(filename, FILE_READ|FILE_BIN);
+   if(handle != INVALID_HANDLE)
+   {
+      g_currentLots = FileReadDouble(handle);
+      if(!FileIsEnding(handle))
+         FileReadInteger(handle); // ເກົ່າ: consecutive losses — ບໍ່ໃຊ້ແລ້ວ
+      if(!FileIsEnding(handle))
+         g_lastClosedTicket = (ulong)FileReadLong(handle);
+      FileClose(handle);
+      Print("ໂຫຼດຂໍ້ມູນ: Lots=", g_currentLots, " LastDealTicket=", g_lastClosedTicket);
+   }
+   else
+   {
+      g_currentLots = InpLotsBase;
+      g_lastClosedTicket = 0;
+      Print("ເລີ່ມຕົ້ນໃໝ່: Base Lot=", InpLotsBase);
+   }
+   
+   if(g_currentLots > InpMaxLots) g_currentLots = InpMaxLots;
+   if(g_currentLots < InpLotsBase) g_currentLots = InpLotsBase;
+   ClampLotsToSymbol(g_currentLots);
+}
+
+//+------------------------------------------------------------------+
+//| ບັນທຶກຄ່າ Lot ແລະ ຈຳນວນການສູນເສຍ                            |
+//+------------------------------------------------------------------+
+void SaveDataToFile()
+{
+   string filename = _Symbol + "_" + IntegerToString(InpMagic) + "_data.bin";
+   int handle = FileOpen(filename, FILE_WRITE|FILE_BIN);
+   if(handle != INVALID_HANDLE)
+   {
+      FileWriteDouble(handle, g_currentLots);
+      FileWriteInteger(handle, 0);
+      FileWriteLong(handle, (long)g_lastClosedTicket);
+      FileClose(handle);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ຊິ້ງ ticket ປິດຫຼ້າສຸດຈາກ history (ໃຊ້ເມື່ອໂຫຼດໄຟລ໌ເກົ່າບໍ່ມີ ticket ບັນທຶກ) |
+//+------------------------------------------------------------------+
+void SyncLastClosedTicketFromHistory()
+{
+   if(g_lastClosedTicket != 0)
+      return;
+   datetime toTime = TimeTradeServer();
+   if(toTime == 0)
+      toTime = TimeCurrent();
+   if(!HistorySelect(0, toTime))
+      return;
+
+   datetime lastCloseTime = 0;
+   ulong lastTicket = 0;
+
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol)
+         continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)InpMagic)
+         continue;
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
+         continue;
+      if(HistoryDealGetInteger(ticket, DEAL_TYPE) != DEAL_TYPE_SELL)
+         continue;
+
+      datetime closeTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(closeTime >= lastCloseTime)
+      {
+         lastCloseTime = closeTime;
+         lastTicket = ticket;
+      }
+   }
+
+   if(lastTicket != 0)
+   {
+      g_lastClosedTicket = lastTicket;
+      Print("Sync ຈາກ history: ບໍ່ໃຫ້ປັບ lot ຊ້ຳ — last deal ticket=", g_lastClosedTicket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ກວດສອບຜົນການປິດ position ຫຼ້າສຸດ ແລະ ປັບ Lot            |
+//+------------------------------------------------------------------+
+void CheckLastTradeAndAdjustLots()
+{
+   // ບັນດາ MT5: ຕ້ອງເລືອກຊ່ວງ history ກ່ອນ — ຖ້າບໍ່ມີ HistoryDealsTotal ອາດເປັນ 0 ຈຶ່ງບໍ່ປັບ martingale
+   datetime toTime = TimeTradeServer();
+   if(toTime == 0)
+      toTime = TimeCurrent();
+   if(!HistorySelect(0, toTime))
+   {
+      return;
+   }
+
+   // ຊອກຫາ trade ຫຼ້າສຸດທີ່ປິດໄປຂອງ EA ນີ້ (ປິດຕຳແໜ່ງ Buy = deal ອອກແບບ SELL)
+   datetime lastCloseTime = 0;
+   double lastProfit = 0;
+   ulong lastTicket = 0;
+   
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != (long)InpMagic) continue;
+
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT)
+         continue;
+      
+      long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dealType != DEAL_TYPE_SELL)
+         continue;
+      
+      datetime closeTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(closeTime > lastCloseTime)
+      {
+         lastCloseTime = closeTime;
+         lastProfit = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                     + HistoryDealGetDouble(ticket, DEAL_SWAP)
+                     + HistoryDealGetDouble(ticket, DEAL_COMMISSION);
+         lastTicket = ticket;
+      }
+   }
+   
+   // ຖ້າບໍ່ມີ trade ໃໝ່ ຫຼື trade ດຽວກັບເກົ່າ
+   if(lastTicket == 0 || lastTicket == g_lastClosedTicket) return;
+   
+   // ບັນທຶກ ticket ຫຼ້າສຸດ
+   g_lastClosedTicket = lastTicket;
+   
+   double oldLots = g_currentLots;
+   
+   if(lastProfit < 0.0)
+   {
+      // ປິດຂາດທຶນ (ລວມຖືກ SL ລົບ): ເພີ່ມ lot ທີ່ລະ InpLotStep
+      g_currentLots += InpLotStep;
+      
+      Print("[ຂາດທຶນ] ຜົນລວມ: ", lastProfit,
+            " | ເພີ່ມ Lot +", InpLotStep, ": ", oldLots, " -> ", g_currentLots);
+   }
+   else if(lastProfit > 0.0)
+   {
+      // ປິດດ້ວຍກຳໄລບວກ (ລວມ SL ຕາມ trailing ທີ່ຍັງກຳໄລ): ກັບໄປ lot ເລີ່ມຕົ້ນ
+      g_currentLots = InpLotsBase;
+      
+      Print("[ກຳໄລບວກ] ຜົນລວມ: ", lastProfit,
+            " | ກັບມາ Base Lot: ", oldLots, " -> ", g_currentLots);
+   }
+   else
+   {
+      // ກຳໄລ = 0 (ທຽມທູນ): ກັບ Base
+      g_currentLots = InpLotsBase;
+      Print("[ທຽມທູນ] ຜົນລວມ 0 — ກັບ Base Lot: ", InpLotsBase);
+   }
+   
+   // ກວດສອບຂອບເຂດ
+   if(g_currentLots > InpMaxLots)
+   {
+      g_currentLots = InpMaxLots;
+      Print("Lot ຮອດຄ່າສູງສຸດ: ", InpMaxLots);
+   }
+   if(g_currentLots < InpLotsBase)
+   {
+      g_currentLots = InpLotsBase;
+   }
+   ClampLotsToSymbol(g_currentLots);
+   
+   // ບັນທຶກຂໍ້ມູນ
+   SaveDataToFile();
+}
+
+//+------------------------------------------------------------------+
+//| ກວດສອບເງື່ອນໄຂ Trend                                      |
+//+------------------------------------------------------------------+
+bool IsTrendBullish(const int hFast, const int hSlow, const ENUM_TIMEFRAMES tf, const int shift)
+{
+   double close = iClose(_Symbol, tf, shift);
+   double emaFast[], emaSlow[];
+   
+   if(CopyBuffer(hFast, 0, shift, 1, emaFast) != 1) return false;
+   if(CopyBuffer(hSlow, 0, shift, 1, emaSlow) != 1) return false;
+   
+   return (close > emaFast[0] && emaFast[0] > emaSlow[0]);
+}
+
+//+------------------------------------------------------------------+
+//| ກວດສອບເງື່ອນໄຂເປີດອໍເດີ                                      |
+//+------------------------------------------------------------------+
+bool IsEntrySignal()
+{
+   if(!IsTrendBullish(g_ema50_m5, g_ema200_m5, PERIOD_M5, 1)) return false;
+   if(!IsTrendBullish(g_ema50_m1, g_ema200_m1, PERIOD_M1, 0)) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ດຶງຄ່າ EMA200 M1 ມາໃຊ້ເປັນ Stop Loss                         |
+//+------------------------------------------------------------------+
+double GetEMA200_M1_SL()
+{
+   double ema200[];
+   if(CopyBuffer(g_ema200_m1, 0, 0, 1, ema200) != 1) return 0.0;
+   return NormalizeDouble(ema200[0], Dg());
+}
+
+//+------------------------------------------------------------------+
+//| ກວດວ່າມີ Buy position ຄ້າງຢູ່ບໍ່                              |
+//+------------------------------------------------------------------+
+bool HasOurBuyPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ເປີດ Buy order                                                |
+//+------------------------------------------------------------------+
+void OpenBuyOrder()
+{
+   if(HasOurBuyPosition()) return;
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl = GetEMA200_M1_SL();
+   
+   if(sl <= 0.0 || sl >= ask)
+   {
+      Print("ບໍ່ສາມາດເປີດ Buy: EMA200 M1=", sl, " Ask=", ask);
+      return;
+   }
+   
+   double pt = Pt();
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minSLDistance = stopsLevel * pt;
+   double minAllowedSL = ask - minSLDistance;
+   
+   if(sl > minAllowedSL)
+   {
+      sl = NormalizeDouble(minAllowedSL, Dg());
+   }
+   
+   double lotsToUse = NormalizeDouble(g_currentLots, 2);
+   
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   
+   Print("=== ກຳລັງເປີດ Buy ===");
+   Print("Lot ທີ່ໃຊ້: ", lotsToUse);
+   Print("SL ທີ່ເສັ້ນ EMA200 M1: ", sl);
+   if(!trade.Buy(lotsToUse, _Symbol, ask, sl, 0.0))
+   {
+      Print("ເປີດ Buy ບໍ່ສຳເລັດ: ", trade.ResultRetcodeDescription());
+   }
+   else
+   {
+      Print("ເປີດ Buy ສຳເລັດ!");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ຈັດການ Trailing Stop ຕາມ EMA200 M1                           |
+//+------------------------------------------------------------------+
+void TrailStopByEMA200_M1()
+{
+   double currentEMA200 = GetEMA200_M1_SL();
+   if(currentEMA200 <= 0.0) return;
+   
+   double pt = Pt();
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minSLDistance = stopsLevel * pt;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+      if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+      
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      double newSL = currentEMA200;
+      
+      if(newSL <= openPrice) continue;
+      
+      double minAllowedSL = bid - minSLDistance;
+      if(newSL > minAllowedSL)
+         newSL = NormalizeDouble(minAllowedSL, Dg());
+      
+      if(newSL <= currentSL) continue;
+      
+      if(trade.PositionModify(ticket, newSL, 0.0))
+      {
+         Print("Trail SL ສຳເລັດ: ", currentSL, " -> ", newSL);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnTick                                                 |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // ກວດສອບຜົນການປິດ position ຫຼ້າສຸດ ແລະ ປັບ Lot
+   CheckLastTradeAndAdjustLots();
+   
+   // ຈັດການ Trailing Stop
+   TrailStopByEMA200_M1();
+   
+   // ກວດສັນຍານເປີດອໍເດີເມື່ອ M1 bar ໃໝ່
+   datetime currentM1Bar = iTime(_Symbol, PERIOD_M1, 0);
+   if(currentM1Bar == 0 || currentM1Bar == g_lastBarM1) return;
+   g_lastBarM1 = currentM1Bar;
+   
+   if(HasOurBuyPosition()) return;
+   if(!IsEntrySignal()) return;
+   
+   OpenBuyOrder();
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnInit                                                 |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   g_ema50_m5  = iMA(_Symbol, PERIOD_M5, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema200_m5 = iMA(_Symbol, PERIOD_M5, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema50_m1  = iMA(_Symbol, PERIOD_M1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema200_m1 = iMA(_Symbol, PERIOD_M1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   
+   if(g_ema50_m5 == INVALID_HANDLE || g_ema200_m5 == INVALID_HANDLE ||
+      g_ema50_m1 == INVALID_HANDLE || g_ema200_m1 == INVALID_HANDLE)
+   {
+      Print("ບໍ່ສາມາດສ້າງ EMA indicators");
+      return INIT_FAILED;
+   }
+   
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   
+   LoadDataFromFile();
+   SyncLastClosedTicketFromHistory();
+   SaveDataToFile();
+
+   Print("========== EA ເລີ່ມຕົ້ນ ==========");
+   Print("Base Lot: ", InpLotsBase, " | Max Lot: ", InpMaxLots);
+   Print("Lot ປັດຈຸບັນ: ", g_currentLots);
+   Print("==================================");
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnDeinit                                               |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_ema50_m5 != INVALID_HANDLE) IndicatorRelease(g_ema50_m5);
+   if(g_ema200_m5 != INVALID_HANDLE) IndicatorRelease(g_ema200_m5);
+   if(g_ema50_m1 != INVALID_HANDLE) IndicatorRelease(g_ema50_m1);
+   if(g_ema200_m1 != INVALID_HANDLE) IndicatorRelease(g_ema200_m1);
+   
+   SaveDataToFile();
+   Print("EA ປິດ, Lot ສຸດທ້າຍ: ", g_currentLots);
+}
+//+------------------------------------------------------------------+

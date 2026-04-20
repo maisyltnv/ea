@@ -32,7 +32,7 @@ input ENUM_AGG_TP_MODE AggTPGoal =
 input bool ShowAggDebugOnChart =
     true; // Show combined pts / target on chart (for testing)
 input double MaxFloatingLossUSD =
-    180.0; // If total floating loss <= -this, close all
+    1800.0; // If total floating loss <= -this, close all
 
 //--- trade object
 CTrade trade;

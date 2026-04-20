@@ -1,0 +1,281 @@
+//+------------------------------------------------------------------+
+//| Buy_EMA_Trail_EMA200_M1_M5.mq5                                  |
+//| Buy only: M5 + M1 ລາຄາ > EMA50 > EMA200, SL trail ຕາມ EMA200 M1 |
+//+------------------------------------------------------------------+
+//ໝົດປີໄດ້ກຳໄລ 3%
+#property copyright "Forex Trader"
+#property version   "1.00"
+#property strict
+
+#include <Trade/Trade.mqh>
+
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| ຕົວແປທີ່ສາມາດປັບໄດ້ (Input Parameters)                    |
+//+------------------------------------------------------------------+
+input double InpLots                = 0.01;      // ຈຳນວນ Lot
+input ulong  InpMagic               = 202504201; // Magic Number
+input int    InpSlippage            = 30;        // Slippage (points)
+
+input int    InpEMAFast             = 50;        // EMA ສາຍໄວ
+input int    InpEMASlow             = 200;       // EMA ສາຍຊ້າ
+
+//+------------------------------------------------------------------+
+//| ຕົວແປລະດັບ Global                                           |
+//+------------------------------------------------------------------+
+int g_ema50_m5   = INVALID_HANDLE;   // Handle EMA50 M5
+int g_ema200_m5  = INVALID_HANDLE;   // Handle EMA200 M5
+int g_ema50_m1   = INVALID_HANDLE;   // Handle EMA50 M1
+int g_ema200_m1  = INVALID_HANDLE;   // Handle EMA200 M1
+
+datetime g_lastBarM1 = 0;             // ເວລາ M1 bar ລ່າສຸດ
+
+//+------------------------------------------------------------------+
+//| ຄ່າ Point ແລະ Digits                                         |
+//+------------------------------------------------------------------+
+double Pt()
+{
+   return SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+}
+
+int Dg()
+{
+   return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+}
+
+//+------------------------------------------------------------------+
+//| ກວດສອບເງື່ອນໄຂ Trend: ລາຄາ > EMA50 > EMA200               |
+//+------------------------------------------------------------------+
+bool IsTrendBullish(const int hFast, const int hSlow, const ENUM_TIMEFRAMES tf, const int shift)
+{
+   double close = iClose(_Symbol, tf, shift);
+   double emaFast[], emaSlow[];
+   
+   if(CopyBuffer(hFast, 0, shift, 1, emaFast) != 1)
+      return false;
+   if(CopyBuffer(hSlow, 0, shift, 1, emaSlow) != 1)
+      return false;
+   
+   // ລາຄາຕ້ອງຢູ່ເໜືອ EMA50 ແລະ EMA50 ຢູ່ເໜືອ EMA200
+   return (close > emaFast[0] && emaFast[0] > emaSlow[0]);
+}
+
+//+------------------------------------------------------------------+
+//| ກວດສອບເງື່ອນໄຂເປີດອໍເດີ (ທັງ M5 ແລະ M1)                  |
+//+------------------------------------------------------------------+
+bool IsEntrySignal()
+{
+   // ກວດ M5: ລາຄາ(close bar ທີ່ຜ່ານມາ) > EMA50 > EMA200
+   if(!IsTrendBullish(g_ema50_m5, g_ema200_m5, PERIOD_M5, 1))
+      return false;
+   
+   // ກວດ M1: ລາຄາປັດຈຸບັນ > EMA50 > EMA200 (ໃຊ້ shift 0 ເພາະຢາກເຂົ້າທັນທີ)
+   if(!IsTrendBullish(g_ema50_m1, g_ema200_m1, PERIOD_M1, 0))
+      return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| ດຶງຄ່າ EMA200 M1 ມາໃຊ້ເປັນ Stop Loss                         |
+//+------------------------------------------------------------------+
+double GetEMA200_M1_SL()
+{
+   double ema200[];
+   if(CopyBuffer(g_ema200_m1, 0, 0, 1, ema200) != 1)
+      return 0.0;
+   return NormalizeDouble(ema200[0], Dg());
+}
+
+//+------------------------------------------------------------------+
+//| ກວດວ່າມີ Buy position ຂອງ EA ນີ້ຄ້າງຢູ່ບໍ່                |
+//+------------------------------------------------------------------+
+bool HasOurBuyPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ເປີດ Buy order                                                |
+//+------------------------------------------------------------------+
+void OpenBuyOrder()
+{
+   if(HasOurBuyPosition())
+      return;
+   
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double sl = GetEMA200_M1_SL();
+   
+   // ກວດສອບ SL ຕ້ອງຢູ່ຕໍ່າກວ່າ ask ເທົ່ານັ້ນ
+   if(sl <= 0.0 || sl >= ask)
+   {
+      Print("ບໍ່ສາມາດເປີດ Buy: EMA200 M1 ຢູ່ທີ່ ", sl, " ສູງກວ່າ ຫຼື ເທົ່າກັບ Ask ", ask);
+      return;
+   }
+   
+   // ກວດສອບ distance ຕໍ່າສຸດທີ່ broker ກຳນົດ
+   double pt = Pt();
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minSLDistance = stopsLevel * pt;
+   double minAllowedSL = ask - minSLDistance;
+   
+   if(sl > minAllowedSL)
+   {
+      sl = NormalizeDouble(minAllowedSL, Dg());
+      Print("ປັບ SL ຍ້ອນໃກ້ລາຄາເກີນໄປ: ", sl);
+   }
+   
+   // ຕັ້ງຄ່າ trade
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   
+   // ເປີດ Buy order (ໃຊ້ SL ທີ່ EMA200 M1, ບໍ່ມີ TP ຄົງທີ່)
+   if(!trade.Buy(InpLots, _Symbol, ask, sl, 0.0))
+   {
+      Print("ເປີດ Buy ບໍ່ສຳເລັດ: ", trade.ResultRetcodeDescription());
+   }
+   else
+   {
+      Print("ເປີດ Buy ສຳເລັດ Lot: ", InpLots, " SL: ", sl);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ຈັດການ Trailing Stop ໂດຍເລື່ອນ SL ຕາມ EMA200 M1             |
+//+------------------------------------------------------------------+
+void TrailStopByEMA200_M1()
+{
+   double currentEMA200 = GetEMA200_M1_SL();
+   if(currentEMA200 <= 0.0)
+      return;
+   
+   double pt = Pt();
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minSLDistance = stopsLevel * pt;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+      if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY)
+         continue;
+      
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // ຄຳນວນ SL ໃໝ່ (ເອົາ EMA200 ເປັນຫຼັກ)
+      double newSL = currentEMA200;
+      
+      // ປັບປຸງ: ຖ້າ EMA200 ຍັງຕໍ່າກວ່າ open price, ຍັງບໍ່ທັນຍົກ SL
+      if(newSL <= openPrice)
+      {
+         // ຖ້າ SL ເກົ່າໃຫຍ່ກວ່າ EMA200, ບໍ່ຕ້ອງປັບ
+         if(newSL <= currentSL)
+            continue;
+      }
+      
+      // ກວດສອບ distance ຕໍ່າສຸດກັບ Bid
+      double minAllowedSL = bid - minSLDistance;
+      if(newSL > minAllowedSL)
+         newSL = NormalizeDouble(minAllowedSL, Dg());
+      
+      // ຖ້າ SL ໃໝ່ຕໍ່າກວ່າ ຫຼື ເທົ່າກັບ SL ເກົ່າ, ຂ້າມໄປ
+      if(newSL <= currentSL)
+         continue;
+      
+      // ປັບປຸງ SL
+      if(trade.PositionModify(ticket, newSL, 0.0))
+      {
+         Print("Trail SL ສຳເລັດ: ໃໝ່ = ", newSL, " (EMA200 M1 = ", currentEMA200, ")");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnTick ຫຼັກ (ເຮັດວຽກທຸກ tick)                      |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // ຂັ້ນຕອນທີ 1: ຈັດການ Trailing Stop ທຸກ tick
+   TrailStopByEMA200_M1();
+   
+   // ຂັ້ນຕອນທີ 2: ກວດສັນຍານເປີດອໍເດີເມື່ອ M1 bar ໃໝ່ເທົ່ານັ້ນ
+   datetime currentM1Bar = iTime(_Symbol, PERIOD_M1, 0);
+   if(currentM1Bar == 0 || currentM1Bar == g_lastBarM1)
+      return;
+   g_lastBarM1 = currentM1Bar;
+   
+   // ຖ້າມີ position ຢູ່ແລ້ວ, ບໍ່ເປີດເພີ່ມ
+   if(HasOurBuyPosition())
+      return;
+   
+   // ກວດເງື່ອນໄຂເປີດອໍເດີ
+   if(!IsEntrySignal())
+      return;
+   
+   // ເປີດ Buy order
+   OpenBuyOrder();
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnInit (ເມື່ອເລີ່ມຕົ້ນ EA)                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // ສ້າງ EMA indicators
+   g_ema50_m5  = iMA(_Symbol, PERIOD_M5, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema200_m5 = iMA(_Symbol, PERIOD_M5, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema50_m1  = iMA(_Symbol, PERIOD_M1, InpEMAFast, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema200_m1 = iMA(_Symbol, PERIOD_M1, InpEMASlow, 0, MODE_EMA, PRICE_CLOSE);
+   
+   // ກວດສອບວ່າສ້າງ handle ສຳເລັດທຸກອັນ
+   if(g_ema50_m5 == INVALID_HANDLE || g_ema200_m5 == INVALID_HANDLE ||
+      g_ema50_m1 == INVALID_HANDLE || g_ema200_m1 == INVALID_HANDLE)
+   {
+      Print("ບໍ່ສາມາດສ້າງ EMA indicators ໄດ້");
+      return INIT_FAILED;
+   }
+   
+   // ຕັ້ງຄ່າ CTrade
+   trade.SetExpertMagicNumber(InpMagic);
+   trade.SetDeviationInPoints(InpSlippage);
+   trade.SetTypeFillingBySymbol(_Symbol);
+   
+   Print("EA ເລີ່ມຕົ້ນສຳເລັດ");
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| ຟັງຊັນ OnDeinit (ເມື່ອປິດ EA)                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // ປ່ອຍ indicator handles
+   if(g_ema50_m5 != INVALID_HANDLE)   IndicatorRelease(g_ema50_m5);
+   if(g_ema200_m5 != INVALID_HANDLE)  IndicatorRelease(g_ema200_m5);
+   if(g_ema50_m1 != INVALID_HANDLE)   IndicatorRelease(g_ema50_m1);
+   if(g_ema200_m1 != INVALID_HANDLE)  IndicatorRelease(g_ema200_m1);
+   
+   Print("EA ຖືກປິດ, reason: ", reason);
+}
+//+------------------------------------------------------------------+
