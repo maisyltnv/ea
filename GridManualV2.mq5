@@ -5,23 +5,32 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: one manual position -> add grid of pending orders."
-#property version "1.00"
+#property description "SetGridManually: grid; on TP or TPPoints target, close all positions + pendings."
+#property version "1.30"
 
 #include <Trade/Trade.mqh>
 
+enum ENUM_AGG_TP_MODE {
+  AGG_TP_BASKET = 0,   // volume-weighted avg entry -> one combined P/L in points
+  AGG_TP_SUM_LEGS = 1 // sum each order's points P/L (e.g. 333+333+334 = 1000)
+};
+
 //--- inputs
-input int GridCount = 4;       // Number of pending orders in grid
+input int GridCount = 5;       // Number of pending orders in grid
 input int GridDistancePoints = //
-    1000;                      // Distance between each pending order (points)
+    100;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.01; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
 input int SLPoints =
-    4500; // Stop Loss (points) for grid orders; editable after set
+    450; // Stop Loss (points) for grid orders; editable after set
 input int TPPoints =
-    1000; // Take Profit (points) for grid orders; editable after set
+    100; // Take Profit (points) for grid orders; editable after set
+input ENUM_AGG_TP_MODE AggTPGoal =
+    AGG_TP_SUM_LEGS; // Sum each order's pts P/L (matches terminal-style per-leg sum)
+input bool ShowAggDebugOnChart =
+    true; // Show combined pts / target on chart (for testing)
 input double MaxFloatingLossUSD =
     180.0; // If total floating loss <= -this, close all
 
@@ -30,6 +39,135 @@ CTrade trade;
 // Remember which position ticket already had its grid placed,
 // so if user deletes pending orders manually we don't place grid again
 ulong g_lastGridTicket = 0;
+
+//+------------------------------------------------------------------+
+//| Floating P/L of one position in price points (that symbol's point) |
+//+------------------------------------------------------------------+
+double PositionProfitPoints(const ulong ticket) {
+  if (ticket == 0 || !PositionSelectByTicket(ticket))
+    return 0.0;
+
+  const string sym = PositionGetString(POSITION_SYMBOL);
+  if (sym != _Symbol)
+    return 0.0;
+
+  if (!SymbolInfoInteger(sym, SYMBOL_SELECT))
+    SymbolSelect(sym, true);
+
+  const double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
+  if (pt <= 0.0)
+    return 0.0;
+
+  const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+  const long type = PositionGetInteger(POSITION_TYPE);
+
+  if (type == POSITION_TYPE_BUY) {
+    const double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+    return (bid - open) / pt;
+  }
+  if (type == POSITION_TYPE_SELL) {
+    const double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+    return (open - ask) / pt;
+  }
+  return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Sum per-leg floating P/L in points (each order vs its own entry) |
+//+------------------------------------------------------------------+
+double TotalFloatingProfitPointsOnSymbol() {
+  double sum = 0.0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong t = PositionGetTicket(i);
+    if (t == 0 || !PositionSelectByTicket(t))
+      continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+      continue;
+    sum += PositionProfitPoints(t);
+  }
+  return sum;
+}
+
+//+------------------------------------------------------------------+
+//| Combined basket P/L in points (volume-weighted average entry).   |
+//| Same-direction grid: one number = distance from avg entry to     |
+//| current price — matches "3 orders together = TPPoints profit".     |
+//+------------------------------------------------------------------+
+double BasketFloatingProfitPointsOnSymbol() {
+  double buyLots = 0.0, sellLots = 0.0;
+  double buyWeightedOpen = 0.0, sellWeightedOpen = 0.0;
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong t = PositionGetTicket(i);
+    if (t == 0 || !PositionSelectByTicket(t))
+      continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+      continue;
+
+    const double vol = PositionGetDouble(POSITION_VOLUME);
+    const double opn = PositionGetDouble(POSITION_PRICE_OPEN);
+    const long typ = PositionGetInteger(POSITION_TYPE);
+
+    if (typ == POSITION_TYPE_BUY) {
+      buyLots += vol;
+      buyWeightedOpen += opn * vol;
+    } else if (typ == POSITION_TYPE_SELL) {
+      sellLots += vol;
+      sellWeightedOpen += opn * vol;
+    }
+  }
+
+  if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT))
+    SymbolSelect(_Symbol, true);
+
+  const double pt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  if (pt <= 0.0)
+    return 0.0;
+
+  // Only buys (typical grid): one combined profit in points from average entry
+  if (buyLots > 0.0 && sellLots <= 0.0) {
+    const double avg = buyWeightedOpen / buyLots;
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    return (bid - avg) / pt;
+  }
+  // Only sells
+  if (sellLots > 0.0 && buyLots <= 0.0) {
+    const double avg = sellWeightedOpen / sellLots;
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    return (avg - ask) / pt;
+  }
+  // Hedge / mixed: fall back to sum of per-leg points
+  return TotalFloatingProfitPointsOnSymbol();
+}
+
+//+------------------------------------------------------------------+
+//| Debug: show combined pts vs TPPoints on chart                      |
+//+------------------------------------------------------------------+
+void UpdateAggComment() {
+  if (!ShowAggDebugOnChart) {
+    Comment("");
+    return;
+  }
+  if (CountPositionsOnSymbol() <= 0) {
+    Comment("");
+    return;
+  }
+
+  const double legSum = TotalFloatingProfitPointsOnSymbol();
+  const double basket = BasketFloatingProfitPointsOnSymbol();
+  const double usePts =
+      (AggTPGoal == AGG_TP_SUM_LEGS) ? legSum : basket;
+  const string modeStr =
+      (AggTPGoal == AGG_TP_SUM_LEGS) ? "SUM_LEGS (add each order)" : "BASKET (avg entry)";
+
+  Comment("GridManualV2 - close when combined pts >= TPPoints\n",
+          "Mode: ", modeStr, "\n",
+          "Sum(legs) pts: ", DoubleToString(legSum, 2), "\n",
+          "Basket pts:    ", DoubleToString(basket, 2), "\n",
+          "TPPoints target: ", IntegerToString(TPPoints), "\n",
+          "Uses for close:  ", DoubleToString(usePts, 2),
+          (usePts >= (double)TPPoints ? "  >= OK (will close)" : "  (below target)"));
+}
 
 //+------------------------------------------------------------------+
 //| Count positions and EA pending orders for symbol                  |
@@ -50,7 +188,8 @@ int CountPositionsOnSymbol() {
 //| Close all positions and pending orders on this symbol             |
 //+------------------------------------------------------------------+
 void CloseAllPositionsAndOrdersOnSymbol() {
-  trade.SetExpertMagicNumber(MagicNumber);
+  // 0 = allow closing manual + any magic on this account
+  trade.SetExpertMagicNumber(0);
   trade.SetDeviationInPoints(SlippagePoints);
 
   // Close all positions on this symbol
@@ -84,6 +223,7 @@ void CloseAllPositionsAndOrdersOnSymbol() {
             " Error=", GetLastError());
     }
   }
+  g_lastGridTicket = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -314,9 +454,49 @@ int OnInit() {
 }
 
 //+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+  Comment("");
+  Print("SetGridManually EA stopped. Reason=", reason);
+}
+
+//+------------------------------------------------------------------+
+//| When any position closes at Take Profit, close all + pendings     |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result) {
+  if (trans.type != TRADE_TRANSACTION_DEAL_ADD)
+    return;
+  if (trans.deal == 0)
+    return;
+
+  if (!HistoryDealSelect(trans.deal))
+    return;
+
+  if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+    return;
+
+  const long entryDeal = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+  if (entryDeal != DEAL_ENTRY_OUT && entryDeal != DEAL_ENTRY_OUT_BY)
+    return;
+
+  const long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
+  if (reason != DEAL_REASON_TP)
+    return;
+
+  Print("[SetGridManually] Take Profit hit (deal ", trans.deal,
+        "). Closing all positions and pending orders on ", _Symbol, ".");
+  CloseAllPositionsAndOrdersOnSymbol();
+}
+
+//+------------------------------------------------------------------+
 //| Expert tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick() {
+  UpdateAggComment();
+
   // Emergency: close everything if floating loss exceeds threshold (in USD)
   if (MaxFloatingLossUSD > 0.0) {
     double totalProfit = 0.0;
@@ -334,6 +514,23 @@ void OnTick() {
             DoubleToString(totalProfit, 2), " USD (threshold = -",
             DoubleToString(MaxFloatingLossUSD, 2),
             "). Closing all positions and orders on symbol ", _Symbol);
+      CloseAllPositionsAndOrdersOnSymbol();
+      return;
+    }
+  }
+
+  // Combined P/L in points >= TPPoints -> close all (incl. pendings)
+  if (TPPoints > 0 && CountPositionsOnSymbol() > 0) {
+    const double pts = (AggTPGoal == AGG_TP_SUM_LEGS)
+                           ? TotalFloatingProfitPointsOnSymbol()
+                           : BasketFloatingProfitPointsOnSymbol();
+    if (pts >= (double)TPPoints) {
+      Print("[SetGridManually] Combined TP goal (",
+            AggTPGoal == AGG_TP_SUM_LEGS ? "sum of legs" : "basket avg",
+            ") = ",
+            DoubleToString(pts, 2),
+            " pts (>= ", IntegerToString(TPPoints),
+            "). Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
     }

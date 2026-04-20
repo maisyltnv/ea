@@ -1,0 +1,184 @@
+//+------------------------------------------------------------------+
+//| CloseProfitLoss EA                                               |
+//| Closes all positions and pending orders when the sum of each     |
+//| position's floating P/L in price points hits target or max loss.|
+//+------------------------------------------------------------------+
+
+#property strict
+#property description "Close all when total floating P/L in points reaches target or loss limit."
+#property version   "1.20"
+
+#include <Trade/Trade.mqh>
+
+//--- inputs (points = price distance / SYMBOL_POINT per position, summed over all positions)
+input int TargetProfitPoints = 500; // Close all when sum of points P/L >= this
+input int MaxLossPoints      = 300; // Close all when sum of points P/L <= -this
+input int    SlippagePoints  = 20;  // Slippage for closing
+
+//--- trade object
+CTrade trade;
+
+//+------------------------------------------------------------------+
+//| Floating P/L of one position in price points (not money)         |
+//+------------------------------------------------------------------+
+double PositionProfitPoints(const ulong ticket)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+      return 0.0;
+
+   const string sym = PositionGetString(POSITION_SYMBOL);
+   const double pt  = SymbolInfoDouble(sym, SYMBOL_POINT);
+   if(pt <= 0.0)
+      return 0.0;
+
+   const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   const long   type = PositionGetInteger(POSITION_TYPE);
+
+   if(type == POSITION_TYPE_BUY)
+   {
+      const double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+      return (bid - open) / pt;
+   }
+   if(type == POSITION_TYPE_SELL)
+   {
+      const double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+      return (open - ask) / pt;
+   }
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Sum floating P/L in points for all open positions                |
+//+------------------------------------------------------------------+
+double TotalFloatingPoints()
+{
+   double sum = 0.0;
+   const int n = PositionsTotal();
+   for(int i = 0; i < n; i++)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      sum += PositionProfitPoints(ticket);
+   }
+   return sum;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions and pending orders                           |
+//+------------------------------------------------------------------+
+void CloseAllTrades()
+{
+   string logPrefix = "[CloseProfitLoss] ";
+
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   //--- Close all open positions
+   int totalPos = PositionsTotal();
+   for(int i = totalPos - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+
+      if(!trade.PositionClose(ticket))
+      {
+         Print(logPrefix,
+               "Failed to close position ticket ", ticket,
+               " on ", symbol,
+               " Error = ", GetLastError());
+      }
+      else
+      {
+         Print(logPrefix,
+               "Closed position ticket ", ticket,
+               " on ", symbol);
+      }
+   }
+
+   //--- Delete all pending orders
+   int totalOrd = OrdersTotal();
+   for(int i = totalOrd - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+         continue;
+
+      string symbol = OrderGetString(ORDER_SYMBOL);
+
+      if(!trade.OrderDelete(ticket))
+      {
+         Print(logPrefix,
+               "Failed to delete pending order ticket ", ticket,
+               " on ", symbol,
+               " Error = ", GetLastError());
+      }
+      else
+      {
+         Print(logPrefix,
+               "Deleted pending order ticket ", ticket,
+               " on ", symbol);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   Print("[CloseProfitLoss] EA initialized. Target Profit = ",
+         IntegerToString(TargetProfitPoints),
+         " pts, Max Loss = ",
+         IntegerToString(MaxLossPoints),
+         " pts.");
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("[CloseProfitLoss] EA deinitialized. Reason = ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick                                                      |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(TargetProfitPoints <= 0 && MaxLossPoints <= 0)
+      return;
+
+   const double totalPts = TotalFloatingPoints();
+
+   //--- Close all if target profit (in points) reached
+   if(TargetProfitPoints > 0 && totalPts >= (double)TargetProfitPoints)
+   {
+      Print("[CloseProfitLoss] Profit target reached. Total floating P/L = ",
+            DoubleToString(totalPts, 1),
+            " points (target = ",
+            IntegerToString(TargetProfitPoints),
+            "). Closing all positions and pending orders.");
+
+      CloseAllTrades();
+      return;
+   }
+
+   //--- Close all if max loss (in points) reached
+   if(MaxLossPoints > 0 && totalPts <= -(double)MaxLossPoints)
+   {
+      Print("[CloseProfitLoss] Loss limit reached. Total floating P/L = ",
+            DoubleToString(totalPts, 1),
+            " points (loss limit = -",
+            IntegerToString(MaxLossPoints),
+            "). Closing all positions and pending orders.");
+
+      CloseAllTrades();
+      return;
+   }
+}
