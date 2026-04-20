@@ -18,17 +18,17 @@ enum ENUM_AGG_TP_MODE {
 };
 
 //--- inputs
-input int GridCount = 5;       // Number of pending orders in grid
+input int GridCount = 8;       // Number of pending orders in grid
 input int GridDistancePoints = //
-    100;                      // Distance between each pending order (points)
+    500;                      // Distance between each pending order (points)
 input double GridLotSize =
-    0.01; // Fixed lot size for all grid orders (no martingale)
+    0.1; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
 input int SLPoints =
-    450; // Stop Loss (points) for grid orders; editable after set
+    4500; // Stop Loss (points) for grid orders; editable after set
 input int TPPoints =
-    100; // Take Profit (points) for grid orders; editable after set
+    1000; // Take Profit (points) for grid orders; editable after set
 input ENUM_AGG_TP_MODE AggTPGoal =
     AGG_TP_SUM_LEGS_POSITIVE; // How to add "points" before comparing to TPPoints
 input bool ShowAggDebugOnChart =
