@@ -6,13 +6,15 @@
 
 #property strict
 #property description "SetGridManually: grid; on TP or TPPoints target, close all positions + pendings."
-#property version "1.30"
+#property version "1.40"
 
 #include <Trade/Trade.mqh>
 
 enum ENUM_AGG_TP_MODE {
-  AGG_TP_BASKET = 0,   // volume-weighted avg entry -> one combined P/L in points
-  AGG_TP_SUM_LEGS = 1 // sum each order's points P/L (e.g. 333+333+334 = 1000)
+  AGG_TP_BASKET = 0, // volume-weighted avg entry -> one combined P/L in points
+  AGG_TP_SUM_LEGS = 1, // signed sum: each leg's points (losers count negative)
+  AGG_TP_SUM_LEGS_POSITIVE =
+      2 // sum only winning legs' points (ignores losing legs for target; best for grids)
 };
 
 //--- inputs
@@ -28,9 +30,11 @@ input int SLPoints =
 input int TPPoints =
     100; // Take Profit (points) for grid orders; editable after set
 input ENUM_AGG_TP_MODE AggTPGoal =
-    AGG_TP_SUM_LEGS; // Sum each order's pts P/L (matches terminal-style per-leg sum)
+    AGG_TP_SUM_LEGS_POSITIVE; // How to add "points" before comparing to TPPoints
 input bool ShowAggDebugOnChart =
     true; // Show combined pts / target on chart (for testing)
+input double CloseWhenTotalProfitMoneyAtLeast =
+    0.0; // If > 0: close all when sum(POSITION_PROFIT+SWAP) on symbol >= this (account currency)
 input double MaxFloatingLossUSD =
     1800.0; // If total floating loss <= -this, close all
 
@@ -84,6 +88,43 @@ double TotalFloatingProfitPointsOnSymbol() {
     if (PositionGetString(POSITION_SYMBOL) != _Symbol)
       continue;
     sum += PositionProfitPoints(t);
+  }
+  return sum;
+}
+
+//+------------------------------------------------------------------+
+//| Sum only legs in profit (points > 0). Losing legs not counted.   |
+//| Matches "grid: several winners + one small loser" -> target still  |
+//| reachable in points. Terminal $ profit is NOT the same as points.  |
+//+------------------------------------------------------------------+
+double TotalPositiveLegPointsOnSymbol() {
+  double sum = 0.0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong t = PositionGetTicket(i);
+    if (t == 0 || !PositionSelectByTicket(t))
+      continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+      continue;
+    const double p = PositionProfitPoints(t);
+    if (p > 0.0)
+      sum += p;
+  }
+  return sum;
+}
+
+//+------------------------------------------------------------------+
+//| Total floating profit + swap in account currency (this symbol)   |
+//+------------------------------------------------------------------+
+double TotalFloatingProfitMoneyOnSymbol() {
+  double sum = 0.0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    ulong t = PositionGetTicket(i);
+    if (t == 0 || !PositionSelectByTicket(t))
+      continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol)
+      continue;
+    sum += PositionGetDouble(POSITION_PROFIT);
+    sum += PositionGetDouble(POSITION_SWAP);
   }
   return sum;
 }
@@ -153,20 +194,37 @@ void UpdateAggComment() {
     return;
   }
 
-  const double legSum = TotalFloatingProfitPointsOnSymbol();
+  const double legSigned = TotalFloatingProfitPointsOnSymbol();
+  const double legPositive = TotalPositiveLegPointsOnSymbol();
   const double basket = BasketFloatingProfitPointsOnSymbol();
-  const double usePts =
-      (AggTPGoal == AGG_TP_SUM_LEGS) ? legSum : basket;
-  const string modeStr =
-      (AggTPGoal == AGG_TP_SUM_LEGS) ? "SUM_LEGS (add each order)" : "BASKET (avg entry)";
+  double usePts = basket;
+  string modeStr = "BASKET";
+  if (AggTPGoal == AGG_TP_SUM_LEGS) {
+    usePts = legSigned;
+    modeStr = "SUM signed (winners-losers)";
+  } else if (AggTPGoal == AGG_TP_SUM_LEGS_POSITIVE) {
+    usePts = legPositive;
+    modeStr = "SUM winners only (losers ignored)";
+  }
 
-  Comment("GridManualV2 - close when combined pts >= TPPoints\n",
+  const double ptSz = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+  const double moneySum = TotalFloatingProfitMoneyOnSymbol();
+
+  Comment("GridManualV2 - close: pts goal OR money goal\n",
+          "SYMBOL_POINT=", DoubleToString(ptSz, (_Digits <= 3 ? 3 : _Digits)),
+          "  Digits=", IntegerToString(_Digits), "\n",
           "Mode: ", modeStr, "\n",
-          "Sum(legs) pts: ", DoubleToString(legSum, 2), "\n",
-          "Basket pts:    ", DoubleToString(basket, 2), "\n",
+          "Pts signed (all legs): ", DoubleToString(legSigned, 2), "\n",
+          "Pts positive legs only: ", DoubleToString(legPositive, 2), "\n",
+          "Basket pts: ", DoubleToString(basket, 2), "\n",
           "TPPoints target: ", IntegerToString(TPPoints), "\n",
-          "Uses for close:  ", DoubleToString(usePts, 2),
-          (usePts >= (double)TPPoints ? "  >= OK (will close)" : "  (below target)"));
+          "Uses for close: ", DoubleToString(usePts, 2),
+          (usePts >= (double)TPPoints ? " >= TP OK" : " < TP"), "\n",
+          "Floating $+swap: ", DoubleToString(moneySum, 2),
+          (CloseWhenTotalProfitMoneyAtLeast > 0.0
+               ? ("  (money target " + DoubleToString(CloseWhenTotalProfitMoneyAtLeast, 2) +
+                  (moneySum >= CloseWhenTotalProfitMoneyAtLeast ? " >= OK)" : " )"))
+               : ""));
 }
 
 //+------------------------------------------------------------------+
@@ -519,17 +577,32 @@ void OnTick() {
     }
   }
 
+  // Optional: total account profit on symbol (money) >= threshold
+  if (CloseWhenTotalProfitMoneyAtLeast > 0.0 && CountPositionsOnSymbol() > 0) {
+    const double moneySum = TotalFloatingProfitMoneyOnSymbol();
+    if (moneySum >= CloseWhenTotalProfitMoneyAtLeast) {
+      Print("[SetGridManually] Total floating profit+swap = ",
+            DoubleToString(moneySum, 2), " >= ",
+            DoubleToString(CloseWhenTotalProfitMoneyAtLeast, 2),
+            ". Closing all positions and pending orders.");
+      CloseAllPositionsAndOrdersOnSymbol();
+      return;
+    }
+  }
+
   // Combined P/L in points >= TPPoints -> close all (incl. pendings)
   if (TPPoints > 0 && CountPositionsOnSymbol() > 0) {
-    const double pts = (AggTPGoal == AGG_TP_SUM_LEGS)
-                           ? TotalFloatingProfitPointsOnSymbol()
-                           : BasketFloatingProfitPointsOnSymbol();
+    double pts = 0.0;
+    if (AggTPGoal == AGG_TP_BASKET)
+      pts = BasketFloatingProfitPointsOnSymbol();
+    else if (AggTPGoal == AGG_TP_SUM_LEGS)
+      pts = TotalFloatingProfitPointsOnSymbol();
+    else
+      pts = TotalPositiveLegPointsOnSymbol();
+
     if (pts >= (double)TPPoints) {
-      Print("[SetGridManually] Combined TP goal (",
-            AggTPGoal == AGG_TP_SUM_LEGS ? "sum of legs" : "basket avg",
-            ") = ",
-            DoubleToString(pts, 2),
-            " pts (>= ", IntegerToString(TPPoints),
+      Print("[SetGridManually] Combined TP goal (AggTPGoal=", AggTPGoal, ") = ",
+            DoubleToString(pts, 2), " pts (>= ", IntegerToString(TPPoints),
             "). Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
