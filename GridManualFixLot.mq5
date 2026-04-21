@@ -23,20 +23,18 @@ input int GridDistancePoints = //
     500;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.1; // Fixed lot size for all grid orders (no martingale)
-input double GridLotStep =
-    0.01; // If > 0: pending lots = first position lots + GridLotStep*i (i=1..GridCount)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
-input double SLUsd =
+input double SLPoints =
     4500.0; // Stop Loss (money, account currency): close ALL when floating P/L <= -this
-input double TPUsd =
+input double TPPoints =
     1000.0; // Take Profit (money, account currency): close ALL when floating P/L >= this
 input int GridSLPoints =
-    4000; // Optional: per-order Stop Loss (points) from first entry; 0=disable
+    0; // Optional: per-order Stop Loss (points) from first entry; 0=disable
 input int GridTPPoints =
-    1000; // Optional: per-order Take Profit (points) from first entry; 0=disable
+    0; // Optional: per-order Take Profit (points) from first entry; 0=disable
 input ENUM_AGG_TP_MODE AggTPGoal =
-    AGG_TP_SUM_LEGS_POSITIVE; // (legacy) How to add "points" before comparing to TP goal
+    AGG_TP_SUM_LEGS_POSITIVE; // How to add "points" before comparing to TPPoints
 input bool ShowAggDebugOnChart =
     true; // Show combined pts / target on chart (for testing)
 
@@ -134,7 +132,7 @@ double TotalFloatingProfitMoneyOnSymbol() {
 //+------------------------------------------------------------------+
 //| Combined basket P/L in points (volume-weighted average entry).   |
 //| Same-direction grid: one number = distance from avg entry to     |
-//| current price — matches "3 orders together = TP goal profit".      |
+//| current price — matches "3 orders together = TPPoints profit".     |
 //+------------------------------------------------------------------+
 double BasketFloatingProfitPointsOnSymbol() {
   double buyLots = 0.0, sellLots = 0.0;
@@ -184,7 +182,7 @@ double BasketFloatingProfitPointsOnSymbol() {
 }
 
 //+------------------------------------------------------------------+
-//| Debug: show combined pts vs money goals on chart                   |
+//| Debug: show combined pts vs TPPoints on chart                      |
 //+------------------------------------------------------------------+
 void UpdateAggComment() {
   if (!ShowAggDebugOnChart) {
@@ -220,10 +218,10 @@ void UpdateAggComment() {
           "Pts positive legs only: ", DoubleToString(legPositive, 2), "\n",
           "Basket pts: ", DoubleToString(basket, 2), "\n",
           "Floating $+swap: ", DoubleToString(moneySum, 2), "\n",
-          "TPUsd (money): ", DoubleToString(TPUsd, 2),
-          (TPUsd > 0.0 && moneySum >= TPUsd ? "  >= OK" : ""), "\n",
-          "SLUsd (money): ", DoubleToString(SLUsd, 2),
-          (SLUsd > 0.0 && moneySum <= -SLUsd ? "  <= -OK" : ""));
+          "TPPoints (money): ", DoubleToString(TPPoints, 2),
+          (TPPoints > 0.0 && moneySum >= TPPoints ? "  >= OK" : ""), "\n",
+          "SLPoints (money): ", DoubleToString(SLPoints, 2),
+          (SLPoints > 0.0 && moneySum <= -SLPoints ? "  <= -OK" : ""));
 }
 
 //+------------------------------------------------------------------+
@@ -435,7 +433,6 @@ void PlaceGrid(ulong firstTicket) {
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
   double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-  const double baseLotsFromFirst = PositionGetDouble(POSITION_VOLUME);
   ENUM_POSITION_TYPE type =
       (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
@@ -475,9 +472,8 @@ void PlaceGrid(ulong firstTicket) {
 
   for (int i = 1; i <= GridCount; i++) {
     double price;
+    // Fixed lot size for all grid orders (no martingale)
     double lots = GridLotSize;
-    if (GridLotStep > 0.0 && baseLotsFromFirst > 0.0)
-      lots = baseLotsFromFirst + GridLotStep * i;
 
     // Normalize lots to broker step and limits
     if (volStep > 0.0)
@@ -501,13 +497,8 @@ void PlaceGrid(ulong firstTicket) {
     }
   }
   Print("[SetGridManually] Grid placed: ", GridCount, " orders, fixed lot ",
-        GridLotSize,
-        (GridLotStep > 0.0 && baseLotsFromFirst > 0.0
-             ? (" (step=" + DoubleToString(GridLotStep, 4) +
-                ", base=" + DoubleToString(baseLotsFromFirst, 4) + ")")
-             : ""),
-        "; first order + all grid use same SL/TP (", GridSLPoints, "/",
-        GridTPPoints, " pts from first entry).");
+        GridLotSize, "; first order + all grid use same SL/TP (", GridSLPoints,
+        "/", GridTPPoints, " pts from first entry).");
 }
 
 //+------------------------------------------------------------------+
@@ -517,8 +508,8 @@ int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
   Print("SetGridManually EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
-        " Dist=", GridDistancePoints, " MoneySL=", SLUsd, " MoneyTP=", TPUsd,
-        " GridSLpts=", GridSLPoints, " GridTPpts=", GridTPPoints);
+        " Dist=", GridDistancePoints, " MoneySL=", SLPoints, " MoneyTP=",
+        TPPoints, " GridSLpts=", GridSLPoints, " GridTPpts=", GridTPPoints);
   return (INIT_SUCCEEDED);
 }
 
@@ -571,17 +562,17 @@ void OnTick() {
   if (CountPositionsOnSymbol() > 0) {
     const double moneySum = TotalFloatingProfitMoneyOnSymbol();
 
-    if (TPUsd > 0.0 && moneySum >= TPUsd) {
+    if (TPPoints > 0.0 && moneySum >= TPPoints) {
       Print("[SetGridManually] Money TP reached: floating profit+swap = ",
-            DoubleToString(moneySum, 2), " >= ", DoubleToString(TPUsd, 2),
+            DoubleToString(moneySum, 2), " >= ", DoubleToString(TPPoints, 2),
             ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
     }
 
-    if (SLUsd > 0.0 && moneySum <= -SLUsd) {
+    if (SLPoints > 0.0 && moneySum <= -SLPoints) {
       Print("[SetGridManually] Money SL reached: floating profit+swap = ",
-            DoubleToString(moneySum, 2), " <= -", DoubleToString(SLUsd, 2),
+            DoubleToString(moneySum, 2), " <= -", DoubleToString(SLPoints, 2),
             ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
