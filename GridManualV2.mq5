@@ -23,6 +23,8 @@ input int GridDistancePoints = //
     500;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.1; // Fixed lot size for all grid orders (no martingale)
+input bool GridUseFirstOrderLotAsBase =
+    true; // If true: pending lots start from first position's lot (then +GridLotStep)
 input double GridLotStep =
     0.01; // If > 0: pending lots = first position lots + GridLotStep*i (i=1..GridCount)
 input int SlippagePoints = 20;  // Slippage (points)
@@ -476,8 +478,8 @@ void PlaceGrid(ulong firstTicket) {
   for (int i = 1; i <= GridCount; i++) {
     double price;
     double lots = GridLotSize;
-    if (GridLotStep > 0.0 && baseLotsFromFirst > 0.0)
-      lots = baseLotsFromFirst + GridLotStep * i;
+    if (GridUseFirstOrderLotAsBase && baseLotsFromFirst > 0.0)
+      lots = baseLotsFromFirst + (GridLotStep > 0.0 ? GridLotStep * i : 0.0);
 
     // Normalize lots to broker step and limits
     if (volStep > 0.0)
@@ -502,9 +504,9 @@ void PlaceGrid(ulong firstTicket) {
   }
   Print("[SetGridManually] Grid placed: ", GridCount, " orders, fixed lot ",
         GridLotSize,
-        (GridLotStep > 0.0 && baseLotsFromFirst > 0.0
-             ? (" (step=" + DoubleToString(GridLotStep, 4) +
-                ", base=" + DoubleToString(baseLotsFromFirst, 4) + ")")
+        (GridUseFirstOrderLotAsBase && baseLotsFromFirst > 0.0
+             ? (" (base=" + DoubleToString(baseLotsFromFirst, 4) +
+                ", step=" + DoubleToString(GridLotStep, 4) + ")")
              : ""),
         "; first order + all grid use same SL/TP (", GridSLPoints, "/",
         GridTPPoints, " pts from first entry).");
