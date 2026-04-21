@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: grid; on TP or TPPoints target, close all positions + pendings."
+#property description "SetGridManually: grid; close all on money TP/SL; optional per-order SL/TP in points."
 #property version "1.40"
 
 #include <Trade/Trade.mqh>
@@ -25,18 +25,18 @@ input double GridLotSize =
     0.1; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
-input int SLPoints =
-    4500; // Stop Loss (points) for grid orders; editable after set
-input int TPPoints =
-    1000; // Take Profit (points) for grid orders; editable after set
+input double SLPoints =
+    4500.0; // Stop Loss (money, account currency): close ALL when floating P/L <= -this
+input double TPPoints =
+    1000.0; // Take Profit (money, account currency): close ALL when floating P/L >= this
+input int GridSLPoints =
+    0; // Optional: per-order Stop Loss (points) from first entry; 0=disable
+input int GridTPPoints =
+    0; // Optional: per-order Take Profit (points) from first entry; 0=disable
 input ENUM_AGG_TP_MODE AggTPGoal =
     AGG_TP_SUM_LEGS_POSITIVE; // How to add "points" before comparing to TPPoints
 input bool ShowAggDebugOnChart =
     true; // Show combined pts / target on chart (for testing)
-input double CloseWhenTotalProfitMoneyAtLeast =
-    0.0; // If > 0: close all when sum(POSITION_PROFIT+SWAP) on symbol >= this (account currency)
-input double MaxFloatingLossUSD =
-    1800.0; // If total floating loss <= -this, close all
 
 //--- trade object
 CTrade trade;
@@ -210,21 +210,18 @@ void UpdateAggComment() {
   const double ptSz = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
   const double moneySum = TotalFloatingProfitMoneyOnSymbol();
 
-  Comment("GridManualV2 - close: pts goal OR money goal\n",
+  Comment("GridManualV2 - close: MONEY SL/TP (close ALL)\n",
           "SYMBOL_POINT=", DoubleToString(ptSz, (_Digits <= 3 ? 3 : _Digits)),
           "  Digits=", IntegerToString(_Digits), "\n",
           "Mode: ", modeStr, "\n",
           "Pts signed (all legs): ", DoubleToString(legSigned, 2), "\n",
           "Pts positive legs only: ", DoubleToString(legPositive, 2), "\n",
           "Basket pts: ", DoubleToString(basket, 2), "\n",
-          "TPPoints target: ", IntegerToString(TPPoints), "\n",
-          "Uses for close: ", DoubleToString(usePts, 2),
-          (usePts >= (double)TPPoints ? " >= TP OK" : " < TP"), "\n",
-          "Floating $+swap: ", DoubleToString(moneySum, 2),
-          (CloseWhenTotalProfitMoneyAtLeast > 0.0
-               ? ("  (money target " + DoubleToString(CloseWhenTotalProfitMoneyAtLeast, 2) +
-                  (moneySum >= CloseWhenTotalProfitMoneyAtLeast ? " >= OK)" : " )"))
-               : ""));
+          "Floating $+swap: ", DoubleToString(moneySum, 2), "\n",
+          "TPPoints (money): ", DoubleToString(TPPoints, 2),
+          (TPPoints > 0.0 && moneySum >= TPPoints ? "  >= OK" : ""), "\n",
+          "SLPoints (money): ", DoubleToString(SLPoints, 2),
+          (SLPoints > 0.0 && moneySum <= -SLPoints ? "  <= -OK" : ""));
 }
 
 //+------------------------------------------------------------------+
@@ -317,7 +314,7 @@ bool GetReferencePosition(double &entryPrice, ENUM_POSITION_TYPE &type) {
 void SyncSLTPToFirstOrder() {
   if (CountPositionsOnSymbol() <= 0)
     return;
-  if (SLPoints <= 0 && TPPoints <= 0)
+  if (GridSLPoints <= 0 && GridTPPoints <= 0)
     return;
 
   double entry;
@@ -332,15 +329,19 @@ void SyncSLTPToFirstOrder() {
 
   double slPrice = 0.0, tpPrice = 0.0;
   if (type == POSITION_TYPE_BUY) {
-    slPrice = (SLPoints > 0) ? NormalizeDouble(entry - SLPoints * point, digits)
-                             : 0.0;
-    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry + TPPoints * point, digits)
-                             : 0.0;
+    slPrice = (GridSLPoints > 0)
+                  ? NormalizeDouble(entry - GridSLPoints * point, digits)
+                  : 0.0;
+    tpPrice = (GridTPPoints > 0)
+                  ? NormalizeDouble(entry + GridTPPoints * point, digits)
+                  : 0.0;
   } else {
-    slPrice = (SLPoints > 0) ? NormalizeDouble(entry + SLPoints * point, digits)
-                             : 0.0;
-    tpPrice = (TPPoints > 0) ? NormalizeDouble(entry - TPPoints * point, digits)
-                             : 0.0;
+    slPrice = (GridSLPoints > 0)
+                  ? NormalizeDouble(entry + GridSLPoints * point, digits)
+                  : 0.0;
+    tpPrice = (GridTPPoints > 0)
+                  ? NormalizeDouble(entry - GridTPPoints * point, digits)
+                  : 0.0;
   }
 
   trade.SetExpertMagicNumber(MagicNumber);
@@ -438,20 +439,20 @@ void PlaceGrid(ulong firstTicket) {
   // SL/TP from first order's entry (same levels for first position and all grid
   // orders)
   double slPrice = 0.0, tpPrice = 0.0;
-  if (SLPoints > 0 || TPPoints > 0) {
+  if (GridSLPoints > 0 || GridTPPoints > 0) {
     if (type == POSITION_TYPE_BUY) {
-      slPrice = (SLPoints > 0)
-                    ? NormalizeDouble(entry - SLPoints * point, digits)
+      slPrice = (GridSLPoints > 0)
+                    ? NormalizeDouble(entry - GridSLPoints * point, digits)
                     : 0.0;
-      tpPrice = (TPPoints > 0)
-                    ? NormalizeDouble(entry + TPPoints * point, digits)
+      tpPrice = (GridTPPoints > 0)
+                    ? NormalizeDouble(entry + GridTPPoints * point, digits)
                     : 0.0;
     } else {
-      slPrice = (SLPoints > 0)
-                    ? NormalizeDouble(entry + SLPoints * point, digits)
+      slPrice = (GridSLPoints > 0)
+                    ? NormalizeDouble(entry + GridSLPoints * point, digits)
                     : 0.0;
-      tpPrice = (TPPoints > 0)
-                    ? NormalizeDouble(entry - TPPoints * point, digits)
+      tpPrice = (GridTPPoints > 0)
+                    ? NormalizeDouble(entry - GridTPPoints * point, digits)
                     : 0.0;
     }
   }
@@ -496,8 +497,8 @@ void PlaceGrid(ulong firstTicket) {
     }
   }
   Print("[SetGridManually] Grid placed: ", GridCount, " orders, fixed lot ",
-        GridLotSize, "; first order + all grid use same SL/TP (", SLPoints, "/",
-        TPPoints, " pts from first entry).");
+        GridLotSize, "; first order + all grid use same SL/TP (", GridSLPoints,
+        "/", GridTPPoints, " pts from first entry).");
 }
 
 //+------------------------------------------------------------------+
@@ -507,7 +508,8 @@ int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
   Print("SetGridManually EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
-        " Dist=", GridDistancePoints, " SL=", SLPoints, " TP=", TPPoints);
+        " Dist=", GridDistancePoints, " MoneySL=", SLPoints, " MoneyTP=",
+        TPPoints, " GridSLpts=", GridSLPoints, " GridTPpts=", GridTPPoints);
   return (INIT_SUCCEEDED);
 }
 
@@ -555,55 +557,23 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 void OnTick() {
   UpdateAggComment();
 
-  // Emergency: close everything if floating loss exceeds threshold (in USD)
-  if (MaxFloatingLossUSD > 0.0) {
-    double totalProfit = 0.0;
-    for (int i = PositionsTotal() - 1; i >= 0; i--) {
-      ulong t = PositionGetTicket(i);
-      if (t == 0 || !PositionSelectByTicket(t))
-        continue;
-      if (PositionGetString(POSITION_SYMBOL) != _Symbol)
-        continue;
-
-      totalProfit += PositionGetDouble(POSITION_PROFIT);
-    }
-    if (totalProfit <= -MaxFloatingLossUSD) {
-      Print("[SetGridManually] Floating loss reached ",
-            DoubleToString(totalProfit, 2), " USD (threshold = -",
-            DoubleToString(MaxFloatingLossUSD, 2),
-            "). Closing all positions and orders on symbol ", _Symbol);
-      CloseAllPositionsAndOrdersOnSymbol();
-      return;
-    }
-  }
-
-  // Optional: total account profit on symbol (money) >= threshold
-  if (CloseWhenTotalProfitMoneyAtLeast > 0.0 && CountPositionsOnSymbol() > 0) {
+  // Close ALL on money TP/SL (account currency), computed on this symbol:
+  // sum(POSITION_PROFIT + POSITION_SWAP)
+  if (CountPositionsOnSymbol() > 0) {
     const double moneySum = TotalFloatingProfitMoneyOnSymbol();
-    if (moneySum >= CloseWhenTotalProfitMoneyAtLeast) {
-      Print("[SetGridManually] Total floating profit+swap = ",
-            DoubleToString(moneySum, 2), " >= ",
-            DoubleToString(CloseWhenTotalProfitMoneyAtLeast, 2),
+
+    if (TPPoints > 0.0 && moneySum >= TPPoints) {
+      Print("[SetGridManually] Money TP reached: floating profit+swap = ",
+            DoubleToString(moneySum, 2), " >= ", DoubleToString(TPPoints, 2),
             ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
     }
-  }
 
-  // Combined P/L in points >= TPPoints -> close all (incl. pendings)
-  if (TPPoints > 0 && CountPositionsOnSymbol() > 0) {
-    double pts = 0.0;
-    if (AggTPGoal == AGG_TP_BASKET)
-      pts = BasketFloatingProfitPointsOnSymbol();
-    else if (AggTPGoal == AGG_TP_SUM_LEGS)
-      pts = TotalFloatingProfitPointsOnSymbol();
-    else
-      pts = TotalPositiveLegPointsOnSymbol();
-
-    if (pts >= (double)TPPoints) {
-      Print("[SetGridManually] Combined TP goal (AggTPGoal=", AggTPGoal, ") = ",
-            DoubleToString(pts, 2), " pts (>= ", IntegerToString(TPPoints),
-            "). Closing all positions and pending orders.");
+    if (SLPoints > 0.0 && moneySum <= -SLPoints) {
+      Print("[SetGridManually] Money SL reached: floating profit+swap = ",
+            DoubleToString(moneySum, 2), " <= -", DoubleToString(SLPoints, 2),
+            ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
     }
