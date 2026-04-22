@@ -11,9 +11,9 @@ CTrade trade;
 //--------------------------- Inputs --------------------------------
 input double InitialLot = 0.01;
 input int GridLevelsPerSide = 3;
-input int GridDistancePoints = 50;
+input int GridDistancePoints = 200;
 input double LotIncrement = 0.001;
-input int SideTargetProfitMoney = 50;
+input int SideTargetProfitMoney = 5;
 
 // ປ່ຽນເປັນ % ຂອງພອດ
 input double DailyProfitTargetPercent = 10.0; 
@@ -45,9 +45,9 @@ input int TradeEndHourBkk = 18;   // exclusive (18:00 is not traded)
 datetime g_todayStart = 0;
 bool g_stopToday = false;
 bool g_stopByMacd = false;
+bool g_stopBySideway = false;
 int g_macdHandleM1 = INVALID_HANDLE;
 int g_macdHandleM5 = INVALID_HANDLE;
-bool g_stopBySideway = false;
 int g_adxHandle = INVALID_HANDLE;
 bool g_stopByTime = false;
 
@@ -90,7 +90,7 @@ void CloseAllEaPositionsAndPendings() {
    }
 }
 
-//-------------------- MACD filter helpers --------------------------
+//-------------------- MACD + sideway filter helpers ----------------
 bool ReadMacdMain(const int handle, const int shift, double &valueOut) {
    if (handle == INVALID_HANDLE) return false;
    double buff[1];
@@ -261,7 +261,7 @@ int OnInit() {
    if (UseAdxFilter)
       g_adxHandle = iADX(_Symbol, AdxTimeframe, AdxPeriod);
    
-   // Do NOT open immediately. Wait until gates are satisfied (handled on ticks).
+   // Do NOT open immediately. Wait until filters are satisfied (handled on ticks).
    
    return (INIT_SUCCEEDED);
 }
@@ -298,7 +298,6 @@ void OnTick() {
       }
       return;
    } else {
-      // back in range -> allow EA to run again
       g_stopByMacd = false;
    }
 
