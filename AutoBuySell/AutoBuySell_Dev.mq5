@@ -11,9 +11,9 @@ CTrade trade;
 //--------------------------- Inputs --------------------------------
 input double InitialLot = 0.01;
 input int GridLevelsPerSide = 3;
-input int GridDistancePoints = 200;
+input int GridDistancePoints = 100;
 input double LotIncrement = 0.001;
-input int SideTargetProfitMoney = 5;
+input int SideTargetProfitMoney = 2;
 
 // ປ່ຽນເປັນ % ຂອງພອດ
 input double DailyProfitTargetPercent = 10.0; 
@@ -24,17 +24,12 @@ input int MagicBuy = 11001;
 input int MagicSell = 11002;
 
 // MACD filter (trade only when MACD is near zero)
-input double MacdAbsMax = 3.0;     // Trade only when -MacdAbsMax < MACD < MacdAbsMax (M1 & M5)
+input double MacdAbsMax = 3.0;     // Trade only when -MacdAbsMax < MACD < MacdAbsMax (M1, M5 & M15)
 input int MacdFastEMA = 12;
 input int MacdSlowEMA = 26;
 input int MacdSignalSMA = 9;
 input bool MacdUseClosedCandle = true; // true=use shift=1 (more stable), false=shift=0
-
-// Sideway + low momentum filters
-input bool UseAdxFilter = true;
-input ENUM_TIMEFRAMES AdxTimeframe = PERIOD_M1;
-input int AdxPeriod = 14;
-input double AdxMax = 20.0; // Trade only when ADX <= this (trend is weak)
+input int MacdSLDistancePoints = 500;  // when MACD is strongly trending, set SL relative to latest leg price
 
 // Trading hours (Bangkok timezone, GMT+7)
 input bool UseTradingHours = true;
@@ -45,10 +40,9 @@ input int TradeEndHourBkk = 18;   // exclusive (18:00 is not traded)
 datetime g_todayStart = 0;
 bool g_stopToday = false;
 bool g_stopByMacd = false;
-bool g_stopBySideway = false;
 int g_macdHandleM1 = INVALID_HANDLE;
 int g_macdHandleM5 = INVALID_HANDLE;
-int g_adxHandle = INVALID_HANDLE;
+int g_macdHandleM15 = INVALID_HANDLE;
 bool g_stopByTime = false;
 
 //---------------------- Utility / Helpers -------------------------
@@ -90,7 +84,7 @@ void CloseAllEaPositionsAndPendings() {
    }
 }
 
-//-------------------- MACD + sideway filter helpers ----------------
+//-------------------- MACD filter helpers --------------------------
 bool ReadMacdMain(const int handle, const int shift, double &valueOut) {
    if (handle == INVALID_HANDLE) return false;
    double buff[1];
@@ -99,43 +93,73 @@ bool ReadMacdMain(const int handle, const int shift, double &valueOut) {
    return true;
 }
 
+bool GetMacdValues(double &m1Out, double &m5Out, double &m15Out) {
+   const int shift = (MacdUseClosedCandle ? 1 : 0);
+   if (!ReadMacdMain(g_macdHandleM1, shift, m1Out)) return false;
+   if (!ReadMacdMain(g_macdHandleM5, shift, m5Out)) return false;
+   if (!ReadMacdMain(g_macdHandleM15, shift, m15Out)) return false;
+   return true;
+}
+
 bool IsMacdInRange() {
-   const int shift = (MacdUseClosedCandle ? 1 : 0);
-   double m1 = 0.0, m5 = 0.0;
-   if (!ReadMacdMain(g_macdHandleM1, shift, m1)) return true; // fail-open
-   if (!ReadMacdMain(g_macdHandleM5, shift, m5)) return true; // fail-open
-   return (MathAbs(m1) < MacdAbsMax && MathAbs(m5) < MacdAbsMax);
+   double m1 = 0.0, m5 = 0.0, m15 = 0.0;
+   if (!GetMacdValues(m1, m5, m15)) return true; // fail-open
+   return (MathAbs(m1) < MacdAbsMax && MathAbs(m5) < MacdAbsMax && MathAbs(m15) < MacdAbsMax);
 }
 
-bool ReadAdxValue(const int handle, const int shift, double &valueOut) {
-   if (handle == INVALID_HANDLE) return false;
-   double buff[1];
-   if (CopyBuffer(handle, 0, shift, 1, buff) != 1) return false; // buffer 0 = ADX main
-   valueOut = buff[0];
-   return true;
+void CloseEaSidePositionsAndPendings(const int magic) {
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong tk = PositionGetTicket(i);
+      if (!PositionSelectByTicket(tk)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if ((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      trade.PositionClose(tk);
+   }
+
+   for (int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong tk = OrderGetTicket(i);
+      if (!OrderSelect(tk)) continue;
+      if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if ((int)OrderGetInteger(ORDER_MAGIC) != magic) continue;
+      trade.OrderDelete(tk);
+   }
 }
 
-bool ReadBands(const int handle, const int shift, double &upperOut, double &lowerOut) {
-   if (handle == INVALID_HANDLE) return false;
-   double up[1], lo[1];
-   if (CopyBuffer(handle, 0, shift, 1, up) != 1) return false; // 0=upper
-   if (CopyBuffer(handle, 2, shift, 1, lo) != 1) return false; // 2=lower
-   upperOut = up[0];
-   lowerOut = lo[0];
-   return true;
-}
+bool FindLatestOpenPriceBySide(const int magic, double &priceOut) {
+   datetime latest = 0;
+   double latestPrice = 0.0;
+   bool found = false;
 
-bool IsSidewayLowMomentum() {
-   const int shift = (MacdUseClosedCandle ? 1 : 0);
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong tk = PositionGetTicket(i);
+      if (!PositionSelectByTicket(tk)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if ((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
 
-   if (UseAdxFilter) {
-      double adx = 0.0;
-      if (ReadAdxValue(g_adxHandle, shift, adx)) {
-         if (adx > AdxMax) return false;
+      datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      double p = PositionGetDouble(POSITION_PRICE_OPEN);
+      if (!found || t > latest) {
+         latest = t;
+         latestPrice = p;
+         found = true;
       }
    }
 
+   if (!found) return false;
+   priceOut = latestPrice;
    return true;
+}
+
+void SetStopLossForSidePositions(const int magic, const double slPrice) {
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong tk = PositionGetTicket(i);
+      if (!PositionSelectByTicket(tk)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if ((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+
+      double tp = PositionGetDouble(POSITION_TP);
+      trade.PositionModify(tk, NormalizeDouble(slPrice, DigitsCount()), tp);
+   }
 }
 
 bool IsWithinBangkokTradingHours() {
@@ -252,16 +276,13 @@ int OnInit() {
    g_todayStart = iTime(_Symbol, PERIOD_D1, 0);
    g_stopToday = false;
    g_stopByMacd = false;
-   g_stopBySideway = false;
    g_stopByTime = false;
 
    g_macdHandleM1 = iMACD(_Symbol, PERIOD_M1, MacdFastEMA, MacdSlowEMA, MacdSignalSMA, PRICE_CLOSE);
    g_macdHandleM5 = iMACD(_Symbol, PERIOD_M5, MacdFastEMA, MacdSlowEMA, MacdSignalSMA, PRICE_CLOSE);
-
-   if (UseAdxFilter)
-      g_adxHandle = iADX(_Symbol, AdxTimeframe, AdxPeriod);
+   g_macdHandleM15 = iMACD(_Symbol, PERIOD_M15, MacdFastEMA, MacdSlowEMA, MacdSignalSMA, PRICE_CLOSE);
    
-   // Do NOT open immediately. Wait until filters are satisfied (handled on ticks).
+   // Do NOT open immediately. Wait until gates are satisfied (handled on ticks).
    
    return (INIT_SUCCEEDED);
 }
@@ -269,7 +290,7 @@ int OnInit() {
 void OnDeinit(const int reason) {
    if (g_macdHandleM1 != INVALID_HANDLE) IndicatorRelease(g_macdHandleM1);
    if (g_macdHandleM5 != INVALID_HANDLE) IndicatorRelease(g_macdHandleM5);
-   if (g_adxHandle != INVALID_HANDLE) IndicatorRelease(g_adxHandle);
+   if (g_macdHandleM15 != INVALID_HANDLE) IndicatorRelease(g_macdHandleM15);
 }
 
 void OnTick() {
@@ -292,25 +313,50 @@ void OnTick() {
    // 1.5 MACD filter gate (M1 & M5): outside range => close all EA orders and pause
    if (!IsMacdInRange()) {
       if (!g_stopByMacd) {
-         CloseAllEaPositionsAndPendings();
-         g_stopByMacd = true;
-         Print("MACD out of range. Pausing EA until MACD returns to range.");
-      }
-      return;
-   } else {
-      g_stopByMacd = false;
-   }
+         // When MACD strongly trends in one direction on ALL TFs (M1, M5, M15),
+         // close the opposing side and protect the remaining side with SL.
+         double m1 = 0.0, m5 = 0.0, m15 = 0.0;
+         if (!GetMacdValues(m1, m5, m15)) {
+            CloseAllEaPositionsAndPendings();
+            g_stopByMacd = true;
+            Print("MACD unavailable. Pausing EA until MACD returns.");
+            return;
+         }
 
-   // 1.6 Sideway + low momentum gate (ADX)
-   if (!IsSidewayLowMomentum()) {
-      if (!g_stopBySideway) {
-         CloseAllEaPositionsAndPendings();
-         g_stopBySideway = true;
-         Print("Sideway filter not satisfied (ADX). Pausing EA until conditions return.");
+         const bool allAbove = (m1 > MacdAbsMax && m5 > MacdAbsMax && m15 > MacdAbsMax);
+         const bool allBelow = (m1 < -MacdAbsMax && m5 < -MacdAbsMax && m15 < -MacdAbsMax);
+
+         if (allAbove) {
+            // Up momentum: close BUY side, keep SELL side but set SL above latest SELL open price + distance
+            CloseEaSidePositionsAndPendings(MagicBuy);
+            double latestSell = 0.0;
+            if (FindLatestOpenPriceBySide(MagicSell, latestSell)) {
+               double sl = latestSell + (MacdSLDistancePoints * PointValue());
+               SetStopLossForSidePositions(MagicSell, sl);
+            }
+            g_stopByMacd = true;
+            Print("MACD > +", MacdAbsMax, " on M1/M5/M15. Closed BUY side and set SL on SELL side.");
+         } else if (allBelow) {
+            // Down momentum: close SELL side, keep BUY side but set SL below latest BUY open price - distance
+            CloseEaSidePositionsAndPendings(MagicSell);
+            double latestBuy = 0.0;
+            if (FindLatestOpenPriceBySide(MagicBuy, latestBuy)) {
+               double sl = latestBuy - (MacdSLDistancePoints * PointValue());
+               SetStopLossForSidePositions(MagicBuy, sl);
+            }
+            g_stopByMacd = true;
+            Print("MACD < -", MacdAbsMax, " on M1/M5/M15. Closed SELL side and set SL on BUY side.");
+         } else {
+            // Mixed direction or only some TFs are trending: fallback to original behavior
+            CloseAllEaPositionsAndPendings();
+            g_stopByMacd = true;
+            Print("MACD out of range (mixed). Pausing EA until MACD returns to range.");
+         }
       }
       return;
    } else {
-      g_stopBySideway = false;
+      // back in range -> allow EA to run again
+      g_stopByMacd = false;
    }
 
    // 2. Check Daily Stop (Percent based)
