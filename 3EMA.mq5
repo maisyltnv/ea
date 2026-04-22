@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
 //|                                                     3EMA.mq5     |
-//|  Buy-only EMA stack + MACD gate with EMA50 trailing              |
+//|  Buy-only EMA stack + MACD gate with EMA50 trailing   
+//| M1+M5 signal           |
 //+------------------------------------------------------------------+
 #property strict
 #property version   "1.00"
@@ -14,7 +15,7 @@ input int SlippagePoints = 20;
 input int MagicNumber = 33001;
 
 input int EmaFastPeriod = 14;
-input int EmaMidPeriod  = 26;
+input int EmaMidPeriod  = 16;
 input int EmaSlowPeriod = 50;
 
 input int MacdFastEMA = 12;
@@ -33,6 +34,10 @@ int g_emaFastHandle = INVALID_HANDLE;
 int g_emaMidHandle  = INVALID_HANDLE;
 int g_emaSlowHandle = INVALID_HANDLE;
 int g_macdHandle    = INVALID_HANDLE;
+
+int g_emaFastHandleM5 = INVALID_HANDLE;
+int g_emaMidHandleM5  = INVALID_HANDLE;
+int g_emaSlowHandleM5 = INVALID_HANDLE;
 
 //--------------------------- Helpers -------------------------------
 double PointValue() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
@@ -81,6 +86,10 @@ int OnInit() {
    g_emaSlowHandle = iMA(_Symbol, PERIOD_M1, EmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
    g_macdHandle    = iMACD(_Symbol, PERIOD_M1, MacdFastEMA, MacdSlowEMA, MacdSignalSMA, PRICE_CLOSE);
 
+   g_emaFastHandleM5 = iMA(_Symbol, PERIOD_M5, EmaFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_emaMidHandleM5  = iMA(_Symbol, PERIOD_M5, EmaMidPeriod,  0, MODE_EMA, PRICE_CLOSE);
+   g_emaSlowHandleM5 = iMA(_Symbol, PERIOD_M5, EmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
 
@@ -92,6 +101,10 @@ void OnDeinit(const int reason) {
    if (g_emaMidHandle  != INVALID_HANDLE) IndicatorRelease(g_emaMidHandle);
    if (g_emaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_emaSlowHandle);
    if (g_macdHandle    != INVALID_HANDLE) IndicatorRelease(g_macdHandle);
+
+   if (g_emaFastHandleM5 != INVALID_HANDLE) IndicatorRelease(g_emaFastHandleM5);
+   if (g_emaMidHandleM5  != INVALID_HANDLE) IndicatorRelease(g_emaMidHandleM5);
+   if (g_emaSlowHandleM5 != INVALID_HANDLE) IndicatorRelease(g_emaSlowHandleM5);
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -150,10 +163,11 @@ void OnTick() {
 
    if (g_stopForToday) return;
 
-   // Entry condition on M1 closed candle
+   // Entry condition on M1+M5 closed candles
    const int shift = 1;
    const double close1 = iClose(_Symbol, PERIOD_M1, shift);
-   if (close1 <= 0.0) return;
+   const double close5 = iClose(_Symbol, PERIOD_M5, shift);
+   if (close1 <= 0.0 || close5 <= 0.0) return;
 
    double emaFast = 0.0, emaMid = 0.0, emaSlow = 0.0, macdMain = 0.0;
    if (!ReadBuffer1(g_emaFastHandle, 0, shift, emaFast)) return;
@@ -161,7 +175,13 @@ void OnTick() {
    if (!ReadBuffer1(g_emaSlowHandle, 0, shift, emaSlow)) return;
    if (!ReadBuffer1(g_macdHandle,    0, shift, macdMain)) return; // buffer 0 = main
 
+   double emaFast5 = 0.0, emaMid5 = 0.0, emaSlow5 = 0.0;
+   if (!ReadBuffer1(g_emaFastHandleM5, 0, shift, emaFast5)) return;
+   if (!ReadBuffer1(g_emaMidHandleM5,  0, shift, emaMid5))  return;
+   if (!ReadBuffer1(g_emaSlowHandleM5, 0, shift, emaSlow5)) return;
+
    if (!(close1 > emaFast && emaFast > emaMid && emaMid > emaSlow)) return;
+   if (!(close5 > emaFast5 && emaFast5 > emaMid5 && emaMid5 > emaSlow5)) return;
    if (!(macdMain > MacdMainMin)) return;
 
    // Place BUY with fixed SL (points)
