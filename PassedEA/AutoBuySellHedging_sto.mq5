@@ -15,13 +15,11 @@
 //|            SELL STOP Step4 -> BUY STOP Step5 -> ລໍ TP             |
 //| SELL-start: ກົງກັນຂ້າມ (mirror).                                   |
 //|                                                                  |
-//| ເງື່ອນໄຂ M1 EMA (ເປີດ/ປິດ UseEmaM1Filter, EmaM1Shift=ແທ່ງທີ່ກວດ):   |
+//| ເງື່ອນໄຂ M1 STO (ເປີດ/ປິດ UseStoM1Filter, StoM1Shift=ແທ່ງທີ່ກວດ):   |
 //|  ຕ້ອງຜ່ານກ່ອນ: ປຸ່ມ market, auto start, StartBuy/SellCycle,        |
 //|  ແລະ ກ່ອນວາງ pending ຂັ້ນຕໍ່ໄປໃນຮອບກຳລັງເຮັດວຽກ.                  |
-//|  ຜ່ານເມື່ອ (ໃນ PERIOD_M1, bar shift = EmaM1Shift, ຄ່າເລີ່ມ 1):      |
-//|   Bull: EMA14 > EMA26 > EMA50 > EMA100 > EMA200                   |
-//|   ຫຼື Bear: EMA14 < EMA26 < EMA50 < EMA100 < EMA200                 |
-//|  ຖ້າບໍ່ຕົງທັງຄູ່ -> ບໍ່ສົ່ງອໍເດີໃໝ່ (ລໍຈົນກວ່າຈະຕົງ).              |
+//|  ຜ່ານເມື່ອ: STO(main) > StoUpperLevel ຫຼື STO(main) < StoLowerLevel |
+//|  (ຄ່າເລີ່ມ: 80/20). ຖ້າບໍ່ຕົງ -> ບໍ່ສົ່ງອໍເດີໃໝ່.                 |
 //|                                                                  |
 //| ຣີເຊັດ: ປິດຫມົດມືບໍ່ມີ position/order -> MODE_NONE ພ້ອມເລີ່ມໃໝ່.   |
 //+------------------------------------------------------------------+
@@ -46,9 +44,14 @@ input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 987654; // Magic for EA-created orders
 input double StartLot = 0.01;   // Lot when starting via BUY/SELL button
 
-//--- M1 EMA stack filter (must pass before any new order)
-input bool   UseEmaM1Filter = true; // false = disable EMA gate
-input int    EmaM1Shift   = 1;      // bar shift (1 = last closed M1 bar)
+//--- M1 Stochastic filter (must pass before any new order)
+input bool   UseStoM1Filter  = true;  // false = disable STO gate
+input int    StoM1Shift      = 1;     // bar shift (1 = last closed M1 bar)
+input int    StoKPeriod      = 5;
+input int    StoDPeriod      = 3;
+input int    StoSlowing      = 3;
+input double StoUpperLevel   = 80.0;  // trade allowed if STO > upper OR < lower
+input double StoLowerLevel   = 20.0;
 
 //--- chart button names (for start BUY / start SELL)
 #define BTN_BUY_NAME "HedgingManualBtnBUY"
@@ -56,95 +59,6 @@ input int    EmaM1Shift   = 1;      // bar shift (1 = last closed M1 bar)
 
 //--- trade object
 CTrade trade;
-
-//+------------------------------------------------------------------+
-//| Anchor SL/TP: make all BUYs share first BUY SL/TP; same for SELL |
-//+------------------------------------------------------------------+
-bool FindAnchorForSide(const ENUM_POSITION_TYPE side, double &slOut, double &tpOut) {
-  slOut = 0.0;
-  tpOut = 0.0;
-  const string symbol = _Symbol;
-
-  ulong bestTk = 0;
-  long bestTime = LONG_MAX;
-
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != symbol)
-      continue;
-
-    // consider manual (magic 0) and EA (magic MagicNumber) positions only
-    const int magic = (int)PositionGetInteger(POSITION_MAGIC);
-    if (magic != 0 && magic != MagicNumber)
-      continue;
-
-    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side)
-      continue;
-
-    const long t = (long)PositionGetInteger(POSITION_TIME_MSC);
-    if (t < bestTime) {
-      bestTime = t;
-      bestTk = tk;
-    }
-  }
-
-  if (bestTk == 0 || !PositionSelectByTicket(bestTk))
-    return false;
-
-  slOut = PositionGetDouble(POSITION_SL);
-  tpOut = PositionGetDouble(POSITION_TP);
-  return (slOut > 0.0 || tpOut > 0.0);
-}
-
-void EnforceAnchorsOnEAPositions() {
-  const string symbol = _Symbol;
-  const int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-  double buySL = 0.0, buyTP = 0.0, sellSL = 0.0, sellTP = 0.0;
-  const bool hasBuyAnchor = FindAnchorForSide(POSITION_TYPE_BUY, buySL, buyTP);
-  const bool hasSellAnchor = FindAnchorForSide(POSITION_TYPE_SELL, sellSL, sellTP);
-
-  if (!hasBuyAnchor && !hasSellAnchor)
-    return;
-
-  trade.SetExpertMagicNumber(MagicNumber);
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  for (int i = PositionsTotal() - 1; i >= 0; --i) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk))
-      continue;
-    if (PositionGetString(POSITION_SYMBOL) != symbol)
-      continue;
-    if ((int)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-      continue; // only modify EA-created positions
-
-    const ENUM_POSITION_TYPE side = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    double wantSL = 0.0, wantTP = 0.0;
-    if (side == POSITION_TYPE_BUY && hasBuyAnchor) {
-      wantSL = buySL; wantTP = buyTP;
-    } else if (side == POSITION_TYPE_SELL && hasSellAnchor) {
-      wantSL = sellSL; wantTP = sellTP;
-    } else {
-      continue;
-    }
-
-    const double curSL = PositionGetDouble(POSITION_SL);
-    const double curTP = PositionGetDouble(POSITION_TP);
-
-    const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
-    const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
-    const double nCurSL  = (curSL > 0.0)  ? NormalizeDouble(curSL, digits)  : 0.0;
-    const double nCurTP  = (curTP > 0.0)  ? NormalizeDouble(curTP, digits)  : 0.0;
-
-    if (nCurSL == nWantSL && nCurTP == nWantTP)
-      continue;
-
-    trade.PositionModify(tk, nWantSL, nWantTP);
-  }
-}
 
 //--- mode and step state
 enum StartMode {
@@ -167,52 +81,26 @@ int      g_step      = STEP_IDLE;
 int      g_nextMode  = MODE_BUY_START; // which side to auto-start next cycle (BUY/SELL)
 datetime g_lastTPDealTime = 0;         // last TP deal time we've processed
 
-int g_ema14  = INVALID_HANDLE;
-int g_ema26  = INVALID_HANDLE;
-int g_ema50  = INVALID_HANDLE;
-int g_ema100 = INVALID_HANDLE;
-int g_ema200 = INVALID_HANDLE;
+int g_sto = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
-//| Read one EMA buffer value (shift on M1)                          |
+//| M1 Stochastic gate                                               |
 //+------------------------------------------------------------------+
-bool ReadEma1(const int handle, const int shift, double &out) {
-  if (handle == INVALID_HANDLE)
-    return false;
-  double b[1];
-  if (CopyBuffer(handle, 0, shift, 1, b) != 1)
-    return false;
-  out = b[0];
-  return true;
-}
-
-//+------------------------------------------------------------------+
-//| M1: full bull stack OR full bear stack                         |
-//+------------------------------------------------------------------+
-bool TrendFilterEmaM1Ok() {
-  if (!UseEmaM1Filter)
+bool TrendFilterStoM1Ok() {
+  if (!UseStoM1Filter)
     return true;
-  const int sh = EmaM1Shift;
+  const int sh = StoM1Shift;
   if (sh < 0)
     return false;
-
-  double e14 = 0.0, e26 = 0.0, e50 = 0.0, e100 = 0.0, e200 = 0.0;
-  if (!ReadEma1(g_ema14, sh, e14))
-    return false;
-  if (!ReadEma1(g_ema26, sh, e26))
-    return false;
-  if (!ReadEma1(g_ema50, sh, e50))
-    return false;
-  if (!ReadEma1(g_ema100, sh, e100))
-    return false;
-  if (!ReadEma1(g_ema200, sh, e200))
+  if (g_sto == INVALID_HANDLE)
     return false;
 
-  const bool bull =
-      (e14 > e26) && (e26 > e50) && (e50 > e100) && (e100 > e200);
-  const bool bear =
-      (e14 < e26) && (e26 < e50) && (e50 < e100) && (e100 < e200);
-  return bull || bear;
+  double mainLine[1];
+  if (CopyBuffer(g_sto, 0, sh, 1, mainLine) != 1)
+    return false;
+
+  const double sto = mainLine[0];
+  return (sto > StoUpperLevel || sto < StoLowerLevel);
 }
 
 //+------------------------------------------------------------------+
@@ -428,9 +316,10 @@ void StartBuyCycle(ulong manualTicket) {
   if (!PositionSelectByTicket(manualTicket))
     return;
 
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] BUY-start skipped: M1 EMA stack not aligned (need "
-          "14>26>50>100>200 OR 14<26<50<100<200).");
+  if (!TrendFilterStoM1Ok()) {
+    Print("[HedgingManual] BUY-start skipped: M1 STO not in range (need STO > ",
+          DoubleToString(StoUpperLevel, 1), " OR STO < ",
+          DoubleToString(StoLowerLevel, 1), ").");
     return;
   }
 
@@ -449,21 +338,16 @@ void StartBuyCycle(ulong manualTicket) {
   // Place SELL STOP #1 (lot = 0.03 = Step2; order: 0.01 buy -> 0.03 sell ->
   // 0.06 buy -> 0.17 sell -> 0.40 buy)
   double sellPrice = entry - DistancePoints * point;
+  double sellTP = sellPrice - TPPoints * point;
   sellPrice = NormalizeDouble(sellPrice, digits);
-  // Use anchored SELL SL/TP if a SELL anchor already exists; otherwise fallback to old TP calc
-  double aSL = 0.0, aTP = 0.0;
-  bool hasAnchor = FindAnchorForSide(POSITION_TYPE_SELL, aSL, aTP);
-  if (!hasAnchor) {
-    aSL = 0.0;
-    aTP = NormalizeDouble(sellPrice - TPPoints * point, digits);
-  }
+  sellTP = NormalizeDouble(sellTP, digits);
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  if (trade.SellStop(Lots_Step2, sellPrice, symbol, aSL, aTP)) {
+  if (trade.SellStop(Lots_Step2, sellPrice, symbol, 0.0, sellTP)) {
     Print("[HedgingManual] BUY-start: SELL STOP #1 (", Lots_Step2,
-          ") placed at ", sellPrice, " TP=", aTP);
+          ") placed at ", sellPrice, " TP=", sellTP);
     g_mode = MODE_BUY_START;
     g_step = STEP_1;
   } else {
@@ -479,9 +363,10 @@ void StartSellCycle(ulong manualTicket) {
   if (!PositionSelectByTicket(manualTicket))
     return;
 
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] SELL-start skipped: M1 EMA stack not aligned (need "
-          "14>26>50>100>200 OR 14<26<50<100<200).");
+  if (!TrendFilterStoM1Ok()) {
+    Print("[HedgingManual] SELL-start skipped: M1 STO not in range (need STO > ",
+          DoubleToString(StoUpperLevel, 1), " OR STO < ",
+          DoubleToString(StoLowerLevel, 1), ").");
     return;
   }
 
@@ -500,21 +385,16 @@ void StartSellCycle(ulong manualTicket) {
   // Place BUY STOP #1 (lot = 0.03 = Step2; order: 0.01 sell -> 0.03 buy -> 0.06
   // sell -> 0.17 buy -> 0.40 sell)
   double buyPrice = entry + DistancePoints * point;
+  double buyTP = buyPrice + TPPoints * point;
   buyPrice = NormalizeDouble(buyPrice, digits);
-  // Use anchored BUY SL/TP if a BUY anchor already exists; otherwise fallback to old TP calc
-  double aSL = 0.0, aTP = 0.0;
-  bool hasAnchor = FindAnchorForSide(POSITION_TYPE_BUY, aSL, aTP);
-  if (!hasAnchor) {
-    aSL = 0.0;
-    aTP = NormalizeDouble(buyPrice + TPPoints * point, digits);
-  }
+  buyTP = NormalizeDouble(buyTP, digits);
 
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  if (trade.BuyStop(Lots_Step2, buyPrice, symbol, aSL, aTP)) {
+  if (trade.BuyStop(Lots_Step2, buyPrice, symbol, 0.0, buyTP)) {
     Print("[HedgingManual] SELL-start: BUY STOP #1 (", Lots_Step2,
-          ") placed at ", buyPrice, " TP=", aTP);
+          ") placed at ", buyPrice, " TP=", buyTP);
     g_mode = MODE_SELL_START;
     g_step = STEP_1;
   } else {
@@ -599,15 +479,10 @@ int OnInit() {
       break; // most recent TP for this EA/symbol
     }
   }
-  g_ema14  = iMA(_Symbol, PERIOD_M1, 14, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema26  = iMA(_Symbol, PERIOD_M1, 26, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema50  = iMA(_Symbol, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema100 = iMA(_Symbol, PERIOD_M1, 100, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema200 = iMA(_Symbol, PERIOD_M1, 200, 0, MODE_EMA, PRICE_CLOSE);
-  if (g_ema14 == INVALID_HANDLE || g_ema26 == INVALID_HANDLE ||
-      g_ema50 == INVALID_HANDLE || g_ema100 == INVALID_HANDLE ||
-      g_ema200 == INVALID_HANDLE) {
-    Print("AutoBuySellHedging: failed to create M1 EMA handles. err=",
+  g_sto = iStochastic(_Symbol, PERIOD_M1, StoKPeriod, StoDPeriod, StoSlowing,
+                      MODE_SMA, STO_LOWHIGH);
+  if (g_sto == INVALID_HANDLE) {
+    Print("AutoBuySellHedging: failed to create M1 STO handle. err=",
           GetLastError());
     return (INIT_FAILED);
   }
@@ -622,16 +497,8 @@ int OnInit() {
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason) {
   DeleteStartButtons();
-  if (g_ema14 != INVALID_HANDLE)
-    IndicatorRelease(g_ema14);
-  if (g_ema26 != INVALID_HANDLE)
-    IndicatorRelease(g_ema26);
-  if (g_ema50 != INVALID_HANDLE)
-    IndicatorRelease(g_ema50);
-  if (g_ema100 != INVALID_HANDLE)
-    IndicatorRelease(g_ema100);
-  if (g_ema200 != INVALID_HANDLE)
-    IndicatorRelease(g_ema200);
+  if (g_sto != INVALID_HANDLE)
+    IndicatorRelease(g_sto);
 }
 
 //+------------------------------------------------------------------+
@@ -659,8 +526,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
   trade.SetExpertMagicNumber(0);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] Button order skipped: M1 EMA stack not aligned.");
+  if (!TrendFilterStoM1Ok()) {
+    Print("[HedgingManual] Button order skipped: M1 STO gate not passed.");
     trade.SetExpertMagicNumber(MagicNumber);
     ChartRedraw(0);
     return;
@@ -693,9 +560,6 @@ void OnTick() {
   string symbol = _Symbol;
   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-  // Keep SL/TP aligned per side after pending triggers
-  EnforceAnchorsOnEAPositions();
 
   // 1) If any TP is hit -> close everything and reset (both modes)
   if (AnyTPHit()) {
@@ -740,10 +604,10 @@ void OnTick() {
 
     // 2a) If user manually opened exactly one side, respect that (old behavior)
     if (hasManualBuy && !hasManualSell) {
-      if (TrendFilterEmaM1Ok())
+      if (TrendFilterStoM1Ok())
         StartBuyCycle(buyTicket);
     } else if (hasManualSell && !hasManualBuy) {
-      if (TrendFilterEmaM1Ok())
+      if (TrendFilterStoM1Ok())
         StartSellCycle(sellTicket);
     } else if (!hasManualBuy && !hasManualSell) {
       // 2b) No manual start -> auto open first order with EA magic
@@ -757,8 +621,8 @@ void OnTick() {
 
       ulong newTicket = 0;
 
-      if (!TrendFilterEmaM1Ok()) {
-        // wait until M1 EMA stack aligns
+      if (!TrendFilterStoM1Ok()) {
+        // wait until M1 STO gate passes
         return;
       }
 
@@ -820,8 +684,8 @@ void OnTick() {
   }
 
   // 3) Hedge sequence for active mode
-  if (!TrendFilterEmaM1Ok())
-    return; // no new pending hedge orders until M1 EMA stack aligns
+  if (!TrendFilterStoM1Ok())
+    return; // no new pending hedge orders until M1 STO gate passes
 
   double entryPrice;
 
@@ -836,14 +700,10 @@ void OnTick() {
       bool hasBuyStop1 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step3);
       if (hasSell1 && !hasBuyStop1) {
         double buyPrice = entryPrice + DistancePoints * point;
+        double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_BUY, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(buyPrice + TPPoints * point, digits);
-        }
-        if (trade.BuyStop(Lots_Step3, buyPrice, symbol, aSL, aTP)) {
+        buyTP = NormalizeDouble(buyTP, digits);
+        if (trade.BuyStop(Lots_Step3, buyPrice, symbol, 0.0, buyTP)) {
           Print("[HedgingManual] BUY-start: BUY STOP #1 (", Lots_Step3, ") at ",
                 buyPrice);
           g_step = STEP_2;
@@ -856,14 +716,10 @@ void OnTick() {
       bool hasSellStop2 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step4);
       if (hasBuy2 && !hasSellStop2) {
         double sellPrice = entryPrice - DistancePoints * point;
+        double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_SELL, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(sellPrice - TPPoints * point, digits);
-        }
-        if (trade.SellStop(Lots_Step4, sellPrice, symbol, aSL, aTP)) {
+        sellTP = NormalizeDouble(sellTP, digits);
+        if (trade.SellStop(Lots_Step4, sellPrice, symbol, 0.0, sellTP)) {
           Print("[HedgingManual] BUY-start: SELL STOP #2 (", Lots_Step4,
                 ") at ", sellPrice);
           g_step = STEP_3;
@@ -876,14 +732,10 @@ void OnTick() {
       bool hasBuyStop3 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step5);
       if (hasSell3 && !hasBuyStop3) {
         double buyPrice = entryPrice + DistancePoints * point;
+        double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_BUY, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(buyPrice + TPPoints * point, digits);
-        }
-        if (trade.BuyStop(Lots_Step5, buyPrice, symbol, aSL, aTP)) {
+        buyTP = NormalizeDouble(buyTP, digits);
+        if (trade.BuyStop(Lots_Step5, buyPrice, symbol, 0.0, buyTP)) {
           Print("[HedgingManual] BUY-start: BUY STOP #2 (", Lots_Step5, ") at ",
                 buyPrice);
           g_step = STEP_4;
@@ -902,14 +754,10 @@ void OnTick() {
       bool hasSellStop1 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step3);
       if (hasBuy1 && !hasSellStop1) {
         double sellPrice = entryPrice - DistancePoints * point;
+        double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_SELL, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(sellPrice - TPPoints * point, digits);
-        }
-        if (trade.SellStop(Lots_Step3, sellPrice, symbol, aSL, aTP)) {
+        sellTP = NormalizeDouble(sellTP, digits);
+        if (trade.SellStop(Lots_Step3, sellPrice, symbol, 0.0, sellTP)) {
           Print("[HedgingManual] SELL-start: SELL STOP #1 (", Lots_Step3,
                 ") at ", sellPrice);
           g_step = STEP_2;
@@ -922,14 +770,10 @@ void OnTick() {
       bool hasBuyStop2 = HasEAPending(ORDER_TYPE_BUY_STOP, Lots_Step4);
       if (hasSell2 && !hasBuyStop2) {
         double buyPrice = entryPrice + DistancePoints * point;
+        double buyTP = buyPrice + TPPoints * point;
         buyPrice = NormalizeDouble(buyPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_BUY, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(buyPrice + TPPoints * point, digits);
-        }
-        if (trade.BuyStop(Lots_Step4, buyPrice, symbol, aSL, aTP)) {
+        buyTP = NormalizeDouble(buyTP, digits);
+        if (trade.BuyStop(Lots_Step4, buyPrice, symbol, 0.0, buyTP)) {
           Print("[HedgingManual] SELL-start: BUY STOP #2 (", Lots_Step4,
                 ") at ", buyPrice);
           g_step = STEP_3;
@@ -942,14 +786,10 @@ void OnTick() {
       bool hasSellStop3 = HasEAPending(ORDER_TYPE_SELL_STOP, Lots_Step5);
       if (hasBuy3 && !hasSellStop3) {
         double sellPrice = entryPrice - DistancePoints * point;
+        double sellTP = sellPrice - TPPoints * point;
         sellPrice = NormalizeDouble(sellPrice, digits);
-        double aSL = 0.0, aTP = 0.0;
-        bool hasAnchor = FindAnchorForSide(POSITION_TYPE_SELL, aSL, aTP);
-        if (!hasAnchor) {
-          aSL = 0.0;
-          aTP = NormalizeDouble(sellPrice - TPPoints * point, digits);
-        }
-        if (trade.SellStop(Lots_Step5, sellPrice, symbol, aSL, aTP)) {
+        sellTP = NormalizeDouble(sellTP, digits);
+        if (trade.SellStop(Lots_Step5, sellPrice, symbol, 0.0, sellTP)) {
           Print("[HedgingManual] SELL-start: SELL STOP #2 (", Lots_Step5,
                 ") at ", sellPrice);
           g_step = STEP_4;
