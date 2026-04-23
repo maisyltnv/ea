@@ -167,6 +167,11 @@ int      g_step      = STEP_IDLE;
 int      g_nextMode  = MODE_BUY_START; // which side to auto-start next cycle (BUY/SELL)
 datetime g_lastTPDealTime = 0;         // last TP deal time we've processed
 
+//--- Manual toggle pause/start behavior
+bool     g_pauseAfterThisCycle = false; // set when user opens manual buy/sell while running
+bool     g_pausedUntilManual   = false; // true = EA paused until next manual buy/sell
+datetime g_lastExitDealTime    = 0;     // last SL/TP deal time processed (any magic, this symbol)
+
 int g_ema14  = INVALID_HANDLE;
 int g_ema26  = INVALID_HANDLE;
 int g_ema50  = INVALID_HANDLE;
@@ -329,6 +334,69 @@ bool AnyTPHit() {
   else if (dealType == DEAL_TYPE_SELL)
     g_nextMode = MODE_BUY_START;  // SELL deal closed a BUY position -> continue BUY
 
+  return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: check if any SL/TP has happened (this symbol)            |
+//+------------------------------------------------------------------+
+bool AnyExitHit(bool &isTP) {
+  isTP = false;
+  datetime toTime = TimeCurrent();
+  datetime fromTime = g_lastExitDealTime;
+
+  if (!HistorySelect(fromTime, toTime))
+    return false;
+
+  string symbol = _Symbol;
+  datetime newest = g_lastExitDealTime;
+  ulong lastDeal = 0;
+  bool found = false;
+
+  int deals = HistoryDealsTotal();
+  for (int i = deals - 1; i >= 0; --i) {
+    ulong dealTicket = HistoryDealGetTicket(i);
+    if (dealTicket == 0)
+      continue;
+    if (HistoryDealGetString(dealTicket, DEAL_SYMBOL) != symbol)
+      continue;
+
+    ENUM_DEAL_ENTRY entry =
+        (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+    if (entry != DEAL_ENTRY_OUT)
+      continue;
+
+    ENUM_DEAL_REASON reason =
+        (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
+    if (reason != DEAL_REASON_TP && reason != DEAL_REASON_SL)
+      continue;
+
+    datetime dTime =
+        (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+    if (dTime <= g_lastExitDealTime)
+      break;
+
+    newest = dTime;
+    lastDeal = dealTicket;
+    found = true;
+    isTP = (reason == DEAL_REASON_TP);
+    break;
+  }
+
+  if (!found)
+    return false;
+
+  g_lastExitDealTime = newest;
+
+  // Keep existing "next side" behavior only when TP happened
+  if (isTP && lastDeal != 0) {
+    ENUM_DEAL_TYPE dealType =
+        (ENUM_DEAL_TYPE)HistoryDealGetInteger(lastDeal, DEAL_TYPE);
+    if (dealType == DEAL_TYPE_BUY)
+      g_nextMode = MODE_SELL_START;
+    else if (dealType == DEAL_TYPE_SELL)
+      g_nextMode = MODE_BUY_START;
+  }
   return true;
 }
 
@@ -570,6 +638,7 @@ int OnInit() {
   g_nextMode = MODE_BUY_START;   // first cycle starts from BUY side
   // Initialize last TP deal time so we only react to NEW TP hits after EA start
   g_lastTPDealTime = 0;
+  g_lastExitDealTime = 0;
   if (HistorySelect(0, TimeCurrent())) {
     int deals = HistoryDealsTotal();
     for (int i = deals - 1; i >= 0; i--) {
@@ -591,12 +660,14 @@ int OnInit() {
 
       ENUM_DEAL_REASON reason =
           (ENUM_DEAL_REASON)HistoryDealGetInteger(dealTicket, DEAL_REASON);
-      if (reason != DEAL_REASON_TP)
+      if (reason != DEAL_REASON_TP && reason != DEAL_REASON_SL)
         continue;
 
-      g_lastTPDealTime =
-          (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
-      break; // most recent TP for this EA/symbol
+      datetime t = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      g_lastExitDealTime = t;
+      if (reason == DEAL_REASON_TP)
+        g_lastTPDealTime = t;
+      break; // most recent TP/SL for this symbol
     }
   }
   g_ema14  = iMA(_Symbol, PERIOD_M1, 14, 0, MODE_EMA, PRICE_CLOSE);
@@ -635,6 +706,41 @@ void OnDeinit(const int reason) {
 }
 
 //+------------------------------------------------------------------+
+//| Trade transaction: detect manual order while running             |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result) {
+  if (trans.type != TRADE_TRANSACTION_DEAL_ADD)
+    return;
+  if (trans.deal == 0)
+    return;
+  if (!HistoryDealSelect(trans.deal))
+    return;
+  if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+    return;
+
+  const ENUM_DEAL_ENTRY e =
+      (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+  if (e != DEAL_ENTRY_IN)
+    return;
+
+  const long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
+  if ((int)magic == MagicNumber)
+    return; // ignore EA deals
+
+  // Manual order detected
+  if (g_mode != MODE_NONE) {
+    g_pauseAfterThisCycle = true;
+    Print("[HedgingManual] Manual order detected while running -> will pause after TP/SL.");
+  } else if (g_pausedUntilManual) {
+    g_pausedUntilManual = false;
+    g_pauseAfterThisCycle = false;
+    Print("[HedgingManual] Resumed by manual order.");
+  }
+}
+
+//+------------------------------------------------------------------+
 //| Chart event: handle BUY / SELL button click                      |
 //+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam, const double &dparam,
@@ -643,6 +749,13 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
     return;
   if (sparam != BTN_BUY_NAME && sparam != BTN_SELL_NAME)
     return;
+
+  // Manual click should also resume EA if paused
+  if (g_pausedUntilManual) {
+    g_pausedUntilManual = false;
+    g_pauseAfterThisCycle = false;
+    Print("[HedgingManual] Resumed by manual button.");
+  }
 
   string symbol = _Symbol;
   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
@@ -694,14 +807,32 @@ void OnTick() {
   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
+  // If paused, only resume when user opens a new manual BUY or SELL
+  if (g_pausedUntilManual) {
+    ulong bt = 0, st = 0;
+    if (!FindManualPosition(POSITION_TYPE_BUY, bt) &&
+        !FindManualPosition(POSITION_TYPE_SELL, st)) {
+      return;
+    }
+    // manual position exists -> allow EA to run again
+    g_pausedUntilManual = false;
+    g_pauseAfterThisCycle = false;
+  }
+
   // Keep SL/TP aligned per side after pending triggers
   EnforceAnchorsOnEAPositions();
 
-  // 1) If any TP is hit -> close everything and reset (both modes)
-  if (AnyTPHit()) {
-    Print("[HedgingManual] TP reached. Closing all positions and orders, "
-          "resetting state.");
+  // 1) If any TP/SL is hit -> close everything and reset (both modes)
+  bool isTP = false;
+  if (AnyExitHit(isTP)) {
+    Print("[HedgingManual] ", (isTP ? "TP" : "SL"),
+          " reached. Closing all positions and orders, resetting state.");
     CloseAllAndReset();
+    if (g_pauseAfterThisCycle) {
+      g_pausedUntilManual = true;
+      g_pauseAfterThisCycle = false;
+      Print("[HedgingManual] Paused until next manual BUY/SELL.");
+    }
     return;
   }
 
