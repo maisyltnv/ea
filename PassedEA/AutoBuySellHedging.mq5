@@ -1,29 +1,13 @@
 //+------------------------------------------------------------------+
-//| AutoBuySellHedging.mq5 (Hedging ladder + auto/manual start)      |
+//| HedgingManual EA                                                 |
+//| Manual start (user opens first BUY or SELL), EA builds hedge     |
+//| ladder of pending stops and closes everything on any TP.         |
 //|                                                                  |
-//| ຈຸດປະສົງ: ສ້າງຂັ້ນ hedge ດ້ວຍ pending stop ສະຫຼັບຝັ່ງ; ມີ TP ຕໍ່ຂັ້ນ.   |
-//| ເມື່ອມີ position ໃດໜຶ່ງໂດນ TP -> ປິດທຸກອໍເດີ/position ຂອງ symbol ນີ້.   |
-//|                                                                  |
-//| ວິທີເລີ່ມຮອບ (3 ຊ່ອງທາງ):                                         |
-//|  1) ປຸ່ມ chart BUY/SELL (ເປີດ market magic=0 = "manual" ສຳລັບ EA)   |
-//|  2) ຜູ້ໃຊ້ເປີດມືຝັ່ງດຽວ (magic != MagicNumber) -> StartBuy/SellCycle |
-//|  3) Auto: ບໍ່ມີ manual ສອງຝັ່ງ -> EA ເປີດ Buy ຫຼື Sell lot=Step1     |
-//|     ຕາມ g_nextMode; ຫຼັງ TP ສັບຝັ່ງຕາມ deal ປິດ (AnyTPHit).         |
-//|                                                                  |
-//| ລຳດັບ lot ຂັ້ນ (ປັບໄດ້ Lots_Step1..5): ຄ່າເລີ່ມຕົ້ນ 0.01,0.03,...   |
-//| BUY-start: BUY Step1 -> SELL STOP Step2 -> BUY STOP Step3 ->      |
-//|            SELL STOP Step4 -> BUY STOP Step5 -> ລໍ TP             |
-//| SELL-start: ກົງກັນຂ້າມ (mirror).                                   |
-//|                                                                  |
-//| ເງື່ອນໄຂ M1 EMA (ເປີດ/ປິດ UseEmaM1Filter, EmaM1Shift=ແທ່ງທີ່ກວດ):   |
-//|  ຕ້ອງຜ່ານກ່ອນ: ປຸ່ມ market, auto start, StartBuy/SellCycle,        |
-//|  ແລະ ກ່ອນວາງ pending ຂັ້ນຕໍ່ໄປໃນຮອບກຳລັງເຮັດວຽກ.                  |
-//|  ຜ່ານເມື່ອ (ໃນ PERIOD_M1, bar shift = EmaM1Shift, ຄ່າເລີ່ມ 1):      |
-//|   Bull: EMA14 > EMA26 > EMA50 > EMA100 > EMA200                   |
-//|   ຫຼື Bear: EMA14 < EMA26 < EMA50 < EMA100 < EMA200                 |
-//|  ຖ້າບໍ່ຕົງທັງຄູ່ -> ບໍ່ສົ່ງອໍເດີໃໝ່ (ລໍຈົນກວ່າຈະຕົງ).              |
-//|                                                                  |
-//| ຣີເຊັດ: ປິດຫມົດມືບໍ່ມີ position/order -> MODE_NONE ພ້ອມເລີ່ມໃໝ່.   |
+//| Ladder by lot order: 0.01, 0.03, 0.06, 0.17, 0.40                 |
+//| BUY-START: BUY 0.01 -> SELL STOP 0.03 -> BUY STOP 0.06 ->         |
+//|            SELL STOP 0.17 -> BUY STOP 0.40 -> wait TP             |
+//| SELL-START: SELL 0.01 -> BUY STOP 0.03 -> SELL STOP 0.06 ->       |
+//|             BUY STOP 0.17 -> SELL STOP 0.40 -> wait TP (mirror)   |
 //+------------------------------------------------------------------+
 
 #property strict
@@ -45,10 +29,6 @@ input int TPPoints = 400;      // Take profit distance (points) from each entry
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 987654; // Magic for EA-created orders
 input double StartLot = 0.01;   // Lot when starting via BUY/SELL button
-
-//--- M1 EMA stack filter (must pass before any new order)
-input bool   UseEmaM1Filter = true; // false = disable EMA gate
-input int    EmaM1Shift   = 1;      // bar shift (1 = last closed M1 bar)
 
 //--- chart button names (for start BUY / start SELL)
 #define BTN_BUY_NAME "HedgingManualBtnBUY"
@@ -77,54 +57,6 @@ int      g_mode      = MODE_NONE;
 int      g_step      = STEP_IDLE;
 int      g_nextMode  = MODE_BUY_START; // which side to auto-start next cycle (BUY/SELL)
 datetime g_lastTPDealTime = 0;         // last TP deal time we've processed
-
-int g_ema14  = INVALID_HANDLE;
-int g_ema26  = INVALID_HANDLE;
-int g_ema50  = INVALID_HANDLE;
-int g_ema100 = INVALID_HANDLE;
-int g_ema200 = INVALID_HANDLE;
-
-//+------------------------------------------------------------------+
-//| Read one EMA buffer value (shift on M1)                          |
-//+------------------------------------------------------------------+
-bool ReadEma1(const int handle, const int shift, double &out) {
-  if (handle == INVALID_HANDLE)
-    return false;
-  double b[1];
-  if (CopyBuffer(handle, 0, shift, 1, b) != 1)
-    return false;
-  out = b[0];
-  return true;
-}
-
-//+------------------------------------------------------------------+
-//| M1: full bull stack OR full bear stack                         |
-//+------------------------------------------------------------------+
-bool TrendFilterEmaM1Ok() {
-  if (!UseEmaM1Filter)
-    return true;
-  const int sh = EmaM1Shift;
-  if (sh < 0)
-    return false;
-
-  double e14 = 0.0, e26 = 0.0, e50 = 0.0, e100 = 0.0, e200 = 0.0;
-  if (!ReadEma1(g_ema14, sh, e14))
-    return false;
-  if (!ReadEma1(g_ema26, sh, e26))
-    return false;
-  if (!ReadEma1(g_ema50, sh, e50))
-    return false;
-  if (!ReadEma1(g_ema100, sh, e100))
-    return false;
-  if (!ReadEma1(g_ema200, sh, e200))
-    return false;
-
-  const bool bull =
-      (e14 > e26) && (e26 > e50) && (e50 > e100) && (e100 > e200);
-  const bool bear =
-      (e14 < e26) && (e26 < e50) && (e50 < e100) && (e100 < e200);
-  return bull || bear;
-}
 
 //+------------------------------------------------------------------+
 //| Get hedge lot for step (1..5)                                    |
@@ -339,12 +271,6 @@ void StartBuyCycle(ulong manualTicket) {
   if (!PositionSelectByTicket(manualTicket))
     return;
 
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] BUY-start skipped: M1 EMA stack not aligned (need "
-          "14>26>50>100>200 OR 14<26<50<100<200).");
-    return;
-  }
-
   string symbol = PositionGetString(POSITION_SYMBOL);
   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
@@ -384,12 +310,6 @@ void StartBuyCycle(ulong manualTicket) {
 void StartSellCycle(ulong manualTicket) {
   if (!PositionSelectByTicket(manualTicket))
     return;
-
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] SELL-start skipped: M1 EMA stack not aligned (need "
-          "14>26>50>100>200 OR 14<26<50<100<200).");
-    return;
-  }
 
   string symbol = PositionGetString(POSITION_SYMBOL);
   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
@@ -500,19 +420,6 @@ int OnInit() {
       break; // most recent TP for this EA/symbol
     }
   }
-  g_ema14  = iMA(_Symbol, PERIOD_M1, 14, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema26  = iMA(_Symbol, PERIOD_M1, 26, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema50  = iMA(_Symbol, PERIOD_M1, 50, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema100 = iMA(_Symbol, PERIOD_M1, 100, 0, MODE_EMA, PRICE_CLOSE);
-  g_ema200 = iMA(_Symbol, PERIOD_M1, 200, 0, MODE_EMA, PRICE_CLOSE);
-  if (g_ema14 == INVALID_HANDLE || g_ema26 == INVALID_HANDLE ||
-      g_ema50 == INVALID_HANDLE || g_ema100 == INVALID_HANDLE ||
-      g_ema200 == INVALID_HANDLE) {
-    Print("AutoBuySellHedging: failed to create M1 EMA handles. err=",
-          GetLastError());
-    return (INIT_FAILED);
-  }
-
   Print("AutoBuySellHedgingManual initialized on symbol ", _Symbol,
         " | auto cycles starting from BUY.");
   return (INIT_SUCCEEDED);
@@ -521,19 +428,7 @@ int OnInit() {
 //+------------------------------------------------------------------+
 //| Expert deinitialization                                           |
 //+------------------------------------------------------------------+
-void OnDeinit(const int reason) {
-  DeleteStartButtons();
-  if (g_ema14 != INVALID_HANDLE)
-    IndicatorRelease(g_ema14);
-  if (g_ema26 != INVALID_HANDLE)
-    IndicatorRelease(g_ema26);
-  if (g_ema50 != INVALID_HANDLE)
-    IndicatorRelease(g_ema50);
-  if (g_ema100 != INVALID_HANDLE)
-    IndicatorRelease(g_ema100);
-  if (g_ema200 != INVALID_HANDLE)
-    IndicatorRelease(g_ema200);
-}
+void OnDeinit(const int reason) { DeleteStartButtons(); }
 
 //+------------------------------------------------------------------+
 //| Chart event: handle BUY / SELL button click                      |
@@ -559,13 +454,6 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam,
   // Open with magic 0 so EA treats it as "manual" and starts cycle
   trade.SetExpertMagicNumber(0);
   trade.SetDeviationInPoints(SlippagePoints);
-
-  if (!TrendFilterEmaM1Ok()) {
-    Print("[HedgingManual] Button order skipped: M1 EMA stack not aligned.");
-    trade.SetExpertMagicNumber(MagicNumber);
-    ChartRedraw(0);
-    return;
-  }
 
   if (sparam == BTN_BUY_NAME) {
     if (trade.Buy(vol, symbol, ask, 0.0, 0.0, "Hedging Start BUY")) {
@@ -638,11 +526,9 @@ void OnTick() {
 
     // 2a) If user manually opened exactly one side, respect that (old behavior)
     if (hasManualBuy && !hasManualSell) {
-      if (TrendFilterEmaM1Ok())
-        StartBuyCycle(buyTicket);
+      StartBuyCycle(buyTicket);
     } else if (hasManualSell && !hasManualBuy) {
-      if (TrendFilterEmaM1Ok())
-        StartSellCycle(sellTicket);
+      StartSellCycle(sellTicket);
     } else if (!hasManualBuy && !hasManualSell) {
       // 2b) No manual start -> auto open first order with EA magic
       string symbol = _Symbol;
@@ -654,11 +540,6 @@ void OnTick() {
       trade.SetDeviationInPoints(SlippagePoints);
 
       ulong newTicket = 0;
-
-      if (!TrendFilterEmaM1Ok()) {
-        // wait until M1 EMA stack aligns
-        return;
-      }
 
       if (g_nextMode == MODE_BUY_START) {
         if (trade.Buy(lot, symbol, ask, 0.0, 0.0, "AutoStart BUY")) {
@@ -718,9 +599,6 @@ void OnTick() {
   }
 
   // 3) Hedge sequence for active mode
-  if (!TrendFilterEmaM1Ok())
-    return; // no new pending hedge orders until M1 EMA stack aligns
-
   double entryPrice;
 
   trade.SetDeviationInPoints(SlippagePoints);
