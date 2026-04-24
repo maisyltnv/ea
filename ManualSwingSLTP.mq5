@@ -27,6 +27,7 @@ input long   MagicNumber              = 909090; // EA will manage positions with
 input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
+input int    FirstSLOffsetPoints      = 200;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
 
 input int    BreakEvenTriggerPoints   = 150;    // when profit >= this, set BE+ and TP
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
@@ -124,6 +125,26 @@ double ProfitPointsForPosition(const ENUM_POSITION_TYPE typ, const double open) 
   return (open - ask) / pt;
 }
 
+double ReferenceSLFromExistingManual(const ENUM_POSITION_TYPE typ, const ulong excludeTicket) {
+  // Find SL from an existing manual position (same symbol & direction).
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || tk == excludeTicket) continue;
+    if (!PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+    const long magic = (long)PositionGetInteger(POSITION_MAGIC);
+    if (magic == MagicNumber) continue; // skip EA's own positions
+
+    const ENUM_POSITION_TYPE t = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    if (t != typ) continue;
+
+    const double sl = PositionGetDouble(POSITION_SL);
+    if (sl > 0.0) return sl;
+  }
+  return 0.0;
+}
+
 //--------------------------- Core logic ------------------------------
 void ManageManualPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return;
@@ -150,12 +171,26 @@ void ManageManualPosition(const ulong tk) {
   // 1) Set SL to swing (only if SL is empty AND not already set by us)
   if (!g_states[st].swingSLSet && curSL <= 0.0) {
     double sl = 0.0;
-    if (typ == POSITION_TYPE_BUY) {
-      double sw = SwingLowPrice();
-      if (sw > 0.0) sl = sw - (double)SwingBufferPoints * pt;
+
+    // If there is already an open manual position in the same direction,
+    // reuse its SL so added entries share the exact same SL as the first one.
+    const double refSL = ReferenceSLFromExistingManual(typ, tk);
+    if (refSL > 0.0) {
+      sl = refSL;
     } else {
-      double sw = SwingHighPrice();
-      if (sw > 0.0) sl = sw + (double)SwingBufferPoints * pt;
+      if (typ == POSITION_TYPE_BUY) {
+        double sw = SwingLowPrice();
+        if (sw > 0.0) sl = sw - (double)SwingBufferPoints * pt;
+      } else {
+        double sw = SwingHighPrice();
+        if (sw > 0.0) sl = sw + (double)SwingBufferPoints * pt;
+      }
+
+      // Apply offset ONLY when creating the first SL (i.e., not copying refSL).
+      if (sl > 0.0 && FirstSLOffsetPoints != 0) {
+        if (typ == POSITION_TYPE_BUY) sl -= (double)FirstSLOffsetPoints * pt;
+        else sl += (double)FirstSLOffsetPoints * pt;
+      }
     }
     if (sl > 0.0) sl = NormalizeDouble(sl, digits);
 
