@@ -34,9 +34,10 @@ input int GridLevelsPerSide = 3;
 input int GridDistancePoints = 50;
 input double LotIncrement = 0.001;
 input int SideTargetProfitPoints = 50;
+input int StopLossAllPoints = 500; // SL for every order (market & pending), points from its entry price
 
 // ປ່ຽນເປັນ % ຂອງພອດ
-input double DailyProfitTargetPercent = 1.0; 
+input double DailyProfitTargetPercent = 3.0; 
 input double DailyLossLimitPercent = 10.0;   
 
 input int SlippagePoints = 20;
@@ -51,6 +52,20 @@ bool g_stopToday = false;
 double PointValue() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
 int DigitsCount() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
 
+int StopsLevelPoints() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL); }
+double NormPrice(double p) { return NormalizeDouble(p, DigitsCount()); }
+
+bool RespectStopsDistance(const bool isBuy, const double entry, const double slPrice) {
+   const double pt = PointValue();
+   if (pt <= 0) return false;
+   const int lvl = StopsLevelPoints();
+   const double minDist = (double)lvl * pt;
+   if (minDist <= 0) return true;
+   if (slPrice <= 0) return true;
+   if (isBuy) return (entry - slPrice) >= (minDist - 1e-10);
+   return (slPrice - entry) >= (minDist - 1e-10);
+}
+
 double NormalizeLot(double lots) {
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -61,6 +76,59 @@ double NormalizeLot(double lots) {
 void SetTradeContext(int magic) {
    trade.SetExpertMagicNumber(magic);
    trade.SetDeviationInPoints(SlippagePoints);
+}
+
+// Ensure all EA orders (this symbol + magic) have SL = StopLossAllPoints from their own entry
+void EnsureSLForSide(const int magic, const bool isBuy) {
+   if (StopLossAllPoints <= 0) return;
+   const double pt = PointValue();
+   if (pt <= 0) return;
+   const int digits = DigitsCount();
+
+   // Market positions
+   for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong tk = PositionGetTicket(i);
+      if (!PositionSelectByTicket(tk)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if ((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      const int typ = (int)PositionGetInteger(POSITION_TYPE);
+      if (isBuy && typ != POSITION_TYPE_BUY) continue;
+      if (!isBuy && typ != POSITION_TYPE_SELL) continue;
+
+      const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      const double curSL = PositionGetDouble(POSITION_SL);
+      const double curTP = PositionGetDouble(POSITION_TP);
+      const double wantSL = NormalizeDouble(open + (isBuy ? -1.0 : 1.0) * (double)StopLossAllPoints * pt, digits);
+      if (curSL > 0 && MathAbs(curSL - wantSL) < (pt * 0.1)) continue;
+      if (!RespectStopsDistance(isBuy, open, wantSL)) continue;
+
+      SetTradeContext(magic);
+      trade.PositionModify(tk, wantSL, curTP);
+   }
+
+   // Pending orders (grid limits)
+   for (int i = OrdersTotal() - 1; i >= 0; i--) {
+      ulong ot = OrderGetTicket(i);
+      if (!OrderSelect(ot)) continue;
+      if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      if ((int)OrderGetInteger(ORDER_MAGIC) != magic) continue;
+
+      const int otyp = (int)OrderGetInteger(ORDER_TYPE);
+      if (isBuy && otyp != ORDER_TYPE_BUY_LIMIT) continue;
+      if (!isBuy && otyp != ORDER_TYPE_SELL_LIMIT) continue;
+
+      const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+      const double curSL = OrderGetDouble(ORDER_SL);
+      const double curTP = OrderGetDouble(ORDER_TP);
+      const double wantSL = NormalizeDouble(price + (isBuy ? -1.0 : 1.0) * (double)StopLossAllPoints * pt, digits);
+      if (curSL > 0 && MathAbs(curSL - wantSL) < (pt * 0.1)) continue;
+      if (!RespectStopsDistance(isBuy, price, wantSL)) continue;
+
+      SetTradeContext(magic);
+      ENUM_ORDER_TYPE_TIME ttype = (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+      datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+      trade.OrderModify(ot, price, wantSL, curTP, ttype, exp);
+   }
 }
 
 //-------------------- Positions / Orders ----------------------
@@ -90,12 +158,24 @@ void CheckAndOpenInitialTrades() {
 
    if (CountPositionsBySide(MagicBuy) == 0 && CountPendingsBySide(MagicBuy) == 0) {
       SetTradeContext(MagicBuy);
-      trade.Buy(NormalizeLot(InitialLot), _Symbol);
+      double sl = 0.0;
+      if (StopLossAllPoints > 0) {
+         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         sl = NormPrice(ask - (double)StopLossAllPoints * PointValue());
+         if (!RespectStopsDistance(true, ask, sl)) sl = 0.0;
+      }
+      trade.Buy(NormalizeLot(InitialLot), _Symbol, 0.0, sl, 0.0);
    }
    
    if (CountPositionsBySide(MagicSell) == 0 && CountPendingsBySide(MagicSell) == 0) {
       SetTradeContext(MagicSell);
-      trade.Sell(NormalizeLot(InitialLot), _Symbol);
+      double sl = 0.0;
+      if (StopLossAllPoints > 0) {
+         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         sl = NormPrice(bid + (double)StopLossAllPoints * PointValue());
+         if (!RespectStopsDistance(false, bid, sl)) sl = 0.0;
+      }
+      trade.Sell(NormalizeLot(InitialLot), _Symbol, 0.0, sl, 0.0);
    }
 }
 
@@ -126,7 +206,13 @@ void MaintainGrids() {
       double price = lowPrice - (GridDistancePoints * PointValue());
       double lot = InitialLot + (LotIncrement * (bPos + bPend));
       SetTradeContext(MagicBuy);
-      trade.BuyLimit(NormalizeLot(lot), NormalizeDouble(price, DigitsCount()), _Symbol);
+      double p = NormalizeDouble(price, DigitsCount());
+      double sl = 0.0;
+      if (StopLossAllPoints > 0) {
+         sl = NormPrice(p - (double)StopLossAllPoints * PointValue());
+         if (!RespectStopsDistance(true, p, sl)) sl = 0.0;
+      }
+      trade.BuyLimit(NormalizeLot(lot), p, _Symbol, sl, 0.0);
    }
 
    // SELL Grid
@@ -150,7 +236,13 @@ void MaintainGrids() {
       double price = highPrice + (GridDistancePoints * PointValue());
       double lot = InitialLot + (LotIncrement * (sPos + sPend));
       SetTradeContext(MagicSell);
-      trade.SellLimit(NormalizeLot(lot), NormalizeDouble(price, DigitsCount()), _Symbol);
+      double p = NormalizeDouble(price, DigitsCount());
+      double sl = 0.0;
+      if (StopLossAllPoints > 0) {
+         sl = NormPrice(p + (double)StopLossAllPoints * PointValue());
+         if (!RespectStopsDistance(false, p, sl)) sl = 0.0;
+      }
+      trade.SellLimit(NormalizeLot(lot), p, _Symbol, sl, 0.0);
    }
 }
 
@@ -196,6 +288,9 @@ void OnTick() {
    // 3. ຮັກສາອໍເດີ ແລະ Grid
    CheckAndOpenInitialTrades();
    MaintainGrids();
+   // 3.1 Ensure every EA order has SL (market & pending, both sides)
+   EnsureSLForSide(MagicBuy, true);
+   EnsureSLForSide(MagicSell, false);
 
    // 4. Check Side TP (Points)
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
