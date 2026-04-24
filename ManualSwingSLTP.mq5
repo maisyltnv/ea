@@ -13,7 +13,7 @@
 //|  - ເມື່ອພົບ manual SELL: ຕັ້ງ SL ໄປທີ່ swing high ກ່ອນໜ້າ (lookback) |
 //|  - ເມື່ອກຳໄລ >= BreakEvenTriggerPoints:                          |
 //|      SL = entry - BreakEvenPlusPoints, ແລະ TP = entry - TPPoints |
-//|                                                                  |
+//|                                                                   |
 //| ໝາຍເຫດ: EA ຈັດການສະເພາະ manual positions (magic != MagicNumber) |
 //+------------------------------------------------------------------+
 #property strict
