@@ -6,7 +6,7 @@
 
 #property strict
 #property description "SetGridManually: grid; close all on money TP/SL; optional per-order SL/TP in points."
-#property version "1.41"
+#property version "1.40"
 
 #include <Trade/Trade.mqh>
 
@@ -23,16 +23,18 @@ input int GridDistancePoints = //
     500;                      // Distance between each pending order (points)
 input double GridLotSize =
     0.1; // Fixed lot size for all grid orders (no martingale)
+input bool GridUseFirstOrderLotAsBase =
+    true; // If true: pending lots start from first position's lot (then +GridLotStep)
 input double GridLotStep =
     0.01; // If > 0: pending lots = first position lots + GridLotStep*i (i=1..GridCount)
 input int SlippagePoints = 20;  // Slippage (points)
 input int MagicNumber = 111222; // Magic for EA grid orders
-input double SLPoints =
-    4500.0; // (money, not price pts) max total loss: close ALL when sum P/L+swap <= -this
-input double TPPoints =
-    1000.0; // (money, not price pts) take profit: close ALL when sum P/L+swap >= this
+input double SLUsd =
+    1500.0; // Stop Loss (money, account currency): close ALL when floating P/L <= -this
+input double TPUsd =
+    500.0; // Take Profit (money, account currency): close ALL when floating P/L >= this
 input int GridSLPoints =
-    4000; // Optional: per-order Stop Loss (points) from first entry; 0=disable
+    4500; // Optional: per-order Stop Loss (points) from first entry; 0=disable
 input int GridTPPoints =
     1000; // Optional: per-order Take Profit (points) from first entry; 0=disable
 input ENUM_AGG_TP_MODE AggTPGoal =
@@ -220,10 +222,10 @@ void UpdateAggComment() {
           "Pts positive legs only: ", DoubleToString(legPositive, 2), "\n",
           "Basket pts: ", DoubleToString(basket, 2), "\n",
           "Floating $+swap: ", DoubleToString(moneySum, 2), "\n",
-          "TPPoints (money): ", DoubleToString(TPPoints, 2),
-          (TPPoints > 0.0 && moneySum >= TPPoints ? "  >= OK" : ""), "\n",
-          "SLPoints (money): ", DoubleToString(SLPoints, 2),
-          (SLPoints > 0.0 && moneySum <= -SLPoints ? "  <= -OK" : ""));
+          "TPUsd (money): ", DoubleToString(TPUsd, 2),
+          (TPUsd > 0.0 && moneySum >= TPUsd ? "  >= OK" : ""), "\n",
+          "SLUsd (money): ", DoubleToString(SLUsd, 2),
+          (SLUsd > 0.0 && moneySum <= -SLUsd ? "  <= -OK" : ""));
 }
 
 //+------------------------------------------------------------------+
@@ -476,8 +478,8 @@ void PlaceGrid(ulong firstTicket) {
   for (int i = 1; i <= GridCount; i++) {
     double price;
     double lots = GridLotSize;
-    if (GridLotStep > 0.0 && baseLotsFromFirst > 0.0)
-      lots = baseLotsFromFirst + GridLotStep * i;
+    if (GridUseFirstOrderLotAsBase && baseLotsFromFirst > 0.0)
+      lots = baseLotsFromFirst + (GridLotStep > 0.0 ? GridLotStep * i : 0.0);
 
     // Normalize lots to broker step and limits
     if (volStep > 0.0)
@@ -502,9 +504,9 @@ void PlaceGrid(ulong firstTicket) {
   }
   Print("[SetGridManually] Grid placed: ", GridCount, " orders, fixed lot ",
         GridLotSize,
-        (GridLotStep > 0.0 && baseLotsFromFirst > 0.0
-             ? (" (step=" + DoubleToString(GridLotStep, 4) +
-                ", base=" + DoubleToString(baseLotsFromFirst, 4) + ")")
+        (GridUseFirstOrderLotAsBase && baseLotsFromFirst > 0.0
+             ? (" (base=" + DoubleToString(baseLotsFromFirst, 4) +
+                ", step=" + DoubleToString(GridLotStep, 4) + ")")
              : ""),
         "; first order + all grid use same SL/TP (", GridSLPoints, "/",
         GridTPPoints, " pts from first entry).");
@@ -517,7 +519,7 @@ int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
   Print("SetGridManually EA initialized. Symbol=", _Symbol, " Grid=", GridCount,
-        " Dist=", GridDistancePoints, " MoneySL=", SLPoints, " MoneyTP=", TPPoints,
+        " Dist=", GridDistancePoints, " MoneySL=", SLUsd, " MoneyTP=", TPUsd,
         " GridSLpts=", GridSLPoints, " GridTPpts=", GridTPPoints);
   return (INIT_SUCCEEDED);
 }
@@ -571,17 +573,17 @@ void OnTick() {
   if (CountPositionsOnSymbol() > 0) {
     const double moneySum = TotalFloatingProfitMoneyOnSymbol();
 
-    if (TPPoints > 0.0 && moneySum >= TPPoints) {
+    if (TPUsd > 0.0 && moneySum >= TPUsd) {
       Print("[SetGridManually] Money TP reached: floating profit+swap = ",
-            DoubleToString(moneySum, 2), " >= ", DoubleToString(TPPoints, 2),
+            DoubleToString(moneySum, 2), " >= ", DoubleToString(TPUsd, 2),
             ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
     }
 
-    if (SLPoints > 0.0 && moneySum <= -SLPoints) {
+    if (SLUsd > 0.0 && moneySum <= -SLUsd) {
       Print("[SetGridManually] Money SL reached: floating profit+swap = ",
-            DoubleToString(moneySum, 2), " <= -", DoubleToString(SLPoints, 2),
+            DoubleToString(moneySum, 2), " <= -", DoubleToString(SLUsd, 2),
             ". Closing all positions and pending orders.");
       CloseAllPositionsAndOrdersOnSymbol();
       return;
