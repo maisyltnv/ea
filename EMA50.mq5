@@ -35,10 +35,20 @@ input int    BreakEvenOffsetPoints      = 20;     // BE +/- 20 points
 input int    SlippagePoints             = 20;
 input long   MagicNumber                = 505050;
 
+// Re-entry guard after BE stop-out:
+// If position closed by SL with ~0 profit (breakeven), do NOT re-enter immediately
+// while price still on the same side of EMA50. Wait for a full cross and re-cross of EMA50.
+input bool   EnableRearmAfterBreakevenSL = true;
+input double BreakevenAbsProfitMaxMoney = 2.0; // treat |profit| <= this as BE (commission/swap tolerance)
+
 //--------------------------- Globals --------------------------------
 CTrade trade;
 int g_ema50  = INVALID_HANDLE;
 int g_ema200 = INVALID_HANDLE;
+
+// 0 = ready, 1 = waiting first cross (to wrong side), 2 = waiting cross back (to signal side)
+int g_buyRearmStage  = 0;
+int g_sellRearmStage = 0;
 
 //--------------------------- Helpers --------------------------------
 double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
@@ -69,6 +79,12 @@ bool ReadBuf1(const int h, const int shift, double &out) {
 bool GetEmaValues(double &ema50, double &ema200) {
   const int sh = CandleShift();
   return ReadBuf1(g_ema50, sh, ema50) && ReadBuf1(g_ema200, sh, ema200);
+}
+
+double SignalPriceClose() {
+  const int sh = CandleShift();
+  const double c = iClose(_Symbol, SignalTF, sh);
+  return c;
 }
 
 bool HasOpenPosition(ulong &ticketOut, ENUM_POSITION_TYPE &typeOut) {
@@ -191,11 +207,61 @@ void OnDeinit(const int reason) {
   if (g_ema200 != INVALID_HANDLE) IndicatorRelease(g_ema200);
 }
 
+void UpdateRearmStages(const double priceClose, const double ema50) {
+  if (!EnableRearmAfterBreakevenSL) return;
+
+  // BUY re-arm: need Close < EMA50 first, then Close > EMA50
+  if (g_buyRearmStage == 1) {
+    if (priceClose < ema50) g_buyRearmStage = 2;
+  } else if (g_buyRearmStage == 2) {
+    if (priceClose > ema50) g_buyRearmStage = 0;
+  }
+
+  // SELL re-arm: need Close > EMA50 first, then Close < EMA50
+  if (g_sellRearmStage == 1) {
+    if (priceClose > ema50) g_sellRearmStage = 2;
+  } else if (g_sellRearmStage == 2) {
+    if (priceClose < ema50) g_sellRearmStage = 0;
+  }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result) {
+  if (!EnableRearmAfterBreakevenSL) return;
+  if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+  if (trans.deal <= 0) return;
+
+  if (!HistoryDealSelect((ulong)trans.deal)) return;
+  if (HistoryDealGetString((ulong)trans.deal, DEAL_SYMBOL) != _Symbol) return;
+  if ((long)HistoryDealGetInteger((ulong)trans.deal, DEAL_MAGIC) != MagicNumber) return;
+
+  const long entry  = HistoryDealGetInteger((ulong)trans.deal, DEAL_ENTRY);
+  if (entry != DEAL_ENTRY_OUT) return;
+
+  const long reason = HistoryDealGetInteger((ulong)trans.deal, DEAL_REASON);
+  if (reason != DEAL_REASON_SL) return;
+
+  const double profit = HistoryDealGetDouble((ulong)trans.deal, DEAL_PROFIT);
+  if (MathAbs(profit) > BreakevenAbsProfitMaxMoney) return; // not a BE-type stop-out
+
+  // Closing a BUY position is typically a SELL deal, and vice versa.
+  const long dealType = HistoryDealGetInteger((ulong)trans.deal, DEAL_TYPE);
+  if (dealType == DEAL_TYPE_SELL) {
+    g_buyRearmStage = 1;
+  } else if (dealType == DEAL_TYPE_BUY) {
+    g_sellRearmStage = 1;
+  }
+}
+
 void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
 
   double ema50 = 0.0, ema200 = 0.0;
   if (!GetEmaValues(ema50, ema200)) return;
+
+  const double priceClose = SignalPriceClose();
+  if (priceClose > 0.0) UpdateRearmStages(priceClose, ema50);
 
   // Manage existing position
   ulong tk = 0;
@@ -212,11 +278,11 @@ void OnTick() {
   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-  if (ema50 > ema200 && ask > (ema50 + (double)EntryOffsetPoints * pt)) {
+  if (g_buyRearmStage == 0 && ema50 > ema200 && ask > (ema50 + (double)EntryOffsetPoints * pt)) {
     OpenBuy();
     return;
   }
-  if (ema50 < ema200 && bid < (ema50 - (double)EntryOffsetPoints * pt)) {
+  if (g_sellRearmStage == 0 && ema50 < ema200 && bid < (ema50 - (double)EntryOffsetPoints * pt)) {
     OpenSell();
     return;
   }
