@@ -1,46 +1,48 @@
 //+------------------------------------------------------------------+
 //|                                          BBStochGridBasketEA.mq5 |
-//| Bollinger (Typical) + Stochastic grid basket EA — M1 only      |
+//| Bollinger (Typical) + Stochastic grid basket EA — M1 only        |
+//| Modified: allow BUY and SELL cycles at the same time             |
 //+------------------------------------------------------------------+
 #property copyright "EA"
 #property link      ""
-#property version   "1.00"
+#property version   "1.01"
 
 #include <Trade/Trade.mqh>
 
 //--- Inputs (strategy parameters)
-input double LotSize                  = 0.01;
-input int    GridCount                = 30;
-input int    GridDistancePoints       = 500;
-input int    BasketTakeProfitPoints   = 1000; // total profit points; 0 = basket TP off
-input int    BasketStopLossPoints     = 0;    // total loss points; 0 = basket SL off
-input long   MagicNumber              = 123456;
-input int    MaxSpreadPoints          = 0;
+input double LotSize                   = 0.01;
+input int    GridCount                 = 30;
+input int    GridDistancePoints        = 500;
+input int    BasketTakeProfitPoints    = 1000; // total profit points; 0 = basket TP off
+input int    BasketStopLossPoints      = 0;    // total loss points; 0 = basket SL off
+input long   MagicNumber               = 123456;
+input int    MaxSpreadPoints           = 0;
 input int    StochasticOverboughtLevel = 90;
-input int    StochasticOversoldLevel  = 10;
-input int    BollingerPeriod          = 56;
-input double BollingerDeviation       = 2.0;
-input int    StochasticK              = 65;
-input int    StochasticD              = 15;
-input int    StochasticSlowing        = 8;
-input bool   AllowNewCycle            = true;
+input int    StochasticOversoldLevel   = 10;
+input int    BollingerPeriod           = 56;
+input double BollingerDeviation        = 2.0;
+input int    StochasticK               = 65;
+input int    StochasticD               = 15;
+input int    StochasticSlowing         = 8;
+input bool   AllowNewCycle             = true;
 
 //--- Optional execution
-input int    SlippagePoints           = 30;
+input int    SlippagePoints            = 30;
 
 //--- Globals
 CTrade       g_trade;
-int          g_hBands   = INVALID_HANDLE;
-int          g_hStoch  = INVALID_HANDLE;
+int          g_hBands      = INVALID_HANDLE;
+int          g_hStoch      = INVALID_HANDLE;
 datetime     g_lastBarTime = 0;
 
 // Last copied values (shift 0) for signals and logging
-// Stochastic: buffer 0 = %K (main), buffer 1 = %D (signal) — entries use %D only
-double g_stochD = 0.0;
-double g_bbUpper   = 0.0;
-double g_bbLower   = 0.0;
-double g_barHigh0  = 0.0;
-double g_barLow0   = 0.0;
+// Stochastic: buffer 0 = %K (main), buffer 1 = %D (signal)
+// Current EA uses %D only, same as original code
+double g_stochD   = 0.0;
+double g_bbUpper  = 0.0;
+double g_bbLower  = 0.0;
+double g_barHigh0 = 0.0;
+double g_barLow0  = 0.0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization: create indicators on chart symbol / M1    |
@@ -73,9 +75,11 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
      }
 
-   // 0 so the first closed/open bar after attach can fire IsNewBar() (not stuck on init-time bar)
    g_lastBarTime = 0;
+
    Print("BBStochGridBasketEA initialized on ", _Symbol, " M1. Magic=", MagicNumber);
+   Print("Modified version: BUY and SELL sides can run at the same time if signals are valid.");
+
    return(INIT_SUCCEEDED);
   }
 
@@ -84,17 +88,22 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
   {
-   if(g_hBands != INVALID_HANDLE)  IndicatorRelease(g_hBands);
-   if(g_hStoch != INVALID_HANDLE) IndicatorRelease(g_hStoch);
+   if(g_hBands != INVALID_HANDLE)
+      IndicatorRelease(g_hBands);
+
+   if(g_hStoch != INVALID_HANDLE)
+      IndicatorRelease(g_hStoch);
+
    Print("BBStochGridBasketEA deinit. reason=", reason);
   }
 
 //+------------------------------------------------------------------+
-//| Choose a supported filling mode for the symbol                 |
+//| Choose a supported filling mode for the symbol                   |
 //+------------------------------------------------------------------+
 void SetTradeFillingBySymbol()
   {
    const long fm = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+
    if((fm & SYMBOL_FILLING_IOC) != 0)
       g_trade.SetTypeFilling(ORDER_FILLING_IOC);
    else if((fm & SYMBOL_FILLING_FOK) != 0)
@@ -104,7 +113,7 @@ void SetTradeFillingBySymbol()
   }
 
 //+------------------------------------------------------------------+
-//| Point size (handles 3- and 5-digit quotes consistently)         |
+//| Point size                                                       |
 //+------------------------------------------------------------------+
 double PointSize()
   {
@@ -117,30 +126,36 @@ double PointSize()
 int CurrentSpreadPoints()
   {
    const double pt = PointSize();
+
    if(pt <= 0.0)
       return(0);
+
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
    return((int)MathRound((ask - bid) / pt));
   }
 
 //+------------------------------------------------------------------+
-//| Decimal places implied by SYMBOL_VOLUME_STEP (no SYMBOL_VOLUME_  |
-//| DIGITS in standard MQL5 enum)                                    |
+//| Decimal places implied by SYMBOL_VOLUME_STEP                     |
 //+------------------------------------------------------------------+
 int LotDigitsFromStep(const double stepLot)
   {
    if(stepLot <= 0.0)
       return(2);
+
    if(stepLot >= 1.0 - 1e-12)
       return(0);
-   int   digits = 0;
-   double x      = stepLot;
+
+   int digits = 0;
+   double x   = stepLot;
+
    while(digits < 8 && x + 1e-12 < 1.0)
      {
       x *= 10.0;
       digits++;
      }
+
    return(digits);
   }
 
@@ -152,18 +167,22 @@ double NormalizeLotVolume(const double lotsIn)
    double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-   const int lotDigits = LotDigitsFromStep(stepLot);
 
    if(stepLot <= 0.0)
       stepLot = 0.01;
 
+   const int lotDigits = LotDigitsFromStep(stepLot);
+
    double lots = lotsIn;
+
    if(lots < minLot)
       lots = minLot;
+
    if(lots > maxLot)
       lots = maxLot;
 
    lots = MathFloor(lots / stepLot) * stepLot;
+
    if(lots < minLot)
       lots = minLot;
 
@@ -179,18 +198,21 @@ double NormalizePrice(const double price)
   }
 
 //+------------------------------------------------------------------+
-//| Returns true once per new M1 bar (signal / entry timing)       |
+//| Returns true once per new M1 bar                                 |
 //+------------------------------------------------------------------+
 bool IsNewBar()
   {
    const datetime t = iTime(_Symbol, PERIOD_M1, 0);
+
    if(t == 0)
       return(false);
+
    if(t != g_lastBarTime)
      {
       g_lastBarTime = t;
       return(true);
      }
+
    return(false);
   }
 
@@ -199,40 +221,47 @@ bool IsNewBar()
 //+------------------------------------------------------------------+
 bool RefreshBarData()
   {
-   double stD[1], up[1], lo[1];
-   // iBands: buffer 1 = upper band, buffer 2 = lower band (buffer 0 = middle)
+   double stD[1];
+   double up[1];
+   double lo[1];
+
+   // Stochastic buffer 1 = %D signal line
    if(CopyBuffer(g_hStoch, 1, 0, 1, stD) != 1)
      {
       Print("BBStochGridBasketEA: CopyBuffer Stochastic signal line (%D) failed. err=", GetLastError());
       return(false);
      }
+
+   // iBands: buffer 1 = upper band, buffer 2 = lower band
    if(CopyBuffer(g_hBands, 1, 0, 1, up) != 1)
      {
       Print("BBStochGridBasketEA: CopyBuffer BB upper failed. err=", GetLastError());
       return(false);
      }
+
    if(CopyBuffer(g_hBands, 2, 0, 1, lo) != 1)
      {
       Print("BBStochGridBasketEA: CopyBuffer BB lower failed. err=", GetLastError());
       return(false);
      }
 
-   g_stochD = stD[0];
-   g_bbUpper   = up[0];
-   g_bbLower   = lo[0];
-   g_barHigh0  = iHigh(_Symbol, PERIOD_M1, 0);
-   g_barLow0   = iLow(_Symbol, PERIOD_M1, 0);
+   g_stochD   = stD[0];
+   g_bbUpper  = up[0];
+   g_bbLower  = lo[0];
+   g_barHigh0 = iHigh(_Symbol, PERIOD_M1, 0);
+   g_barLow0  = iLow(_Symbol, PERIOD_M1, 0);
 
    Print("Indicators [bar0]: StochD=", DoubleToString(g_stochD, 2),
          " BB_Upper=", DoubleToString(g_bbUpper, _Digits),
          " BB_Lower=", DoubleToString(g_bbLower, _Digits),
          " High0=", DoubleToString(g_barHigh0, _Digits),
          " Low0=", DoubleToString(g_barLow0, _Digits));
+
    return(true);
   }
 
 //+------------------------------------------------------------------+
-//| Sell setup: stoch overbought + price touches/crosses upper BB   |
+//| Sell setup: stoch overbought + price touches/crosses upper BB    |
 //+------------------------------------------------------------------+
 bool CheckSellSignal()
   {
@@ -240,7 +269,9 @@ bool CheckSellSignal()
       return(false);
 
    const double highPrev = iHigh(_Symbol, PERIOD_M1, 1);
+
    double upPrev[1];
+
    if(CopyBuffer(g_hBands, 1, 1, 1, upPrev) != 1)
       return(false);
 
@@ -250,12 +281,13 @@ bool CheckSellSignal()
    if(touchOrCross)
       Print("ENTRY SIGNAL: SELL setup — StochD=", DoubleToString(g_stochD, 2),
             " > ", StochasticOverboughtLevel,
-            "; touch/cross upper BB (High0 vs Upper0).");
+            "; touch/cross upper BB.");
+
    return(touchOrCross);
   }
 
 //+------------------------------------------------------------------+
-//| Buy setup: stoch oversold + price touches/crosses lower BB     |
+//| Buy setup: stoch oversold + price touches/crosses lower BB       |
 //+------------------------------------------------------------------+
 bool CheckBuySignal()
   {
@@ -263,7 +295,9 @@ bool CheckBuySignal()
       return(false);
 
    const double lowPrev = iLow(_Symbol, PERIOD_M1, 1);
+
    double loPrev[1];
+
    if(CopyBuffer(g_hBands, 2, 1, 1, loPrev) != 1)
       return(false);
 
@@ -273,122 +307,145 @@ bool CheckBuySignal()
    if(touchOrCross)
       Print("ENTRY SIGNAL: BUY setup — StochD=", DoubleToString(g_stochD, 2),
             " < ", StochasticOversoldLevel,
-            "; touch/cross lower BB (Low0 vs Lower0).");
+            "; touch/cross lower BB.");
+
    return(touchOrCross);
   }
 
 //+------------------------------------------------------------------+
-//| Place Sell Limit grid above anchor price                        |
+//| Place Sell Limit grid above anchor price                         |
 //+------------------------------------------------------------------+
 void PlaceSellGrid(const double anchorPrice)
   {
-   const double pt    = PointSize();
-   const double step  = (double)GridDistancePoints * pt;
-   const double lot   = NormalizeLotVolume(LotSize);
+   const double pt   = PointSize();
+   const double step = (double)GridDistancePoints * pt;
+   const double lot  = NormalizeLotVolume(LotSize);
 
    for(int i = 1; i <= GridCount; i++)
      {
       const double price = NormalizePrice(anchorPrice + step * (double)i);
 
-      if(!g_trade.SellLimit(lot, price, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0.0, "BBStoch SellLimit"))
+      if(!g_trade.SellLimit(lot, price, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "BBStoch SellLimit"))
         {
-         Print("FAILED pending SellLimit #", i, " price=", price,
-               " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+         Print("FAILED pending SellLimit #", i,
+               " price=", DoubleToString(price, _Digits),
+               " retcode=", g_trade.ResultRetcode(),
+               " desc=", g_trade.ResultRetcodeDescription());
         }
       else
         {
-         Print("Pending SellLimit #", i, " placed ticket=", g_trade.ResultOrder(),
-               " price=", DoubleToString(price, _Digits), " lot=", DoubleToString(lot, 2));
+         Print("Pending SellLimit #", i,
+               " placed ticket=", g_trade.ResultOrder(),
+               " price=", DoubleToString(price, _Digits),
+               " lot=", DoubleToString(lot, 2));
         }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Place Buy Limit grid below anchor price                         |
+//| Place Buy Limit grid below anchor price                          |
 //+------------------------------------------------------------------+
 void PlaceBuyGrid(const double anchorPrice)
   {
-   const double pt    = PointSize();
-   const double step  = (double)GridDistancePoints * pt;
-   const double lot   = NormalizeLotVolume(LotSize);
+   const double pt   = PointSize();
+   const double step = (double)GridDistancePoints * pt;
+   const double lot  = NormalizeLotVolume(LotSize);
 
    for(int i = 1; i <= GridCount; i++)
      {
       const double price = NormalizePrice(anchorPrice - step * (double)i);
 
-      if(!g_trade.BuyLimit(lot, price, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0.0, "BBStoch BuyLimit"))
+      if(!g_trade.BuyLimit(lot, price, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "BBStoch BuyLimit"))
         {
-         Print("FAILED pending BuyLimit #", i, " price=", price,
-               " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+         Print("FAILED pending BuyLimit #", i,
+               " price=", DoubleToString(price, _Digits),
+               " retcode=", g_trade.ResultRetcode(),
+               " desc=", g_trade.ResultRetcodeDescription());
         }
       else
         {
-         Print("Pending BuyLimit #", i, " placed ticket=", g_trade.ResultOrder(),
-               " price=", DoubleToString(price, _Digits), " lot=", DoubleToString(lot, 2));
+         Print("Pending BuyLimit #", i,
+               " placed ticket=", g_trade.ResultOrder(),
+               " price=", DoubleToString(price, _Digits),
+               " lot=", DoubleToString(lot, 2));
         }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Open market SELL + sell-limit grid (one cycle)                  |
+//| Open market SELL + sell-limit grid                               |
 //+------------------------------------------------------------------+
 void OpenSellCycle()
   {
    const double lot = NormalizeLotVolume(LotSize);
+
    if(!g_trade.Sell(lot, _Symbol, 0.0, 0.0, 0.0, "BBStoch market SELL"))
      {
-      Print("FAILED market SELL lot=", lot,
-            " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+      Print("FAILED market SELL lot=", DoubleToString(lot, 2),
+            " retcode=", g_trade.ResultRetcode(),
+            " desc=", g_trade.ResultRetcodeDescription());
       return;
      }
 
-   Print("Market SELL opened ticket=", g_trade.ResultDeal(), " lot=", DoubleToString(lot, 2));
+   Print("Market SELL opened ticket=", g_trade.ResultDeal(),
+         " lot=", DoubleToString(lot, 2));
 
-   // Anchor grid from price after fill (per spec: distances from current price)
    const double anchor = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
    PlaceSellGrid(anchor);
   }
 
 //+------------------------------------------------------------------+
-//| Open market BUY + buy-limit grid (one cycle)                    |
+//| Open market BUY + buy-limit grid                                 |
 //+------------------------------------------------------------------+
 void OpenBuyCycle()
   {
    const double lot = NormalizeLotVolume(LotSize);
+
    if(!g_trade.Buy(lot, _Symbol, 0.0, 0.0, 0.0, "BBStoch market BUY"))
      {
-      Print("FAILED market BUY lot=", lot,
-            " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+      Print("FAILED market BUY lot=", DoubleToString(lot, 2),
+            " retcode=", g_trade.ResultRetcode(),
+            " desc=", g_trade.ResultRetcodeDescription());
       return;
      }
 
-   Print("Market BUY opened ticket=", g_trade.ResultDeal(), " lot=", DoubleToString(lot, 2));
+   Print("Market BUY opened ticket=", g_trade.ResultDeal(),
+         " lot=", DoubleToString(lot, 2));
 
    const double anchor = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
    PlaceBuyGrid(anchor);
   }
 
 //+------------------------------------------------------------------+
-//| Sum floating profit in points for all EA positions on symbol   |
+//| Sum floating profit in points for all EA positions on symbol     |
+//| This is still total basket: BUY + SELL together                  |
 //+------------------------------------------------------------------+
 double GetBasketProfitPoints()
   {
    double totalPts = 0.0;
+
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    const double pt  = PointSize();
+
    if(pt <= 0.0)
       return(0.0);
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       const ulong ticket = PositionGetTicket(i);
+
       if(ticket == 0)
          continue;
+
       if(!PositionSelectByTicket(ticket))
          continue;
+
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
+
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
 
@@ -400,59 +457,76 @@ double GetBasketProfitPoints()
       else if(type == POSITION_TYPE_SELL)
          totalPts += (openPrice - ask) / pt;
      }
+
    return(totalPts);
   }
 
 //+------------------------------------------------------------------+
-//| Close all EA market positions and remove EA pending orders      |
+//| Close all EA market positions and remove EA pending orders       |
+//| This closes/deletes both BUY and SELL sides                      |
 //+------------------------------------------------------------------+
 void CloseAllPositionsAndDeletePendings()
   {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       const ulong ticket = PositionGetTicket(i);
+
       if(ticket == 0)
          continue;
+
       if(!PositionSelectByTicket(ticket))
          continue;
+
       if(PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
+
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
 
       if(!g_trade.PositionClose(ticket))
         {
          Print("FAILED PositionClose ticket=", ticket,
-               " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+               " retcode=", g_trade.ResultRetcode(),
+               " desc=", g_trade.ResultRetcodeDescription());
         }
       else
+        {
          Print("Position closed ticket=", ticket);
+        }
      }
 
    for(int j = OrdersTotal() - 1; j >= 0; j--)
      {
       const ulong ot = OrderGetTicket(j);
+
       if(ot == 0)
          continue;
+
       if(!OrderSelect(ot))
          continue;
+
       if(OrderGetString(ORDER_SYMBOL) != _Symbol)
          continue;
+
       if(OrderGetInteger(ORDER_MAGIC) != MagicNumber)
          continue;
 
       if(!g_trade.OrderDelete(ot))
         {
          Print("FAILED OrderDelete ticket=", ot,
-               " retcode=", g_trade.ResultRetcode(), " desc=", g_trade.ResultRetcodeDescription());
+               " retcode=", g_trade.ResultRetcode(),
+               " desc=", g_trade.ResultRetcodeDescription());
         }
       else
+        {
          Print("Pending order deleted ticket=", ot);
+        }
      }
   }
 
 //+------------------------------------------------------------------+
-//| Count positions + pendings for this symbol and magic           |
+//| Count all positions + pendings for this symbol and magic         |
+//| Kept for reference / future use                                  |
 //+------------------------------------------------------------------+
 int CountOpenPositionsAndPendingOrders()
   {
@@ -461,10 +535,13 @@ int CountOpenPositionsAndPendingOrders()
    for(int i = 0; i < PositionsTotal(); i++)
      {
       const ulong ticket = PositionGetTicket(i);
+
       if(ticket == 0)
          continue;
+
       if(!PositionSelectByTicket(ticket))
          continue;
+
       if(PositionGetString(POSITION_SYMBOL) == _Symbol &&
          PositionGetInteger(POSITION_MAGIC) == MagicNumber)
          count++;
@@ -473,19 +550,96 @@ int CountOpenPositionsAndPendingOrders()
    for(int j = 0; j < OrdersTotal(); j++)
      {
       const ulong ot = OrderGetTicket(j);
+
       if(ot == 0)
          continue;
+
       if(!OrderSelect(ot))
          continue;
+
       if(OrderGetString(ORDER_SYMBOL) == _Symbol &&
          OrderGetInteger(ORDER_MAGIC) == MagicNumber)
          count++;
      }
+
    return(count);
   }
 
 //+------------------------------------------------------------------+
-//| Expert tick: basket management + new-bar entries               |
+//| Count positions + pending orders by direction for this EA        |
+//| isBuySide = true  -> BUY positions and BUY pending orders        |
+//| isBuySide = false -> SELL positions and SELL pending orders      |
+//+------------------------------------------------------------------+
+int CountSidePositionsAndPendingOrders(const bool isBuySide)
+  {
+   int count = 0;
+
+   // Count market positions
+   for(int i = 0; i < PositionsTotal(); i++)
+     {
+      const ulong ticket = PositionGetTicket(i);
+
+      if(ticket == 0)
+         continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+         continue;
+
+      const long posType = PositionGetInteger(POSITION_TYPE);
+
+      if(isBuySide && posType == POSITION_TYPE_BUY)
+         count++;
+
+      if(!isBuySide && posType == POSITION_TYPE_SELL)
+         count++;
+     }
+
+   // Count pending orders
+   for(int j = 0; j < OrdersTotal(); j++)
+     {
+      const ulong ot = OrderGetTicket(j);
+
+      if(ot == 0)
+         continue;
+
+      if(!OrderSelect(ot))
+         continue;
+
+      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
+         continue;
+
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+         continue;
+
+      const long orderType = OrderGetInteger(ORDER_TYPE);
+
+      if(isBuySide)
+        {
+         if(orderType == ORDER_TYPE_BUY_LIMIT ||
+            orderType == ORDER_TYPE_BUY_STOP ||
+            orderType == ORDER_TYPE_BUY_STOP_LIMIT)
+            count++;
+        }
+      else
+        {
+         if(orderType == ORDER_TYPE_SELL_LIMIT ||
+            orderType == ORDER_TYPE_SELL_STOP ||
+            orderType == ORDER_TYPE_SELL_STOP_LIMIT)
+            count++;
+        }
+     }
+
+   return(count);
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick: basket management + new-bar entries                 |
 //+------------------------------------------------------------------+
 void OnTick()
   {
@@ -494,12 +648,14 @@ void OnTick()
 
    g_trade.SetExpertMagicNumber((ulong)MagicNumber);
 
+   // Basket TP/SL still manages all EA positions together
    const double basketPts = GetBasketProfitPoints();
 
    if(BasketTakeProfitPoints > 0 && basketPts >= (double)BasketTakeProfitPoints)
      {
       Print("BASKET TAKE PROFIT: total points=", DoubleToString(basketPts, 2),
-            " >= ", BasketTakeProfitPoints, " — closing all and deleting pendings.");
+            " >= ", BasketTakeProfitPoints,
+            " — closing all positions and deleting all pending orders.");
       CloseAllPositionsAndDeletePendings();
       return;
      }
@@ -507,7 +663,8 @@ void OnTick()
    if(BasketStopLossPoints > 0 && basketPts <= -(double)BasketStopLossPoints)
      {
       Print("BASKET STOP LOSS: total points=", DoubleToString(basketPts, 2),
-            " <= -", BasketStopLossPoints, " — closing all and deleting pendings.");
+            " <= -", BasketStopLossPoints,
+            " — closing all positions and deleting all pending orders.");
       CloseAllPositionsAndDeletePendings();
       return;
      }
@@ -515,35 +672,66 @@ void OnTick()
    if(!AllowNewCycle)
       return;
 
-   if(CountOpenPositionsAndPendingOrders() > 0)
-      return;
-
    if(MaxSpreadPoints > 0 && CurrentSpreadPoints() > MaxSpreadPoints)
      {
       static datetime s_lastSpreadLogBar = 0;
       const datetime  barT = iTime(_Symbol, PERIOD_M1, 0);
+
       if(barT != 0 && barT != s_lastSpreadLogBar)
         {
          s_lastSpreadLogBar = barT;
-         Print("Spread filter: ", CurrentSpreadPoints(), " points > MaxSpreadPoints ", MaxSpreadPoints,
+
+         Print("Spread filter: ", CurrentSpreadPoints(),
+               " points > MaxSpreadPoints ", MaxSpreadPoints,
                " — skip new cycle this bar.");
         }
+
       return;
      }
 
+   // Entry only once per new M1 bar
    if(!IsNewBar())
       return;
 
-   if(BarsCalculated(g_hBands) < BollingerPeriod + 5 || BarsCalculated(g_hStoch) < StochasticK + StochasticD + StochasticSlowing + 5)
+   if(BarsCalculated(g_hBands) < BollingerPeriod + 5 ||
+      BarsCalculated(g_hStoch) < StochasticK + StochasticD + StochasticSlowing + 5)
       return;
 
    if(!RefreshBarData())
       return;
 
-   if(CheckSellSignal())
-      OpenSellCycle();
-   else if(CheckBuySignal())
-      OpenBuyCycle();
+   const bool sellSignal = CheckSellSignal();
+   const bool buySignal  = CheckBuySignal();
+
+   // Allow SELL side even if BUY side already exists
+   // But do not open duplicate SELL cycle if SELL side already exists
+   if(sellSignal)
+     {
+      if(CountSidePositionsAndPendingOrders(false) == 0)
+        {
+         Print("SELL signal valid and no existing SELL cycle. Opening SELL cycle.");
+         OpenSellCycle();
+        }
+      else
+        {
+         Print("SELL signal valid, but SELL cycle already exists. Skip duplicate SELL cycle.");
+        }
+     }
+
+   // Allow BUY side even if SELL side already exists
+   // But do not open duplicate BUY cycle if BUY side already exists
+   if(buySignal)
+     {
+      if(CountSidePositionsAndPendingOrders(true) == 0)
+        {
+         Print("BUY signal valid and no existing BUY cycle. Opening BUY cycle.");
+         OpenBuyCycle();
+        }
+      else
+        {
+         Print("BUY signal valid, but BUY cycle already exists. Skip duplicate BUY cycle.");
+        }
+     }
   }
 
 //+------------------------------------------------------------------+
