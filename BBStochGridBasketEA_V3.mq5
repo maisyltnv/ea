@@ -3,11 +3,10 @@
 //| Bollinger (Typical) + Stochastic grid basket EA — M1 only        |
 //| Modified: allow BUY and SELL cycles at the same time             |
 //| v1.02: replenish BuyLimit/SellLimit count to stay >= GridCount   |
-//| v1.03: basket TP closes BUY or SELL side only (per-side sum)     |
 //+------------------------------------------------------------------+
 #property copyright "EA"
 #property link      ""
-#property version   "1.03"
+#property version   "1.02"
 
 #include <Trade/Trade.mqh>
 
@@ -15,7 +14,7 @@
 input double LotSize                   = 0.01;
 input int    GridCount                 = 5;
 input int    GridDistancePoints        = 500;
-input int    BasketTakeProfitPoints    = 300; // per-side profit points (BUY sum / SELL sum); 0 = off
+input int    BasketTakeProfitPoints    = 300; // total profit points; 0 = basket TP off
 input int    BasketStopLossPoints      = 0;    // total loss points; 0 = basket SL off
 input long   MagicNumber               = 123456;
 input int    MaxSpreadPoints           = 0;
@@ -555,50 +554,8 @@ void ReplenishGridsIfNeeded()
   }
 
 //+------------------------------------------------------------------+
-//| Sum floating profit in points for BUY or SELL positions only     |
-//+------------------------------------------------------------------+
-double GetSideBasketProfitPoints(const bool isBuySide)
-  {
-   double totalPts = 0.0;
-
-   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   const double pt  = PointSize();
-
-   if(pt <= 0.0)
-      return(0.0);
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      const ulong ticket = PositionGetTicket(i);
-
-      if(ticket == 0)
-         continue;
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-         continue;
-
-      const double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      const long   type      = PositionGetInteger(POSITION_TYPE);
-
-      if(isBuySide && type == POSITION_TYPE_BUY)
-         totalPts += (bid - openPrice) / pt;
-      else if(!isBuySide && type == POSITION_TYPE_SELL)
-         totalPts += (openPrice - ask) / pt;
-     }
-
-   return(totalPts);
-  }
-
-//+------------------------------------------------------------------+
 //| Sum floating profit in points for all EA positions on symbol     |
-//| (BUY + SELL) — used for combined basket stop loss                |
+//| This is still total basket: BUY + SELL together                  |
 //+------------------------------------------------------------------+
 double GetBasketProfitPoints()
   {
@@ -637,89 +594,6 @@ double GetBasketProfitPoints()
      }
 
    return(totalPts);
-  }
-
-//+------------------------------------------------------------------+
-//| Close market positions + delete pendings for one side only        |
-//+------------------------------------------------------------------+
-void CloseSidePositionsAndDeletePendings(const bool isBuySide)
-  {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      const ulong ticket = PositionGetTicket(i);
-
-      if(ticket == 0)
-         continue;
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-         continue;
-
-      const long posType = PositionGetInteger(POSITION_TYPE);
-
-      if(isBuySide && posType != POSITION_TYPE_BUY)
-         continue;
-
-      if(!isBuySide && posType != POSITION_TYPE_SELL)
-         continue;
-
-      if(!g_trade.PositionClose(ticket))
-        {
-         Print("FAILED PositionClose (side) ticket=", ticket,
-               " retcode=", g_trade.ResultRetcode(),
-               " desc=", g_trade.ResultRetcodeDescription());
-        }
-      else
-         Print("Position closed (side) ticket=", ticket);
-     }
-
-   for(int j = OrdersTotal() - 1; j >= 0; j--)
-     {
-      const ulong ot = OrderGetTicket(j);
-
-      if(ot == 0)
-         continue;
-
-      if(!OrderSelect(ot))
-         continue;
-
-      if(OrderGetString(ORDER_SYMBOL) != _Symbol)
-         continue;
-
-      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber)
-         continue;
-
-      const long orderType = OrderGetInteger(ORDER_TYPE);
-
-      if(isBuySide)
-        {
-         if(orderType != ORDER_TYPE_BUY_LIMIT &&
-            orderType != ORDER_TYPE_BUY_STOP &&
-            orderType != ORDER_TYPE_BUY_STOP_LIMIT)
-            continue;
-        }
-      else
-        {
-         if(orderType != ORDER_TYPE_SELL_LIMIT &&
-            orderType != ORDER_TYPE_SELL_STOP &&
-            orderType != ORDER_TYPE_SELL_STOP_LIMIT)
-            continue;
-        }
-
-      if(!g_trade.OrderDelete(ot))
-        {
-         Print("FAILED OrderDelete (side) ticket=", ot,
-               " retcode=", g_trade.ResultRetcode(),
-               " desc=", g_trade.ResultRetcodeDescription());
-        }
-      else
-         Print("Pending order deleted (side) ticket=", ot);
-     }
   }
 
 //+------------------------------------------------------------------+
@@ -909,31 +783,17 @@ void OnTick()
 
    g_trade.SetExpertMagicNumber((ulong)MagicNumber);
 
-   // Basket TP: each side independently (sum of floating points on that side only)
-   if(BasketTakeProfitPoints > 0)
-     {
-      const double buyPts  = GetSideBasketProfitPoints(true);
-      const double sellPts = GetSideBasketProfitPoints(false);
-
-      if(buyPts >= (double)BasketTakeProfitPoints)
-        {
-         Print("BASKET TAKE PROFIT (BUY side): points=", DoubleToString(buyPts, 2),
-               " >= ", BasketTakeProfitPoints,
-               " — closing BUY positions and BUY pendings only.");
-         CloseSidePositionsAndDeletePendings(true);
-        }
-
-      if(sellPts >= (double)BasketTakeProfitPoints)
-        {
-         Print("BASKET TAKE PROFIT (SELL side): points=", DoubleToString(sellPts, 2),
-               " >= ", BasketTakeProfitPoints,
-               " — closing SELL positions and SELL pendings only.");
-         CloseSidePositionsAndDeletePendings(false);
-        }
-     }
-
-   // Basket SL: still combined total (all positions)
+   // Basket TP/SL still manages all EA positions together
    const double basketPts = GetBasketProfitPoints();
+
+   if(BasketTakeProfitPoints > 0 && basketPts >= (double)BasketTakeProfitPoints)
+     {
+      Print("BASKET TAKE PROFIT: total points=", DoubleToString(basketPts, 2),
+            " >= ", BasketTakeProfitPoints,
+            " — closing all positions and deleting all pending orders.");
+      CloseAllPositionsAndDeletePendings();
+      return;
+     }
 
    if(BasketStopLossPoints > 0 && basketPts <= -(double)BasketStopLossPoints)
      {
