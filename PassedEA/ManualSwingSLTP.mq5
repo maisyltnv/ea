@@ -15,11 +15,9 @@
 //|      SL = entry - BreakEvenPlusPoints, ແລະ TP = entry - TPPoints |
 //|                                                                   |
 //| ໝາຍເຫດ: EA ຈັດການສະເພາະ manual positions (magic != MagicNumber) |
-//| Bugfix v1.01: ລ້າງລາຍການ ticket ທີ່ປິດແລ້ວອອກຈາກ g_states — ບໍ່ດັ່ນຫຼັງມີ ~200 |
-//|   ອໍເດີເກົ່າ EnsureState ຈະເຕັມ ແລະ ອໍເດີໃໝ່ຈະບໍ່ຖືກຕັ້ງ SL ອີກ.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.01"
+#property version   "1.00"
 #property description "Manage manual trades: set SL to prior swing; at +X pts move SL to BE+Y and set TP."
 
 #include <Trade/Trade.mqh>
@@ -71,22 +69,6 @@ int EnsureState(const ulong ticket) {
   g_states[g_statesCount].beTpSet = false;
   g_statesCount++;
   return g_statesCount - 1;
-}
-
-// Remove ticket states for positions that no longer exist (or are not our manual symbol).
-// Without this, g_states fills to 200 and EnsureState() returns -1 — new trades get no SL.
-void PruneStaleStates() {
-  int write = 0;
-  for (int i = 0; i < g_statesCount; i++) {
-    const ulong tk = g_states[i].ticket;
-    if (tk == 0) continue;
-    if (!PositionSelectByTicket(tk)) continue; // closed -> drop
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
-    if (mag == MagicNumber) continue; // EA-managed, drop from manual table
-    g_states[write++] = g_states[i];
-  }
-  g_statesCount = write;
 }
 
 bool RespectStopsDistanceFromMarket(const bool isBuy, const double sl, const double tp) {
@@ -177,14 +159,7 @@ void ManageManualPosition(const ulong tk) {
   const double curTP = PositionGetDouble(POSITION_TP);
 
   int st = EnsureState(tk);
-  if (st < 0) {
-    static datetime s_lastFullWarn = 0;
-    if (TimeCurrent() - s_lastFullWarn > 3600) {
-      Print("[ManualSwingSLTP] state table full (200 open manuals?). ticket=", tk, " — cannot track SL.");
-      s_lastFullWarn = TimeCurrent();
-    }
-    return;
-  }
+  if (st < 0) return;
 
   const double pt = Pt();
   if (pt <= 0.0) return;
@@ -293,8 +268,6 @@ int OnInit() {
 
 void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
-
-  PruneStaleStates();
 
   // Manage all manual positions on this symbol
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
