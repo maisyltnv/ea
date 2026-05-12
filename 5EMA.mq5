@@ -1,11 +1,23 @@
 //+------------------------------------------------------------------+
 //|                                                     5EMA.mq5     |
-//|  Buy-only: M1 trend start entry with EMA stack + MACD filter.    |
-//|  Entry: Price > EMA14 > EMA26 > EMA50 and MACD(main) > threshold |
-//|  SL: fixed points. When profit >= TrailStartPoints:              |
-//|      trail SL along EMA50 (updates upward only).                 |
-//|  Re-entry rule: after a completed cycle, EA must see price go     |
-//|      below EMA50 (reset) before allowing a new entry.            |
+//| ຄຳອະທິບາຍ (ລາວ)                                                   |
+//| - ເປັນ EA ຊື້ຢ່າງດຽວ (Buy): ບໍ່ເປີດ Sell.                         |
+//| - ໃຊ້ແທ່ງເວລາ SignalTF (ຄ່າເລີ່ມ M1); ອ່ານ EMA14/26/50 ແລະ MACD |
+//|   ຈາກແທ່ງປິດກ່ອນ ຫຼື ແທ່ງປັດຈຸບັນຕາມ UseClosedCandle.            |
+//| - ເງື່ອນໄຂເຂົ້າ: ລາຄາສັນຍານ > EMA14 > EMA26 > EMA50              |
+//|   ແລະ ຄ່າ MACD ເສັ້ນຫຼັກ (main) > MacdMainMin.                   |
+//| - ຫຼັງເປີດ Buy ສຳເລັດແລ້ວ ຈະບໍ່ເປີດອໍເດີໃໝ່ຈົນກວ່າລາຄາສັນຍານ      |
+//|   ຈະຕ້ອງຕ່ຳກວ່າ EMA50 ອີກຄັ້ງ (reset) ຈຶ່ງອະນຸຍາດເຂົ້າໃໝ່.      |
+//| - SL: ຫ່າງຈາກລາຄາເປີດຕາມ SLPoints (ຈຸດ); ບໍ່ຕັ້ງ TP.             |
+//| - ເມື່ອກຳໄລລອຍ ≥ TrailStartPoints: ຍ້າຍ SL ໄປທີ່ EMA50            |
+//|   (ຍ້າຍໃຫ້ສູງຂຶ້ນເທົ່ານັ້ນ, ບໍ່ຄ່າຍລົງ) ແລະ ເຄົາລະບົບຫ່າງຂັ້ນຕ່ຳ.   |
+//| - ມີໄດ້ແຕ່ຕຳແຫນ່ງ Buy ໜຶ່ງອັນຕໍ່ symbol/magic ນີ້.               |
+//|                                                                   |
+//| English (summary)                                                 |
+//|  Buy-only: EMA stack + MACD filter on SignalTF.                  |
+//|  Entry: close/price > EMA14 > EMA26 > EMA50, MACD main > min.    |
+//|  SL: fixed points; no TP. Profit >= TrailStartPoints: trail SL  |
+//|  to EMA50 (up only). After a buy, re-arm only after price<EMA50.|
 //+------------------------------------------------------------------+
 #property strict
 #property version "1.00"
