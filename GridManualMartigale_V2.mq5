@@ -1,22 +1,53 @@
 //+------------------------------------------------------------------+
-//| SetGridManually EA                                               |
+//| GridManualMartigale EA  v1.42                                    |
 //|                                                                  |
-//| ການເຮັດວຽກຫຼັກ:                                             |
-//| 1) ຜູ້ໃຊ້ກົດເປີດ BUY ຫຼື SELL ໄມ້ທຳອິດດ້ວຍມື.          |
-//| 2) EA ຈະວາງ pending grid orders ຕາມ GridCount / GridDistance. |
-//| 3) ຫຼັງຈາກ grid ຖືກວາງແລ້ວ, EA ຈະ lock ບໍ່ໃຫ້ຜູ້ໃຊ້       |
-//|    ເປີດໄມ້ໃໝ່ດ້ວຍມືເພີ່ມອີກ ເພື່ອກັນ overtrade.        |
-//| 4) ຖ້າມີ manual position ຫຼື manual pending order ໃໝ່ເຂົ້າມາ |
-//|    ຫຼັງຈາກ grid active, EA ຈະປິດ/ລຶບໃຫ້ອັດຕະໂນມັດ.       |
-//| 5) ເມື່ອທຸກ positions ແລະ EA pending orders ຖືກປິດ/ລຶບໝົດ, |
-//|    EA ຈະ reset lock ເພື່ອໃຫ້ເລີ່ມ cycle ໃໝ່ໄດ້.            |
+//| EA ນີ້ເຮັດຫຍັງ?                                             |
+//|   ຊ່ວຍຜູ້ໃຊ້ວາງ grid ອັດຕະໂນມັດຫຼັງຈາກກົດໄມ້ທຳອິດ |
+//|   ດ້ວຍມື, ພ້ອມບໍລິການປິດທັງໝົດໃນ 2 ລະດັບ ແລະ         |
+//|   ປ້ອງກັນການ overtrade ດ້ວຍ lock ອັດຕະໂນມັດ.            |
 //|                                                                  |
-//| ເປີດ/ປິດ feature ກັນ overtrade ໄດ້ດ້ວຍ:                    |
-//|   BlockManualAddsAfterGrid = true/false                          |
+//| ການເຮັດວຽກຫຼັກ (flow):                                     |
+//|   1) ຜູ້ໃຊ້ກົດເປີດ BUY ຫຼື SELL ໄມ້ທຳອິດດ້ວຍມື.       |
+//|   2) EA ກວດເຫັນວ່າມີ position ໜຶ່ງ ແລະ ຍັງບໍ່ມີ            |
+//|      pending ຂອງ EA ມາກ່ອນ → ວາງ pending grid              |
+//|      ຕາມ GridCount / GridDistancePoints.                         |
+//|   3) Lot ຂອງແຕ່ລະ leg:                                       |
+//|        - ຖ້າ GridLotStep > 0  → martingale-step ແບບເພີ່ມ:    |
+//|          lots(i) = ໄມ້ທຳອິດ + GridLotStep * i                |
+//|        - ຖ້າ GridLotStep <= 0 → ໃຊ້ fixed GridLotSize.        |
+//|   4) SL/TP ມີ 2 ກົນໄກຄຽງຂ້າງກັນ:                          |
+//|      ● BASKET (USD ລວມທຸກໄມ້): TotalUSDSL / TotalUSDTP    |
+//|        ປິດທັງໝົດ (positions + pendings) ເມື່ອ              |
+//|        sum(floating P/L + swap) ຮອດເງື່ອນໄຂ.                |
+//|      ● PER-ORDER (price points): GridSLPoints / GridTPPoints |
+//|        broker ຖື SL/TP ໃຫ້ແຕ່ລະໄມ້ໃນລະດັບລາຄາດຽວ        |
+//|        ທີ່ຄຳນວນຈາກ entry ຂອງໄມ້ທຳອິດ.                    |
+//|        (ຖ້າໄມ້ໃດໂດນ TP ທີ່ broker → ປິດທັງ basket)         |
+//|   5) Anti-overtrade lock:                                       |
+//|      - ຫຼັງ grid ຖືກວາງ, EA ບໍ່ໃຫ້ເປີດໄມ້ໃໝ່ດ້ວຍມື.    |
+//|      - ມີ manual position ໃໝ່ → ປິດທັນທີ.                 |
+//|      - ມີ manual pending ໃໝ່ → ລຶບທັນທີ.                  |
+//|      - ໄມ້ທຳອິດ ແລະ ໄມ້ grid (magic ຂອງ EA) ບໍ່ໂດນແຕະ.  |
+//|   6) Reset cycle:                                              |
+//|      ເມື່ອບໍ່ມີ position ແລະ ບໍ່ມີ EA pending ເຫລືອ        |
+//|      (ປິດດ້ວຍ TP/SL ຫຼື ປິດດ້ວຍມືໝົດ) → EA ປົດ lock      |
+//|      ໃຫ້ສາມາດເລີ່ມໄມ້ໃໝ່ໄດ້ອີກ.                          |
+//|                                                                  |
+//| Inputs ສຳຄັນ:                                                 |
+//|   GridCount, GridDistancePoints, GridLotSize, GridLotStep    |
+//|   TotalUSDSL, TotalUSDTP      → close-all ດ້ວຍເງິນລວມ        |
+//|   GridSLPoints, GridTPPoints  → broker SL/TP ຕໍ່ໄມ້ (0=ປິດ) |
+//|   BlockManualAddsAfterGrid    → ເປີດ/ປິດ anti-overtrade     |
+//|   MagicNumber                 → ໃຊ້ແຍກໄມ້ EA ກັບ ໄມ້ manual |
+//|                                                                  |
+//| ໝາຍເຫດ:                                                       |
+//|   - EA ເຮັດວຽກສະເພາະ symbol ທີ່ attach ຢູ່.                 |
+//|   - ຖ້າຜູ້ໃຊ້ປິດ first position ດ້ວຍມື ແຕ່ pending grid   |
+//|     ຍັງເຫລືອ, lock ຍັງເປີດຢູ່ຈົນກວ່າຈະລຶບ pending ໝົດ.  |
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: grid; close all on basket USD TP/SL; optional per-order SL/TP in points; anti-overtrade lock."
+#property description "GridManualMartigale: auto grid after manual first order; basket USD SL/TP + per-order SL/TP; anti-overtrade lock."
 #property version "1.42"
 
 #include <Trade/Trade.mqh>
