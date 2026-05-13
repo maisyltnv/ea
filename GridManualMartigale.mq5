@@ -10,14 +10,18 @@
 //|    ຫຼັງຈາກ grid active, EA ຈະປິດ/ລຶບໃຫ້ອັດຕະໂນມັດ.       |
 //| 5) ເມື່ອທຸກ positions ແລະ EA pending orders ຖືກປິດ/ລຶບໝົດ, |
 //|    EA ຈະ reset lock ເພື່ອໃຫ້ເລີ່ມ cycle ໃໝ່ໄດ້.            |
+//| 6) Sync SL/TP: ຖ້າມີຫລາຍກວ່າ 1 position ຢູ່ → EA sync       |
+//|    SL/TP ຂອງທຸກໄມ້ໃຫ້ຄືກັນກັບໄມ້ທຳອິດ. ແຕ່ຖ້າເຫລືອ    |
+//|    ພຽງ 1 position ເທົ່ານັ້ນ → EA ບໍ່ sync, ຜູ້ໃຊ້ສາມາດ    |
+//|    ຍ້າຍ SL/TP ຂອງໄມ້ນັ້ນຕາມໃຈໄດ້.                         |
 //|                                                                  |
 //| ເປີດ/ປິດ feature ກັນ overtrade ໄດ້ດ້ວຍ:                    |
 //|   BlockManualAddsAfterGrid = true/false                          |
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: grid; close all on basket USD TP/SL; optional per-order SL/TP in points; anti-overtrade lock."
-#property version "1.42"
+#property description "SetGridManually: grid; close all on basket USD TP/SL; optional per-order SL/TP in points; anti-overtrade lock; last-leg SL/TP free."
+#property version "1.43"
 
 #include <Trade/Trade.mqh>
 
@@ -325,10 +329,13 @@ bool GetReferencePosition(double &entryPrice, ENUM_POSITION_TYPE &type) {
 
 //+------------------------------------------------------------------+
 //| Sync SL/TP on all positions to same levels as first (earliest) order |
+//|                                                                  |
+//| ຂໍ້ຍົກເວັ້ນ: ຖ້າເຫລືອພຽງ 1 position ເທົ່ານັ້ນ → ບໍ່ sync, |
+//| ປ່ອຍໃຫ້ຜູ້ໃຊ້ຍ້າຍ SL/TP ຂອງໄມ້ນັ້ນຕາມໃຈໄດ້.            |
 //+------------------------------------------------------------------+
 void SyncSLTPToFirstOrder() {
-  if (CountPositionsOnSymbol() <= 0)
-    return;
+  if (CountPositionsOnSymbol() <= 1)
+    return; // 0 = nothing to do; 1 = let user freely move SL/TP of last leg
   if (GridSLPoints <= 0 && GridTPPoints <= 0)
     return;
 
