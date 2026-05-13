@@ -1,10 +1,11 @@
 //+------------------------------------------------------------------+
 //|                                          BBStochGridBasketEA.mq5 |
-//| Bollinger (Typical) + Stochastic grid basket EA — M1 only      |
+//| Bollinger (Typical) + Stochastic grid basket EA — signals on M1 |
+//| Chart can be any period; indicators & new-bar logic use M1 data. |
 //+------------------------------------------------------------------+
 #property copyright "EA"
 #property link      ""
-#property version   "1.00"
+#property version   "1.01"
 
 #include <Trade/Trade.mqh>
 
@@ -12,7 +13,7 @@
 input double LotSize                  = 0.01;
 input int    GridCount                = 30;
 input int    GridDistancePoints       = 500;
-input int    BasketTakeProfitPoints   = 1000; // total profit points; 0 = basket TP off
+input int    BasketTakeProfitPoints   = 300; // total profit points; 0 = basket TP off
 input int    BasketStopLossPoints     = 0;    // total loss points; 0 = basket SL off
 input long   MagicNumber              = 123456;
 input int    MaxSpreadPoints          = 0;
@@ -47,11 +48,12 @@ double g_barLow0   = 0.0;
 //+------------------------------------------------------------------+
 int OnInit()
   {
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_SELECT))
+      SymbolSelect(_Symbol, true);
+
    if(_Period != PERIOD_M1)
-     {
-      Print("BBStochGridBasketEA: attach this EA only on M1. Current period=", EnumToString(_Period));
-      return(INIT_FAILED);
-     }
+      Print("BBStochGridBasketEA: chart is ", EnumToString(_Period),
+            " — EA stays attached; signals still use M1 (see indicator handles).");
 
    g_trade.SetExpertMagicNumber((ulong)MagicNumber);
    g_trade.SetDeviationInPoints(SlippagePoints);
@@ -489,9 +491,6 @@ int CountOpenPositionsAndPendingOrders()
 //+------------------------------------------------------------------+
 void OnTick()
   {
-   if(_Period != PERIOD_M1)
-      return;
-
    g_trade.SetExpertMagicNumber((ulong)MagicNumber);
 
    const double basketPts = GetBasketProfitPoints();
