@@ -19,14 +19,10 @@
 //|   ອໍເດີເກົ່າ EnsureState ຈະເຕັມ ແລະ ອໍເດີໃໝ່ຈະບໍ່ຖືກຕັ້ງ SL ອີກ.        |
 //| v1.02–1.03: ຫຼັງຕັ້ງ swing SL ວາງ pending grid ຈຳນວນ GridExtraPendingLegs, |
 //|   ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL (ບໍ່ລະເມີດ SL).              |
-//| v1.04: Anti-overtrade — ຫຼັງ grid ຖືກວາງແລ້ວ, EA ຈະບໍ່ໃຫ້ກົດ    |
-//|   ໄມ້ໃໝ່ດ້ວຍມືອີກ. ໄມ້ manual ໃໝ່ໃດໆທີ່ບໍ່ແມ່ນ parent ຂອງ    |
-//|   grid ຈະຖືກປິດທັນທີ; pending orders ນອກ EA ຈະຖືກລຶບ. ເປີດ/  |
-//|   ປິດດ້ວຍ input BlockManualAddsAfterGrid.                       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.04"
-#property description "Manual swing SL/TP + optional equal-spaced pending grid legs toward SL + anti-overtrade lock."
+#property version   "1.03"
+#property description "Manual swing SL/TP + optional equal-spaced pending grid legs toward SL."
 
 #include <Trade/Trade.mqh>
 
@@ -47,8 +43,6 @@ input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
-
-input bool   BlockManualAddsAfterGrid = true;   // Anti-overtrade: after grid is placed, auto-close any new manual position / pending
 
 //--------------------------- Globals --------------------------------
 CTrade trade;
@@ -329,93 +323,6 @@ void TryPlaceGridPendings(const ulong parentTk, const ENUM_POSITION_TYPE typ,
   g_states[st].gridDone = true;
 }
 
-//--------------------------- Anti-overtrade --------------------------
-// ດຶງລາຍການ parent tickets (manual position ທີ່ trigger grid) ຈາກ
-// comment "MSSLTP<parentTicket>" ຂອງ pending orders ແລະ EA-managed
-// positions ທີ່ trigger ມາຈາກ grid pendings.
-int CollectActiveGridParents(ulong &parents[]) {
-  int n = 0;
-  const int cap = ArraySize(parents);
-  const string prefix = "MSSLTP";
-  const int prefLen = (int)StringLen(prefix);
-
-  // 1) pending grid orders
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (ot == 0 || !OrderSelect(ot)) continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-    if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
-    const string c = OrderGetString(ORDER_COMMENT);
-    if (StringFind(c, prefix) != 0) continue;
-    const long ptk = (long)StringToInteger(StringSubstr(c, prefLen));
-    if (ptk <= 0) continue;
-    bool dup = false;
-    for (int k = 0; k < n; k++) if (parents[k] == (ulong)ptk) { dup = true; break; }
-    if (!dup && n < cap) parents[n++] = (ulong)ptk;
-  }
-
-  // 2) EA-managed positions (those triggered from grid pendings inherit comment)
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-    if ((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-    const string c = PositionGetString(POSITION_COMMENT);
-    if (StringFind(c, prefix) != 0) continue;
-    const long ptk = (long)StringToInteger(StringSubstr(c, prefLen));
-    if (ptk <= 0) continue;
-    bool dup = false;
-    for (int k = 0; k < n; k++) if (parents[k] == (ulong)ptk) { dup = true; break; }
-    if (!dup && n < cap) parents[n++] = (ulong)ptk;
-  }
-
-  return n;
-}
-
-// ຫລັງ grid active (ມີ parent ໃດໜຶ່ງ): ປິດ manual position ໃໝ່ໃດໆທີ່
-// ບໍ່ແມ່ນ parent, ແລະ ລຶບ pending order ໃໝ່ໃດໆທີ່ບໍ່ແມ່ນຂອງ EA.
-void BlockManualAdditionalTrades() {
-  if (!BlockManualAddsAfterGrid) return;
-
-  ulong parents[200];
-  const int n = CollectActiveGridParents(parents);
-  if (n <= 0) return; // ບໍ່ມີ grid active -> ໄມ້ທຳອິດຍັງເປີດໄດ້
-
-  trade.SetExpertMagicNumber(0); // allow closing manual (non-EA) tickets
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  // 1) Close any extra manual position (not a grid parent, not EA-managed)
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
-    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-    const long magic = (long)PositionGetInteger(POSITION_MAGIC);
-    if (magic == MagicNumber) continue; // EA-managed grid fill -> keep
-
-    bool isParent = false;
-    for (int k = 0; k < n; k++) if (parents[k] == tk) { isParent = true; break; }
-    if (isParent) continue;
-
-    Print("[ManualSwingSLTP] Anti-overtrade: closing extra MANUAL position ticket=", tk);
-    if (!trade.PositionClose(tk))
-      Print("[ManualSwingSLTP] Anti-overtrade: PositionClose failed ticket=", tk,
-            " err=", GetLastError());
-  }
-
-  // 2) Delete any non-EA pending orders on this symbol
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (ot == 0 || !OrderSelect(ot)) continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-    if ((long)OrderGetInteger(ORDER_MAGIC) == MagicNumber) continue; // EA pending -> keep
-
-    Print("[ManualSwingSLTP] Anti-overtrade: deleting extra MANUAL pending order=", ot);
-    if (!trade.OrderDelete(ot))
-      Print("[ManualSwingSLTP] Anti-overtrade: OrderDelete failed order=", ot,
-            " err=", GetLastError());
-  }
-}
-
 //--------------------------- Core logic ------------------------------
 void ManageManualPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return;
@@ -569,9 +476,5 @@ void OnTick() {
     if (tk == 0) continue;
     ManageManualPosition(tk);
   }
-
-  // Anti-overtrade: ຫລັງ grid ຖືກວາງ (ມີ parent ໃດໜຶ່ງ active),
-  // ປິດ/ລຶບ manual orders ໃໝ່ໃດໆທີ່ user ກົດເພີ່ມເຂົ້າມາ.
-  BlockManualAdditionalTrades();
 }
 
