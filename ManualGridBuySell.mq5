@@ -5,15 +5,15 @@
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "SetGridManually: per-side grid + per-side TargetProfitUSD close."
-#property version "1.04"
+#property description "SetGridManually: one EA grid stack per BUY/SELL side; per-side TP; combined SL."
+#property version "1.05"
 
 #include <Trade/Trade.mqh>
 
 //--- inputs
-input int GridCount = 4; // Number of pending orders in grid
+input int GridCount = 8; // Number of pending orders in grid
 input int GridDistancePoints =
-    1000; // Distance between each pending order (points)
+    500; // Distance between each pending order (points)
 input double GridLotSize =
     0.01; // Fixed lot size for all grid orders (no martingale)
 input int SlippagePoints = 20;  // Slippage (points)
@@ -165,6 +165,41 @@ bool HasOpenPositionOfTypeOnSymbol(const ENUM_POSITION_TYPE posType) {
 }
 
 //+------------------------------------------------------------------+
+//| Classify pending order type as BUY-market-side vs SELL-market-side |
+//+------------------------------------------------------------------+
+bool EAPendingOrderTypeIsBuySide(const ENUM_ORDER_TYPE otype) {
+  return (otype == ORDER_TYPE_BUY_LIMIT || otype == ORDER_TYPE_BUY_STOP ||
+          otype == ORDER_TYPE_BUY_STOP_LIMIT);
+}
+
+bool EAPendingOrderTypeIsSellSide(const ENUM_ORDER_TYPE otype) {
+  return (otype == ORDER_TYPE_SELL_LIMIT || otype == ORDER_TYPE_SELL_STOP ||
+          otype == ORDER_TYPE_SELL_STOP_LIMIT);
+}
+
+//+------------------------------------------------------------------+
+//| Count this EA's pending orders on one market side (same symbol)    |
+//+------------------------------------------------------------------+
+int CountEAPendingOrdersForMarketSide(const bool buySide) {
+  int n = 0;
+  for (int i = OrdersTotal() - 1; i >= 0; i--) {
+    ulong ot = OrderGetTicket(i);
+    if (ot == 0 || !OrderSelect(ot))
+      continue;
+    if (OrderGetString(ORDER_SYMBOL) != _Symbol)
+      continue;
+    if ((int)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+      continue;
+    ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    if (buySide && EAPendingOrderTypeIsBuySide(otype))
+      n++;
+    else if (!buySide && EAPendingOrderTypeIsSellSide(otype))
+      n++;
+  }
+  return n;
+}
+
+//+------------------------------------------------------------------+
 //| Delete EA (magic) pending orders on one market side (buy vs sell) |
 //+------------------------------------------------------------------+
 void DeleteEAPendingOrdersForMarketSide(const bool closeBuySide) {
@@ -177,15 +212,9 @@ void DeleteEAPendingOrdersForMarketSide(const bool closeBuySide) {
     if ((int)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
       continue;
     ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    bool isBuyPending =
-        (otype == ORDER_TYPE_BUY_LIMIT || otype == ORDER_TYPE_BUY_STOP ||
-         otype == ORDER_TYPE_BUY_STOP_LIMIT);
-    bool isSellPending =
-        (otype == ORDER_TYPE_SELL_LIMIT || otype == ORDER_TYPE_SELL_STOP ||
-         otype == ORDER_TYPE_SELL_STOP_LIMIT);
-    if (closeBuySide && !isBuyPending)
+    if (closeBuySide && !EAPendingOrderTypeIsBuySide(otype))
       continue;
-    if (!closeBuySide && !isSellPending)
+    if (!closeBuySide && !EAPendingOrderTypeIsSellSide(otype))
       continue;
     if (!trade.OrderDelete(ot))
       Print("[SetGridManually] Failed to delete pending ", ot, " Error=",
@@ -682,8 +711,10 @@ void OnTick() {
   // Save current SL/TP so next tick we can detect user changes
   UpdatePrevPositionState();
 
-  // Place a grid for every open position on this symbol that has not yet
-  // received a grid (BUY and SELL can both have grids at the same time).
+  // Place a grid for each open position that has not had a grid yet, but only
+  // one active grid stack per market side: if EA already has BUY (or SELL)
+  // pendings on this symbol, skip placing another full grid for additional
+  // positions of that side until those pendings are gone (filled/deleted).
   PruneGridDoneTickets();
 
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -697,6 +728,17 @@ void OnTick() {
 
     if (GridAlreadyPlacedForTicket(ticket))
       continue;
+
+    const ENUM_POSITION_TYPE pt =
+        (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    const bool isBuy = (pt == POSITION_TYPE_BUY);
+    if (isBuy) {
+      if (CountEAPendingOrdersForMarketSide(true) > 0)
+        continue;
+    } else {
+      if (CountEAPendingOrdersForMarketSide(false) > 0)
+        continue;
+    }
 
     PlaceGrid(ticket);
     MarkGridPlacedForTicket(ticket);
