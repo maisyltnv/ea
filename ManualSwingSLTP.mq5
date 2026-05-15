@@ -30,10 +30,12 @@
 //|   (restore if dragged/removed) to reduce over-trading.                      |
 //| v1.10: Grid pendings use the same SL as parent (first) position; freeze      |
 //|   pending SL while parent is in swing phase (same as ProtectSLFreezeBeforeBE). |
+//| v1.11: BE — ບໍ່ຕັ້ງ beTpSet ຄ້າງວົງ swing ເມື່ອກຳໄລຮອດ trigger ແລ້ວ; ຖ້າ BE+ ຕິດ |
+//|   stops level ຈະຂຍັບ SL ໃຫ້ໃກ້ຕະຫຼາດທີ່ broker ຍອມຮັບ (BreakEvenRelaxSLToStopsLevel). |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.10"
-#property description "Swing SL/TP + grid SL=parent + pending SL freeze + bundle + sync TP."
+#property version   "1.11"
+#property description "Swing SL/TP + BE broker-safe SL + grid freeze + bundle + sync TP."
 
 #include <Trade/Trade.mqh>
 
@@ -46,6 +48,7 @@ input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: B
 
 input int    BreakEvenTriggerPoints   = 150;    // when profit >= this, set BE+ and TP
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
+input bool   BreakEvenRelaxSLToStopsLevel = true; // if ideal BE+ SL too close to bid/ask, use tightest allowed SL
 input int    TPPoints                = 1000;   // TP distance from entry (points)
 
 input int    SlippagePoints           = 20;
@@ -163,6 +166,26 @@ bool RespectStopDistanceSLOnly(const bool isBuy, const double sl) {
 
 bool RespectStopDistanceTPOnly(const bool isBuy, const double tp) {
   return RespectStopsDistanceFromMarket(isBuy, 0.0, tp);
+}
+
+// If ideal break-even SL violates stops level, snap to the tightest valid SL
+// (BUY: just below bid; SELL: just above ask) so BE can still run on tight brokers.
+double AdjustBreakevenSlForStopsLevel(const bool isBuy, const double idealSl,
+                                      const int digits) {
+  const double pt = Pt();
+  if (pt <= 0.0) return NormalizeDouble(idealSl, digits);
+  if (RespectStopDistanceSLOnly(isBuy, idealSl))
+    return NormalizeDouble(idealSl, digits);
+  const int lvl = (int)MathMax(StopsLevelPoints(), 1);
+  const double minDist = (double)lvl * pt;
+  const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+  const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  double adj;
+  if (isBuy)
+    adj = bid - minDist - pt;
+  else
+    adj = ask + minDist + pt;
+  return NormalizeDouble(adj, digits);
 }
 
 // When TP is edited on a manual position, apply the same TP to every same-side
@@ -987,23 +1010,41 @@ void ManageManualPosition(const ulong tk) {
 
       const bool isBuy = (typ == POSITION_TYPE_BUY);
 
-      // If SL target is not acceptable now, keep current SL (still try to set TP).
+      // If ideal BE+ SL is inside stops level, relax toward broker limit (not back to swing).
       if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL)) {
-        wantSL = workSL; // may be 0, that's ok
+        if (BreakEvenRelaxSLToStopsLevel)
+          wantSL = AdjustBreakevenSlForStopsLevel(isBuy, wantSL, digits);
+        if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL))
+          wantSL = workSL; // may be 0, that's ok
+      }
+      // Re-apply "do not loosen" after broker snap (BUY: never move SL down vs chosen floor).
+      if (workSL > 0.0) {
+        if (typ == POSITION_TYPE_BUY && wantSL > 0.0 && wantSL <= workSL) wantSL = workSL;
+        if (typ == POSITION_TYPE_SELL && wantSL > 0.0 && wantSL >= workSL) wantSL = workSL;
       }
       // If TP target not acceptable now, keep current TP (or 0).
       if (wantTP > 0.0 && !RespectStopDistanceTPOnly(isBuy, wantTP)) {
         wantTP = workTP; // may be 0
       }
 
-      // If nothing to change, still mark as done (avoids repeated calls)
+      // If nothing to change, mark done — except when profit already hit trigger but SL
+      // is still the frozen swing price (would wrongly skip BE forever).
       const double nCurSL = (workSL > 0.0) ? NormalizeDouble(workSL, digits) : 0.0;
       const double nCurTP = (workTP > 0.0) ? NormalizeDouble(workTP, digits) : 0.0;
       const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
       const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
 
       if (nCurSL == nWantSL && nCurTP == nWantTP) {
-        g_states[st].beTpSet = true;
+        const bool userKeptSlForBe =
+            (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL);
+        const double bound = g_states[st].protectBoundSL;
+        const double epsSwing = pt * 10.0;
+        const bool stillOnSwingFreeze =
+            (!userKeptSlForBe && bound > 0.0 && workSL > 0.0 &&
+             MathAbs(NormalizeDouble(workSL, digits) - NormalizeDouble(bound, digits)) <=
+                 epsSwing);
+        if (!(pPts >= (double)BreakEvenTriggerPoints && stillOnSwingFreeze))
+          g_states[st].beTpSet = true;
         return;
       }
 
