@@ -6,19 +6,19 @@
 
 #property strict
 #property description "SetGridManually: one manual position -> add grid of pending orders (no TP)."
-#property version "1.00"
+#property version "1.01"
 
 #include <Trade/Trade.mqh>
 
 //--- inputs
-input int GridCount = 20;        // Number of pending orders in grid
+input int GridCount = 30;        // Number of pending orders in grid
 input int GridDistancePoints =   //
-    200;                         // Distance between each pending order (points)
-input double GridLotStep = 0.05; // Increment lot size for each grid order
+    500;                         // Distance between each pending order (points)
+input double GridLotStep = 0.001; // Increment lot size for each grid order
 input int SlippagePoints = 20;   // Slippage (points)
 input int MagicNumber = 111222;  // Magic for EA grid orders
-input int CloseAllProfitPoints =
-    500; // If price moves this many points in favor, close all positions/orders
+input double CloseAllProfitUSD =
+    500.0; // Combined floating profit+swap on this side (account currency, e.g. USD) >= this → close side
 
 //--- trade object
 CTrade trade;
@@ -209,23 +209,16 @@ void CloseSidePositionsAndOrders(ENUM_POSITION_TYPE side) {
 }
 
 //+------------------------------------------------------------------+
-//| Check if net profit in points for ONE side >= CloseAllProfitPts  |
+//| Close side when combined floating profit+swap >= CloseAllProfitUSD |
 //+------------------------------------------------------------------+
 void CheckCloseSideOnProfit(ENUM_POSITION_TYPE side) {
-  if (CloseAllProfitPoints <= 0)
+  if (CloseAllProfitUSD <= 0.0)
     return;
 
   if (CountPositionsByType(side) <= 0)
     return;
 
-  double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-  if (point <= 0)
-    return;
-
-  double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-  double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-  double totalPoints = 0.0;
+  double totalMoney = 0.0;
 
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     ulong t = PositionGetTicket(i);
@@ -236,21 +229,15 @@ void CheckCloseSideOnProfit(ENUM_POSITION_TYPE side) {
     if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side)
       continue;
 
-    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
-    double posPoints = 0.0;
-
-    if (side == POSITION_TYPE_BUY)
-      posPoints = (bid - entry) / point;
-    else
-      posPoints = (entry - ask) / point;
-
-    totalPoints += posPoints;
+    totalMoney += PositionGetDouble(POSITION_PROFIT);
+    totalMoney += PositionGetDouble(POSITION_SWAP);
   }
 
-  if (totalPoints >= CloseAllProfitPoints) {
-    Print("[SetGridManually] CloseAllProfitPoints reached for ",
+  if (totalMoney >= CloseAllProfitUSD) {
+    Print("[SetGridManually] CloseAllProfitUSD reached for ",
           (side == POSITION_TYPE_BUY ? "BUY" : "SELL"),
-          " side. Total points = ", totalPoints, " >= ", CloseAllProfitPoints,
+          " side. Total profit+swap = ", DoubleToString(totalMoney, 2),
+          " >= ", DoubleToString(CloseAllProfitUSD, 2),
           ". Closing all positions and orders for that side on symbol ", _Symbol);
     CloseSidePositionsAndOrders(side);
   }
@@ -374,7 +361,7 @@ int OnInit() {
 //| Expert tick                                                       |
 //+------------------------------------------------------------------+
 void OnTick() {
-  // First, check if each side (BUY / SELL) has enough profit to close its grid
+  // First, check if each side (BUY / SELL) has enough profit (USD) to close its grid
   CheckCloseSideOnProfit(POSITION_TYPE_BUY);
   CheckCloseSideOnProfit(POSITION_TYPE_SELL);
 
