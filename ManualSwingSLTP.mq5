@@ -19,10 +19,16 @@
 //|   ອໍເດີເກົ່າ EnsureState ຈະເຕັມ ແລະ ອໍເດີໃໝ່ຈະບໍ່ຖືກຕັ້ງ SL ອີກ.        |
 //| v1.02–1.03: ຫຼັງຕັ້ງ swing SL ວາງ pending grid ຈຳນວນ GridExtraPendingLegs, |
 //|   ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL (ບໍ່ລະເມີດ SL).              |
+//| v1.05: Optional max bundle per side = legs at first SL lock + grid legs; |
+//|   excess market positions closed (newest first) — broker cannot block clicks. |
+//| v1.06: Protect SL — clamp widen beyond EA swing/ref; restore SL if removed; |
+//|   optional: do not override user-moved SL in the break-even step (TP still). |
+//| v1.07: When you change TP on a manual position, copy that TP to all same-side |
+//|   bundle legs (manual + MSSLTP fills) and EA grid pendings on this symbol.   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.03"
-#property description "Manual swing SL/TP + optional equal-spaced pending grid legs toward SL."
+#property version   "1.07"
+#property description "Swing SL/TP + grid + bundle cap + SL protect + sync TP from manual."
 
 #include <Trade/Trade.mqh>
 
@@ -44,18 +50,40 @@ input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
+input bool   EnforceInitialBundleMax  = true;   // cap BUY/SELL "legs" to count-at-first-SL + grid legs (see header)
+input int    BundleMaxExtraLegsCap    = 0;      // 0 = use GridExtraPendingLegs at lock time; else override max add
+
+input bool   ProtectSLClampNoWiden     = true;  // BUY: SL cannot go below EA swing/ref; SELL: cannot go above
+input bool   ProtectSLRestoreIfRemoved = true;  // if SL cleared while swing phase, restore committed SL
+input bool   ProtectBEDontOverrideUserSL = true; // if SL moved after EA set swing, BE step changes TP only (keeps your SL)
+
+input bool   SyncTPWhenManualChanges = true;  // change TP on one manual → set same TP on same-side bundle + EA pendings
+input bool   SyncTPDeletionToAll     = false; // if true, clearing TP on one manual clears TP on same-side bundle
+
 //--------------------------- Globals --------------------------------
 CTrade trade;
 
+// Locked once per "wave" when first swing SL succeeds for that direction (0 = not locked).
+int g_maxBuyBundlePositions = 0;
+int g_maxSellBundlePositions = 0;
+
 struct TicketState {
   ulong ticket;
-  bool  swingSLSet;
-  bool  beTpSet;
-  bool  gridDone;
+  bool swingSLSet;
+  bool beTpSet;
+  bool gridDone;
+  double protectBoundSL;
+  double lastEaWrittenSL;
+  bool userTouchedSL;
 };
 
 TicketState g_states[200];
 int g_statesCount = 0;
+
+#define MAX_TP_MANUAL_TRACK 200
+ulong g_tpManTickets[MAX_TP_MANUAL_TRACK];
+double g_tpManPrevTP[MAX_TP_MANUAL_TRACK];
+int g_tpManSnapshotCount = 0;
 
 //--------------------------- Helpers --------------------------------
 double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
@@ -78,6 +106,9 @@ int EnsureState(const ulong ticket) {
   g_states[g_statesCount].swingSLSet = false;
   g_states[g_statesCount].beTpSet = false;
   g_states[g_statesCount].gridDone = false;
+  g_states[g_statesCount].protectBoundSL = 0.0;
+  g_states[g_statesCount].lastEaWrittenSL = 0.0;
+  g_states[g_statesCount].userTouchedSL = false;
   g_statesCount++;
   return g_statesCount - 1;
 }
@@ -123,6 +154,144 @@ bool RespectStopDistanceSLOnly(const bool isBuy, const double sl) {
 
 bool RespectStopDistanceTPOnly(const bool isBuy, const double tp) {
   return RespectStopsDistanceFromMarket(isBuy, 0.0, tp);
+}
+
+// When TP is edited on a manual position, apply the same TP to every same-side
+// market leg (manual + this EA's MSSLTP grid fills) and EA pending limits/stops.
+void SyncTPFromManualUserChange() {
+  if (!SyncTPWhenManualChanges) return;
+  const double pt = Pt();
+  if (pt <= 0.0) return;
+  const double eps = pt / 2.0;
+  const int digits = DigitsCount();
+
+  ulong curTk[MAX_TP_MANUAL_TRACK];
+  double curTP[MAX_TP_MANUAL_TRACK];
+  ENUM_POSITION_TYPE curSide[MAX_TP_MANUAL_TRACK];
+  int nMan = 0;
+  for (int i = PositionsTotal() - 1; i >= 0 && nMan < MAX_TP_MANUAL_TRACK; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+    if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) continue;
+    curTk[nMan] = tk;
+    curTP[nMan] = PositionGetDouble(POSITION_TP);
+    curSide[nMan] = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    nMan++;
+  }
+
+  ulong changedTk = 0;
+  double newTP = 0.0;
+  ENUM_POSITION_TYPE side = POSITION_TYPE_BUY;
+  bool deleteTP = false;
+
+  for (int i = 0; i < nMan; i++) {
+    const double tp = curTP[i];
+    bool found = false;
+    double prev = 0.0;
+    for (int j = 0; j < g_tpManSnapshotCount; j++) {
+      if (g_tpManTickets[j] == curTk[i]) {
+        found = true;
+        prev = g_tpManPrevTP[j];
+        break;
+      }
+    }
+    if (!found) continue;
+
+    if (SyncTPDeletionToAll && prev > 0.0 && tp <= 0.0) {
+      changedTk = curTk[i];
+      newTP = 0.0;
+      side = curSide[i];
+      deleteTP = true;
+      break;
+    }
+    if (tp > 0.0 && MathAbs(prev - tp) > eps) {
+      changedTk = curTk[i];
+      newTP = NormalizeDouble(tp, digits);
+      side = curSide[i];
+      deleteTP = false;
+      break;
+    }
+  }
+
+  if (changedTk == 0) return;
+
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+    const ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    if (pt != side) continue;
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+    const string com = PositionGetString(POSITION_COMMENT);
+    if (mag == MagicNumber && StringFind(com, "MSSLTP") != 0) continue;
+
+    const double sl = PositionGetDouble(POSITION_SL);
+    const double ctp = PositionGetDouble(POSITION_TP);
+    if (!deleteTP) {
+      if (ctp > 0.0 && MathAbs(ctp - newTP) <= eps) continue;
+      if (!RespectStopDistanceTPOnly(isBuy, newTP)) continue;
+    } else {
+      if (ctp <= 0.0) continue;
+    }
+    if (!trade.PositionModify(tk, sl, deleteTP ? 0.0 : newTP))
+      Print("[ManualSwingSLTP] SyncTP position failed tk=", tk, " ret=",
+            trade.ResultRetcode());
+  }
+
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (ot == 0 || !OrderSelect(ot)) continue;
+    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+    if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    if (isBuy) {
+      if (otyp != ORDER_TYPE_BUY_LIMIT && otyp != ORDER_TYPE_BUY_STOP &&
+          otyp != ORDER_TYPE_BUY_STOP_LIMIT)
+        continue;
+    } else {
+      if (otyp != ORDER_TYPE_SELL_LIMIT && otyp != ORDER_TYPE_SELL_STOP &&
+          otyp != ORDER_TYPE_SELL_STOP_LIMIT)
+        continue;
+    }
+    const double op = OrderGetDouble(ORDER_PRICE_OPEN);
+    const double osl = OrderGetDouble(ORDER_SL);
+    const double otp = OrderGetDouble(ORDER_TP);
+    const ENUM_ORDER_TYPE_TIME ttime =
+        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+    const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+    if (!deleteTP) {
+      if (otp > 0.0 && MathAbs(otp - newTP) <= eps) continue;
+      if (!RespectStopDistanceTPOnly(isBuy, newTP)) continue;
+    } else {
+      if (otp <= 0.0) continue;
+    }
+    if (!trade.OrderModify(ot, op, osl, deleteTP ? 0.0 : newTP, ttime, exp))
+      Print("[ManualSwingSLTP] SyncTP pending failed ot=", ot, " ret=",
+            trade.ResultRetcode());
+  }
+
+  Print("[ManualSwingSLTP] Synced TP from manual ticket ", changedTk,
+        " → ", deleteTP ? "removed" : DoubleToString(newTP, digits),
+        " (", isBuy ? "BUY" : "SELL", " side)");
+}
+
+void UpdateManualTPPrevSnapshot() {
+  g_tpManSnapshotCount = 0;
+  for (int i = PositionsTotal() - 1; i >= 0 && g_tpManSnapshotCount < MAX_TP_MANUAL_TRACK;
+       i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+    if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) continue;
+    g_tpManTickets[g_tpManSnapshotCount] = tk;
+    g_tpManPrevTP[g_tpManSnapshotCount] = PositionGetDouble(POSITION_TP);
+    g_tpManSnapshotCount++;
+  }
 }
 
 double SwingLowPrice() {
@@ -174,6 +343,116 @@ double ReferenceSLFromExistingManual(const ENUM_POSITION_TYPE typ, const ulong e
 
 string GridParentTag(const ulong parentTicket) {
   return "MSSLTP" + IntegerToString((long)parentTicket);
+}
+
+// Manual (non-EA magic) OR this EA's grid fills (comment MSSLTP…) on _Symbol.
+int CountBundleLegs(const bool buySide) {
+  int n = 0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+    const ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    if (buySide && pt != POSITION_TYPE_BUY) continue;
+    if (!buySide && pt != POSITION_TYPE_SELL) continue;
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+    if (mag != MagicNumber) {
+      n++;
+      continue;
+    }
+    const string c = PositionGetString(POSITION_COMMENT);
+    if (StringFind(c, "MSSLTP") == 0) n++;
+  }
+  return n;
+}
+
+void ResetBundleCapIfSideFlat(const bool buySide) {
+  if (buySide) {
+    if (CountBundleLegs(true) == 0) g_maxBuyBundlePositions = 0;
+  } else {
+    if (CountBundleLegs(false) == 0) g_maxSellBundlePositions = 0;
+  }
+}
+
+int BundleExtraLegsForLock() {
+  if (!UseGridPendingOrders) return 0;
+  int extra = (BundleMaxExtraLegsCap > 0) ? BundleMaxExtraLegsCap : GridExtraPendingLegs;
+  if (extra < 0) extra = 0;
+  return extra;
+}
+
+void MaybeLockBundleMaxForDirection(const ENUM_POSITION_TYPE typ) {
+  if (!EnforceInitialBundleMax) return;
+  const int extra = BundleExtraLegsForLock();
+  if (typ == POSITION_TYPE_BUY) {
+    if (g_maxBuyBundlePositions > 0) return;
+    const int n = CountBundleLegs(true);
+    g_maxBuyBundlePositions = n + extra;
+    if (g_maxBuyBundlePositions < n) g_maxBuyBundlePositions = n;
+    Print("[ManualSwingSLTP] BUY bundle max locked = ", g_maxBuyBundlePositions,
+          " (open legs ", n, " + extra ", extra, ")");
+  } else {
+    if (g_maxSellBundlePositions > 0) return;
+    const int n = CountBundleLegs(false);
+    g_maxSellBundlePositions = n + extra;
+    if (g_maxSellBundlePositions < n) g_maxSellBundlePositions = n;
+    Print("[ManualSwingSLTP] SELL bundle max locked = ", g_maxSellBundlePositions,
+          " (open legs ", n, " + extra ", extra, ")");
+  }
+}
+
+bool CloseNewestBundleExcessOne(const bool buySide) {
+  const int cap = buySide ? g_maxBuyBundlePositions : g_maxSellBundlePositions;
+  if (cap <= 0) return false;
+  if (CountBundleLegs(buySide) <= cap) return false;
+
+  ulong newestTk = 0;
+  datetime newestTime = 0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+    if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+    const ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    if (buySide && pt != POSITION_TYPE_BUY) continue;
+    if (!buySide && pt != POSITION_TYPE_SELL) continue;
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+    bool leg = false;
+    if (mag != MagicNumber) leg = true;
+    else {
+      const string c = PositionGetString(POSITION_COMMENT);
+      if (StringFind(c, "MSSLTP") == 0) leg = true;
+    }
+    if (!leg) continue;
+    const datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+    if (newestTk == 0 || t >= newestTime) {
+      newestTime = t;
+      newestTk = tk;
+    }
+  }
+  if (newestTk == 0) return false;
+
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
+  if (trade.PositionClose(newestTk)) {
+    Print("[ManualSwingSLTP] Bundle cap: closed newest excess ticket ", newestTk,
+          " (", (buySide ? "BUY" : "SELL"), " side)");
+    return true;
+  }
+  Print("[ManualSwingSLTP] Bundle cap: failed to close excess ticket ", newestTk,
+        " ret=", trade.ResultRetcode());
+  return false;
+}
+
+void EnforceBundleMaxPositions() {
+  if (!EnforceInitialBundleMax) return;
+  for (int k = 0; k < 24; k++) {
+    bool progressed = false;
+    if (g_maxBuyBundlePositions > 0 && CountBundleLegs(true) > g_maxBuyBundlePositions)
+      progressed = CloseNewestBundleExcessOne(true) || progressed;
+    if (g_maxSellBundlePositions > 0 && CountBundleLegs(false) > g_maxSellBundlePositions)
+      progressed = CloseNewestBundleExcessOne(false) || progressed;
+    if (!progressed) break;
+  }
 }
 
 double NormalizeVolumeLocal(const double lotsIn) {
@@ -323,6 +602,62 @@ void TryPlaceGridPendings(const ulong parentTk, const ENUM_POSITION_TYPE typ,
   g_states[st].gridDone = true;
 }
 
+//--------------------------- SL protection ---------------------------
+void DetectUserSlDrag(const int st, const ENUM_POSITION_TYPE typ,
+                      const double curSL, const double pt) {
+  if (!ProtectBEDontOverrideUserSL) return;
+  if (!g_states[st].swingSLSet || g_states[st].beTpSet) return;
+  if (g_states[st].userTouchedSL) return;
+  if (g_states[st].lastEaWrittenSL <= 0.0 || curSL <= 0.0) return;
+  const double eps = pt * 8.0;
+  if (MathAbs(curSL - g_states[st].lastEaWrittenSL) > eps)
+    g_states[st].userTouchedSL = true;
+}
+
+// Returns true if position was modified (caller should refresh SL/TP from market).
+bool ProtectRestoreOrClampSL(const ulong tk, const int st,
+                             const ENUM_POSITION_TYPE typ, const double curSL,
+                             const double curTP, const int digits) {
+  if (!g_states[st].swingSLSet || g_states[st].beTpSet) return false;
+  const double bound = g_states[st].protectBoundSL;
+  if (bound <= 0.0) return false;
+  const double pt = Pt();
+  if (pt <= 0.0) return false;
+  const double eps = pt * 5.0;
+  const bool isBuy = (typ == POSITION_TYPE_BUY);
+
+  if (ProtectSLRestoreIfRemoved && curSL <= 0.0) {
+    if (!RespectStopDistanceSLOnly(isBuy, bound)) return false;
+    if (trade.PositionModify(tk, bound, curTP)) {
+      g_states[st].lastEaWrittenSL = bound;
+      Print("[ManualSwingSLTP] Restored removed SL ticket=", tk);
+      return true;
+    }
+    return false;
+  }
+
+  if (!ProtectSLClampNoWiden) return false;
+
+  if (isBuy && curSL + eps < bound) {
+    const double nsl = NormalizeDouble(bound, digits);
+    if (!RespectStopDistanceSLOnly(true, nsl)) return false;
+    if (trade.PositionModify(tk, nsl, curTP)) {
+      g_states[st].lastEaWrittenSL = nsl;
+      Print("[ManualSwingSLTP] BUY SL clamped to committed bound ticket=", tk);
+      return true;
+    }
+  } else if (!isBuy && curSL > bound + eps) {
+    const double nsl = NormalizeDouble(bound, digits);
+    if (!RespectStopDistanceSLOnly(false, nsl)) return false;
+    if (trade.PositionModify(tk, nsl, curTP)) {
+      g_states[st].lastEaWrittenSL = nsl;
+      Print("[ManualSwingSLTP] SELL SL clamped to committed bound ticket=", tk);
+      return true;
+    }
+  }
+  return false;
+}
+
 //--------------------------- Core logic ------------------------------
 void ManageManualPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return;
@@ -333,8 +668,8 @@ void ManageManualPosition(const ulong tk) {
 
   const ENUM_POSITION_TYPE typ = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
   const double open = PositionGetDouble(POSITION_PRICE_OPEN);
-  const double curSL = PositionGetDouble(POSITION_SL);
-  const double curTP = PositionGetDouble(POSITION_TP);
+  double workSL = PositionGetDouble(POSITION_SL);
+  double workTP = PositionGetDouble(POSITION_TP);
 
   int st = EnsureState(tk);
   if (st < 0) {
@@ -353,8 +688,17 @@ void ManageManualPosition(const ulong tk) {
   trade.SetExpertMagicNumber(MagicNumber); // for modifications only
   trade.SetDeviationInPoints(SlippagePoints);
 
+  if (g_states[st].swingSLSet && g_states[st].protectBoundSL > 0.0) {
+    if (ProtectRestoreOrClampSL(tk, st, typ, workSL, workTP, digits)) {
+      if (!PositionSelectByTicket(tk)) return;
+      workSL = PositionGetDouble(POSITION_SL);
+      workTP = PositionGetDouble(POSITION_TP);
+    }
+  }
+  DetectUserSlDrag(st, typ, workSL, pt);
+
   // 1) Set SL to swing (only if SL is empty AND not already set by us)
-  if (!g_states[st].swingSLSet && curSL <= 0.0) {
+  if (!g_states[st].swingSLSet && workSL <= 0.0) {
     double sl = 0.0;
 
     // If there is already an open manual position in the same direction,
@@ -381,8 +725,12 @@ void ManageManualPosition(const ulong tk) {
     if (sl > 0.0) sl = NormalizeDouble(sl, digits);
 
     if (sl > 0.0 && RespectStopsDistanceFromMarket(typ == POSITION_TYPE_BUY, sl, 0.0)) {
-      if (trade.PositionModify(tk, sl, curTP)) {
+      if (trade.PositionModify(tk, sl, workTP)) {
         g_states[st].swingSLSet = true;
+        g_states[st].protectBoundSL = sl;
+        g_states[st].lastEaWrittenSL = sl;
+        g_states[st].userTouchedSL = false;
+        MaybeLockBundleMaxForDirection(typ);
         if (!PositionSelectByTicket(tk)) return;
         const double vol = PositionGetDouble(POSITION_VOLUME);
         TryPlaceGridPendings(tk, typ, open, sl, vol, usedRefSL, st);
@@ -392,6 +740,10 @@ void ManageManualPosition(const ulong tk) {
 
   // 2) After profit reaches trigger, set SL to BE+ and set TP (if not done)
   if (!g_states[st].beTpSet) {
+    if (!PositionSelectByTicket(tk)) return;
+    workSL = PositionGetDouble(POSITION_SL);
+    workTP = PositionGetDouble(POSITION_TP);
+
     const double pPts = ProfitPointsForPosition(typ, open);
     if (pPts >= (double)BreakEvenTriggerPoints) {
       DeleteGridPendingsForParent(tk);
@@ -407,28 +759,31 @@ void ManageManualPosition(const ulong tk) {
       wantSL = NormalizeDouble(wantSL, digits);
       wantTP = NormalizeDouble(wantTP, digits);
 
+      if (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL)
+        wantSL = workSL;
+
       // do not loosen SL if user already tightened it beyond our target
-      if (curSL > 0.0) {
-        if (typ == POSITION_TYPE_BUY && wantSL <= curSL) wantSL = curSL;
-        if (typ == POSITION_TYPE_SELL && wantSL >= curSL) wantSL = curSL;
+      if (workSL > 0.0) {
+        if (typ == POSITION_TYPE_BUY && wantSL <= workSL) wantSL = workSL;
+        if (typ == POSITION_TYPE_SELL && wantSL >= workSL) wantSL = workSL;
       }
       // if user already has TP, keep it; else set ours
-      if (curTP > 0.0) wantTP = curTP;
+      if (workTP > 0.0) wantTP = workTP;
 
       const bool isBuy = (typ == POSITION_TYPE_BUY);
 
       // If SL target is not acceptable now, keep current SL (still try to set TP).
       if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL)) {
-        wantSL = curSL; // may be 0, that's ok
+        wantSL = workSL; // may be 0, that's ok
       }
       // If TP target not acceptable now, keep current TP (or 0).
       if (wantTP > 0.0 && !RespectStopDistanceTPOnly(isBuy, wantTP)) {
-        wantTP = curTP; // may be 0
+        wantTP = workTP; // may be 0
       }
 
       // If nothing to change, still mark as done (avoids repeated calls)
-      const double nCurSL = (curSL > 0.0) ? NormalizeDouble(curSL, digits) : 0.0;
-      const double nCurTP = (curTP > 0.0) ? NormalizeDouble(curTP, digits) : 0.0;
+      const double nCurSL = (workSL > 0.0) ? NormalizeDouble(workSL, digits) : 0.0;
+      const double nCurTP = (workTP > 0.0) ? NormalizeDouble(workTP, digits) : 0.0;
       const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
       const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
 
@@ -439,6 +794,7 @@ void ManageManualPosition(const ulong tk) {
 
       if (trade.PositionModify(tk, nWantSL, nWantTP)) {
         g_states[st].beTpSet = true;
+        g_states[st].lastEaWrittenSL = nWantSL;
       } else {
         Print("[ManualSwingSLTP] Modify BE/TP failed. ticket=", tk,
               " profitPts=", DoubleToString(pPts, 1),
@@ -468,7 +824,10 @@ void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
 
   PruneStaleStates();
+  ResetBundleCapIfSideFlat(true);
+  ResetBundleCapIfSideFlat(false);
   CleanupOrphanGridPendings();
+  EnforceBundleMaxPositions();
 
   // Manage all manual positions on this symbol
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
@@ -476,5 +835,9 @@ void OnTick() {
     if (tk == 0) continue;
     ManageManualPosition(tk);
   }
+
+  SyncTPFromManualUserChange();
+  EnforceBundleMaxPositions();
+  UpdateManualTPPrevSnapshot();
 }
 
