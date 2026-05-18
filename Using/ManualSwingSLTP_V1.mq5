@@ -32,9 +32,10 @@
 //|   pending SL while parent is in swing phase (same as ProtectSLFreezeBeforeBE). |
 //| v1.11: BE — ບໍ່ຕັ້ງ beTpSet ຄ້າງວົງ swing ເມື່ອກຳໄລຮອດ trigger ແລ້ວ; ຖ້າ BE+ ຕິດ |
 //|   stops level ຈະຂຍັບ SL ໃຫ້ໃກ້ຕະຫຼາດທີ່ broker ຍອມຮັບ (BreakEvenRelaxSLToStopsLevel). |
+//| v1.12: MaxLotPerLeg — ຫ້າມ lot ຕໍ່ໄມ້ເກີນຄ່າກຳນົດ (ຕັດ position / ປັບ pending). |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.11"
+#property version   "1.12"
 #property description "Swing SL/TP + BE broker-safe SL + grid freeze + bundle + sync TP."
 
 #include <Trade/Trade.mqh>
@@ -56,6 +57,7 @@ input int    SlippagePoints           = 20;
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
+input double MaxLotPerLeg             = 0.1;    // max lot per position/pending leg (0 = off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
 input bool   EnforceInitialBundleMax  = true;   // cap BUY/SELL "legs" to count-at-first-SL + grid legs (see header)
@@ -495,9 +497,89 @@ double NormalizeVolumeLocal(const double lotsIn) {
   double lots = lotsIn;
   if (lots < minLot) lots = minLot;
   if (lots > maxLot) lots = maxLot;
+  if (MaxLotPerLeg > 0.0 && lots > MaxLotPerLeg)
+    lots = MaxLotPerLeg;
   lots = MathFloor(lots / stepLot) * stepLot;
   if (lots < minLot) lots = minLot;
   return NormalizeDouble(lots, 2);
+}
+
+bool IsBundlePositionLeg(const ulong tk) {
+  if (tk == 0 || !PositionSelectByTicket(tk)) return false;
+  if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+  const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+  if (mag != MagicNumber) return true;
+  const string c = PositionGetString(POSITION_COMMENT);
+  return (StringFind(c, "MSSLTP") == 0);
+}
+
+bool IsBundleOrderLeg(const ulong ot) {
+  if (ot == 0 || !OrderSelect(ot)) return false;
+  if (OrderGetString(ORDER_SYMBOL) != _Symbol) return false;
+  const long mag = (long)OrderGetInteger(ORDER_MAGIC);
+  if (mag != MagicNumber) return true;
+  const string c = OrderGetString(ORDER_COMMENT);
+  return (StringFind(c, "MSSLTP") == 0);
+}
+
+// Manual + MSSLTP: ຫ້າມ lot ຕໍ່ໄມ້ເກີນ MaxLotPerLeg (ຕັດ position / ປັບ pending).
+void EnforceMaxLotPerLeg() {
+  if (MaxLotPerLeg <= 0.0) return;
+
+  const double maxL = NormalizeVolumeLocal(MaxLotPerLeg);
+  const double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  const double eps = (stepLot > 0.0) ? stepLot * 0.01 : 0.00001;
+
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    const double vol = PositionGetDouble(POSITION_VOLUME);
+    if (vol <= maxL + eps) continue;
+
+    double closeVol = vol - maxL;
+    if (stepLot > 0.0)
+      closeVol = MathFloor(closeVol / stepLot) * stepLot;
+    if (closeVol < stepLot) continue;
+
+    if (!trade.PositionClosePartial(tk, closeVol)) {
+      Print("[ManualSwingSLTP] MaxLotPerLeg: partial close failed tk=", tk,
+            " vol=", vol, " close=", closeVol, " ret=", trade.ResultRetcode());
+    } else {
+      Print("[ManualSwingSLTP] MaxLotPerLeg: reduced position tk=", tk,
+            " from ", vol, " toward max ", maxL);
+    }
+  }
+
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (!IsBundleOrderLeg(ot)) continue;
+
+    double ovol = OrderGetDouble(ORDER_VOLUME_CURRENT);
+    if (ovol <= 0.0)
+      ovol = OrderGetDouble(ORDER_VOLUME_INITIAL);
+    if (ovol <= maxL + eps) continue;
+
+    const double newVol = maxL;
+    const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+    const double osl = OrderGetDouble(ORDER_SL);
+    const double otp = OrderGetDouble(ORDER_TP);
+    const ENUM_ORDER_TYPE_TIME ttime =
+        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+    const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+
+    if (!trade.OrderModify(ot, price, osl, otp, ttime, exp, newVol)) {
+      Print("[ManualSwingSLTP] MaxLotPerLeg: order volume modify failed ot=", ot,
+            " vol=", ovol, " ret=", trade.ResultRetcode());
+      if (!trade.OrderDelete(ot))
+        Print("[ManualSwingSLTP] MaxLotPerLeg: order delete failed ot=", ot);
+    } else {
+      Print("[ManualSwingSLTP] MaxLotPerLeg: pending ot=", ot,
+            " volume ", ovol, " -> ", newVol);
+    }
+  }
 }
 
 bool HasPendingLimitNear(const bool isBuy, const double price) {
@@ -1084,6 +1166,7 @@ void OnTick() {
   ResetBundleCapIfSideFlat(false);
   CleanupOrphanGridPendings();
   EnforceBundleMaxPositions();
+  EnforceMaxLotPerLeg();
 
   // Manage all manual positions on this symbol
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
