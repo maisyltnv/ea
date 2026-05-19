@@ -38,9 +38,10 @@
 //| v1.13: Trend gate — manual BUY ຕ້ອງ EMA fast > slow; manual SELL ຕ້ອງ fast < slow. |
 //| v1.14: Trend gate M1 OR M5 — BUY ຖ້າ M1 ຫຼື M5 ມີ EMA50>200; SELL ຖ້າ M1 ຫຼື M5 EMA50<200. |
 //| v1.15: BE ຕາມໄມ້ທຳອິດຝັ່ງ — trigger ຈາກກຳໄລໄມ້ແຮກ; SL BE+ ລາຄາ entry ໄມ້ແຮກ ທຸກ leg. |
+//| v1.16: MaxLotPerLeg — ຕັດ lot ທັນທີເມື່ອເປີດ manual/grid ເກີນ (magic 0 ສຳລັບ manual). |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.15"
+#property version   "1.16"
 #property description "Swing SL/TP + EMA trend gate + BE + grid freeze + bundle."
 
 #include <Trade/Trade.mqh>
@@ -62,7 +63,7 @@ input int    SlippagePoints           = 20;
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
-input double MaxLotPerLeg             = 0.1;    // max lot per position/pending leg (0 = off)
+input double MaxLotPerLeg             = 0.1;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
 input bool   EnforceInitialBundleMax  = true;   // cap BUY/SELL "legs" to count-at-first-SL + grid legs (see header)
@@ -742,63 +743,108 @@ int StateIndexForBreakEvenLeg(const ulong tk) {
   return FindStateIndex(parentTk);
 }
 
-// Manual + MSSLTP: ຫ້າມ lot ຕໍ່ໄມ້ເກີນ MaxLotPerLeg (ຕັດ position / ປັບ pending).
-void EnforceMaxLotPerLeg() {
-  if (MaxLotPerLeg <= 0.0) return;
+void SetTradeMagicForPositionTicket(const ulong tk) {
+  if (!PositionSelectByTicket(tk)) return;
+  if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
+    trade.SetExpertMagicNumber(MagicNumber);
+  else
+    trade.SetExpertMagicNumber(0); // manual: broker needs neutral magic to modify/close
+}
+
+void SetTradeMagicForOrderTicket(const ulong ot) {
+  if (!OrderSelect(ot)) return;
+  if ((long)OrderGetInteger(ORDER_MAGIC) == MagicNumber)
+    trade.SetExpertMagicNumber(MagicNumber);
+  else
+    trade.SetExpertMagicNumber(0);
+}
+
+// Reduce one market position to <= MaxLotPerLeg (e.g. 0.2 → 0.1).
+bool ReducePositionVolumeToMaxLot(const ulong tk) {
+  if (MaxLotPerLeg <= 0.0 || tk == 0) return false;
+  if (!PositionSelectByTicket(tk)) return false;
+  if (!IsBundlePositionLeg(tk)) return false;
 
   const double maxL = NormalizeVolumeLocal(MaxLotPerLeg);
-  const double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-  const double eps = (stepLot > 0.0) ? stepLot * 0.01 : 0.00001;
+  double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  if (stepLot <= 0.0) stepLot = 0.01;
+  const double eps = stepLot * 0.01;
 
-  trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
+  SetTradeMagicForPositionTicket(tk);
 
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsBundlePositionLeg(tk)) continue;
+  bool changed = false;
+  for (int attempt = 0; attempt < 12; attempt++) {
+    if (!PositionSelectByTicket(tk)) break;
     const double vol = PositionGetDouble(POSITION_VOLUME);
-    if (vol <= maxL + eps) continue;
+    if (vol <= maxL + eps) break;
 
     double closeVol = vol - maxL;
     if (stepLot > 0.0)
       closeVol = MathFloor(closeVol / stepLot) * stepLot;
-    if (closeVol < stepLot) continue;
+    if (closeVol < stepLot)
+      closeVol = stepLot;
+    if (closeVol <= 0.0 || closeVol >= vol - eps) break;
 
     if (!trade.PositionClosePartial(tk, closeVol)) {
       Print("[ManualSwingSLTP] MaxLotPerLeg: partial close failed tk=", tk,
             " vol=", vol, " close=", closeVol, " ret=", trade.ResultRetcode());
-    } else {
-      Print("[ManualSwingSLTP] MaxLotPerLeg: reduced position tk=", tk,
-            " from ", vol, " toward max ", maxL);
+      break;
     }
+    changed = true;
+    Print("[ManualSwingSLTP] MaxLotPerLeg: reduced tk=", tk, " closed ", closeVol,
+          " (target max ", maxL, ")");
+  }
+  return changed;
+}
+
+bool ReducePendingOrderVolumeToMaxLot(const ulong ot) {
+  if (MaxLotPerLeg <= 0.0 || ot == 0) return false;
+  if (!OrderSelect(ot)) return false;
+  if (!IsBundleOrderLeg(ot)) return false;
+
+  const double maxL = NormalizeVolumeLocal(MaxLotPerLeg);
+  double ovol = OrderGetDouble(ORDER_VOLUME_CURRENT);
+  if (ovol <= 0.0)
+    ovol = OrderGetDouble(ORDER_VOLUME_INITIAL);
+  const double stepLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  const double eps = (stepLot > 0.0) ? stepLot * 0.01 : 0.00001;
+  if (ovol <= maxL + eps) return false;
+
+  const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+  const double osl = OrderGetDouble(ORDER_SL);
+  const double otp = OrderGetDouble(ORDER_TP);
+  const ENUM_ORDER_TYPE_TIME ttime =
+      (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+  const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+
+  trade.SetDeviationInPoints(SlippagePoints);
+  SetTradeMagicForOrderTicket(ot);
+
+  if (trade.OrderModify(ot, price, osl, otp, ttime, exp, maxL)) {
+    Print("[ManualSwingSLTP] MaxLotPerLeg: pending ot=", ot, " volume ", ovol,
+          " -> ", maxL);
+    return true;
+  }
+  Print("[ManualSwingSLTP] MaxLotPerLeg: order volume modify failed ot=", ot,
+        " vol=", ovol, " ret=", trade.ResultRetcode());
+  if (!trade.OrderDelete(ot))
+    Print("[ManualSwingSLTP] MaxLotPerLeg: order delete failed ot=", ot);
+  return false;
+}
+
+// Manual + MSSLTP: ຫ້າມ lot ຕໍ່ໄມ້ເກີນ MaxLotPerLeg (ຕັດ position / ປັບ pending).
+void EnforceMaxLotPerLeg() {
+  if (MaxLotPerLeg <= 0.0) return;
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    ReducePositionVolumeToMaxLot(tk);
   }
 
   for (int j = OrdersTotal() - 1; j >= 0; j--) {
     const ulong ot = OrderGetTicket(j);
-    if (!IsBundleOrderLeg(ot)) continue;
-
-    double ovol = OrderGetDouble(ORDER_VOLUME_CURRENT);
-    if (ovol <= 0.0)
-      ovol = OrderGetDouble(ORDER_VOLUME_INITIAL);
-    if (ovol <= maxL + eps) continue;
-
-    const double newVol = maxL;
-    const double price = OrderGetDouble(ORDER_PRICE_OPEN);
-    const double osl = OrderGetDouble(ORDER_SL);
-    const double otp = OrderGetDouble(ORDER_TP);
-    const ENUM_ORDER_TYPE_TIME ttime =
-        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
-    const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
-
-    if (!trade.OrderModify(ot, price, osl, otp, ttime, exp, newVol)) {
-      Print("[ManualSwingSLTP] MaxLotPerLeg: order volume modify failed ot=", ot,
-            " vol=", ovol, " ret=", trade.ResultRetcode());
-      if (!trade.OrderDelete(ot))
-        Print("[ManualSwingSLTP] MaxLotPerLeg: order delete failed ot=", ot);
-    } else {
-      Print("[ManualSwingSLTP] MaxLotPerLeg: pending ot=", ot,
-            " volume ", ovol, " -> ", newVol);
-    }
+    ReducePendingOrderVolumeToMaxLot(ot);
   }
 }
 
@@ -1481,7 +1527,6 @@ void OnDeinit(const int reason) {
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result) {
-  if (!UseTrendFilter) return;
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
   if (trans.deal == 0) return;
   if (!HistoryDealSelect(trans.deal)) return;
@@ -1491,36 +1536,45 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   if (entry != DEAL_ENTRY_IN) return;
 
   const long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
-  if (magic == MagicNumber) return;
-
   const long dtype = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
   const bool isBuy = (dtype == DEAL_TYPE_BUY);
   const bool isSell = (dtype == DEAL_TYPE_SELL);
-  if (!isBuy && !isSell) return;
-
-  if (isBuy && TrendAllowsBuy()) return;
-  if (isSell && TrendAllowsSell()) return;
 
   const ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-  if (posId == 0) {
-    EnforceTrendFilterOnManualTrades();
-    return;
+
+  if (UseTrendFilter && magic != MagicNumber && (isBuy || isSell)) {
+    if ((isBuy && !TrendAllowsBuy()) || (isSell && !TrendAllowsSell())) {
+      if (posId == 0) {
+        EnforceTrendFilterOnManualTrades();
+        return;
+      }
+      for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        const ulong tk = PositionGetTicket(i);
+        if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+        if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
+        if (!IsManualPositionTicket(tk)) return;
+
+        trade.SetExpertMagicNumber(0);
+        trade.SetDeviationInPoints(SlippagePoints);
+        const string side = isBuy ? "BUY" : "SELL";
+        NotifyTrendBlocked("Trend filter: rejected manual " + side +
+                           " (deal " + IntegerToString((long)trans.deal) + ")");
+        if (!trade.PositionClose(tk))
+          Print("[ManualSwingSLTP] Trend filter: fast close failed tk=", tk);
+        return;
+      }
+    }
   }
 
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
-    if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
-    if (!IsManualPositionTicket(tk)) return;
-
-    trade.SetExpertMagicNumber(0);
-    trade.SetDeviationInPoints(SlippagePoints);
-    const string side = isBuy ? "BUY" : "SELL";
-    NotifyTrendBlocked("Trend filter: rejected manual " + side +
-                       " (deal " + IntegerToString((long)trans.deal) + ")");
-    if (!trade.PositionClose(tk))
-      Print("[ManualSwingSLTP] Trend filter: fast close failed tk=", tk);
-    return;
+  if (MaxLotPerLeg > 0.0 && posId > 0) {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
+      if (!IsBundlePositionLeg(tk)) return;
+      ReducePositionVolumeToMaxLot(tk);
+      return;
+    }
   }
 }
 
