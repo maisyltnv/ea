@@ -7,12 +7,12 @@
 //| BUY:                                                             |
 //|  - ຕັ້ງ SL ທີ່ swing low (lookback); ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ BuyLimit grid |
 //|    (ຈຳນວນ = GridExtraPendingLegs, ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL).        |
-//|  - ເມື່ອກຳໄລ >= BreakEvenTriggerPoints: SL=entry+BreakEvenPlus, TP=entry+TPPoints |
+//|  - ເມື່ອກຳໄລ points ລວມທຸກໄມ້ຝັ່ງນັ້ນ >= BreakEvenTriggerPoints: BE+ ແລະ TP ຕໍ່ entry |
 //|                                                                  |
 //| SELL:                                                            |
 //|  - ຕັ້ງ SL ທີ່ swing high; ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ SellLimit grid ຂຶ້ນຈາກ entry |
 //|    ຫ່າງກັນສະເໝີຕາມ GridExtraPendingLegs ຈົນບໍ່ເກີນ SL.              |
-//|  - ເມື່ອກຳໄລ >= BreakEvenTriggerPoints: SL=entry-BreakEvenPlus, TP=entry-TPPoints |
+//|  - ເມື່ອກຳໄລ points ລວມທຸກໄມ້ຝັ່ງນັ້ນ >= BreakEvenTriggerPoints: BE+ ແລະ TP ຕໍ່ entry |
 //|                                                                   |
 //| ໝາຍເຫດ: EA ຈັດການສະເພາະ manual positions (magic != MagicNumber) |
 //| Bugfix v1.01: ລ້າງລາຍການ ticket ທີ່ປິດແລ້ວອອກຈາກ g_states — ບໍ່ດັ່ນຫຼັງມີ ~200 |
@@ -33,10 +33,11 @@
 //| v1.11: BE — ບໍ່ຕັ້ງ beTpSet ຄ້າງວົງ swing ເມື່ອກຳໄລຮອດ trigger ແລ້ວ; ຖ້າ BE+ ຕິດ |
 //|   stops level ຈະຂຍັບ SL ໃຫ້ໃກ້ຕະຫຼາດທີ່ broker ຍອມຮັບ (BreakEvenRelaxSLToStopsLevel). |
 //| v1.12: MaxLotPerLeg — ຫ້າມ lot ຕໍ່ໄມ້ເກີນຄ່າກຳນົດ (ຕັດ position / ປັບ pending). |
+//| v1.13: BE/TP ເມື່ອກຳໄລ points ລວມທຸກໄມ້ຝັ່ງ (manual+MSSLTP) ຮອດ trigger — ບໍ່ແມ່ນແຕ່ໄມ້ດຽວ. |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.12"
-#property description "Swing SL/TP + BE broker-safe SL + grid freeze + bundle + sync TP."
+#property version   "1.13"
+#property description "Swing SL/TP + bundle-sum BE + grid freeze + MaxLotPerLeg."
 
 #include <Trade/Trade.mqh>
 
@@ -47,7 +48,7 @@ input int    SwingLookbackBars        = 50;     // search range for swing high/l
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
 
-input int    BreakEvenTriggerPoints   = 150;    // when profit >= this, set BE+ and TP
+input int    BreakEvenTriggerPoints   = 500;    // sum of profit points on side (all legs) >= this → BE+ and TP
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
 input bool   BreakEvenRelaxSLToStopsLevel = true; // if ideal BE+ SL too close to bid/ask, use tightest allowed SL
 input int    TPPoints                = 1000;   // TP distance from entry (points)
@@ -55,7 +56,7 @@ input int    TPPoints                = 1000;   // TP distance from entry (points
 input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
-input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
+input int    GridExtraPendingLegs     = 3;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
 input double MaxLotPerLeg             = 0.1;    // max lot per position/pending leg (0 = off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
@@ -522,7 +523,39 @@ bool IsBundleOrderLeg(const ulong ot) {
   return (StringFind(c, "MSSLTP") == 0);
 }
 
-// Manual + MSSLTP: ຫ້າມ lot ຕໍ່ໄມ້ເກີນ MaxLotPerLeg (ຕັດ position / ປັບ pending).
+// Combined floating profit in points for all bundle legs on one side (manual + MSSLTP fills).
+double BundleProfitPointsSum(const ENUM_POSITION_TYPE side) {
+  double sum = 0.0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+    sum += ProfitPointsForPosition(side, open);
+  }
+  return sum;
+}
+
+bool BundleReadyForBreakEven(const ENUM_POSITION_TYPE side) {
+  if (BreakEvenTriggerPoints <= 0) return false;
+  if (CountBundleLegs(side == POSITION_TYPE_BUY) <= 0) return false;
+  return BundleProfitPointsSum(side) >= (double)BreakEvenTriggerPoints;
+}
+
+int StateIndexForBreakEvenLeg(const ulong tk) {
+  if (!PositionSelectByTicket(tk)) return -1;
+  const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+  if (mag != MagicNumber) return FindStateIndex(tk);
+  const string c = PositionGetString(POSITION_COMMENT);
+  const string prefix = "MSSLTP";
+  if (StringFind(c, prefix) != 0) return -1;
+  const ulong parentTk =
+      (ulong)StringToInteger(StringSubstr(c, (int)StringLen(prefix)));
+  if (parentTk == 0) return -1;
+  return FindStateIndex(parentTk);
+}
+
+// Manual + MSSLTP: ຫ້າມ lot ຕໍ່ໄມ້ເກີນຄ່າກຳນົດ (ຕັດ position / ປັບ pending).
 void EnforceMaxLotPerLeg() {
   if (MaxLotPerLeg <= 0.0) return;
 
@@ -611,6 +644,32 @@ void DeleteGridPendingsForParent(const ulong parentTicket) {
     if (OrderGetString(ORDER_COMMENT) != tag) continue;
     if (!trade.OrderDelete(ot))
       Print("[ManualSwingSLTP] OrderDelete grid failed ticket=", ot, " ret=", trade.ResultRetcode());
+  }
+}
+
+void DeleteAllGridPendingsOnSide(const ENUM_POSITION_TYPE side) {
+  const string prefix = "MSSLTP";
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (ot == 0 || !OrderSelect(ot)) continue;
+    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+    if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+    const string c = OrderGetString(ORDER_COMMENT);
+    if (StringFind(c, prefix) != 0) continue;
+    const ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    const bool isBuySide =
+        (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
+         otype == ORDER_TYPE_BUY_STOP || otype == ORDER_TYPE_BUY_STOP_LIMIT);
+    const bool isSellSide =
+        (otype == ORDER_TYPE_SELL || otype == ORDER_TYPE_SELL_LIMIT ||
+         otype == ORDER_TYPE_SELL_STOP || otype == ORDER_TYPE_SELL_STOP_LIMIT);
+    if (side == POSITION_TYPE_BUY && !isBuySide) continue;
+    if (side == POSITION_TYPE_SELL && !isSellSide) continue;
+    if (!trade.OrderDelete(ot))
+      Print("[ManualSwingSLTP] OrderDelete grid side failed ot=", ot,
+            " ret=", trade.ResultRetcode());
   }
 }
 
@@ -973,6 +1032,116 @@ bool ProtectRestoreOrClampSL(const ulong tk, const int st,
   return false;
 }
 
+// Apply BE+TP to one bundle leg when combined side profit points >= trigger.
+bool ApplyBreakEvenToLeg(const ulong tk, const int st, const double bundlePts) {
+  if (!PositionSelectByTicket(tk)) return false;
+
+  const ENUM_POSITION_TYPE typ = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+  const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+  double workSL = PositionGetDouble(POSITION_SL);
+  double workTP = PositionGetDouble(POSITION_TP);
+
+  const double pt = Pt();
+  if (pt <= 0.0) return false;
+  const int digits = DigitsCount();
+
+  trade.SetExpertMagicNumber(MagicNumber);
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  double wantSL = 0.0, wantTP = 0.0;
+  if (typ == POSITION_TYPE_BUY) {
+    wantSL = open + (double)BreakEvenPlusPoints * pt;
+    wantTP = open + (double)TPPoints * pt;
+  } else {
+    wantSL = open - (double)BreakEvenPlusPoints * pt;
+    wantTP = open - (double)TPPoints * pt;
+  }
+  wantSL = NormalizeDouble(wantSL, digits);
+  wantTP = NormalizeDouble(wantTP, digits);
+
+  if (st >= 0 && ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL)
+    wantSL = workSL;
+
+  if (workSL > 0.0) {
+    if (typ == POSITION_TYPE_BUY && wantSL <= workSL) wantSL = workSL;
+    if (typ == POSITION_TYPE_SELL && wantSL >= workSL) wantSL = workSL;
+  }
+  if (workTP > 0.0) wantTP = workTP;
+
+  const bool isBuy = (typ == POSITION_TYPE_BUY);
+
+  if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL)) {
+    if (BreakEvenRelaxSLToStopsLevel)
+      wantSL = AdjustBreakevenSlForStopsLevel(isBuy, wantSL, digits);
+    if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL))
+      wantSL = workSL;
+  }
+  if (workSL > 0.0) {
+    if (typ == POSITION_TYPE_BUY && wantSL > 0.0 && wantSL <= workSL) wantSL = workSL;
+    if (typ == POSITION_TYPE_SELL && wantSL > 0.0 && wantSL >= workSL) wantSL = workSL;
+  }
+  if (wantTP > 0.0 && !RespectStopDistanceTPOnly(isBuy, wantTP))
+    wantTP = workTP;
+
+  const double nCurSL = (workSL > 0.0) ? NormalizeDouble(workSL, digits) : 0.0;
+  const double nCurTP = (workTP > 0.0) ? NormalizeDouble(workTP, digits) : 0.0;
+  const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
+  const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
+
+  if (nCurSL == nWantSL && nCurTP == nWantTP) {
+    if (st >= 0) {
+      const bool userKeptSlForBe =
+          (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL);
+      const double bound = g_states[st].protectBoundSL;
+      const double epsSwing = pt * 10.0;
+      const bool stillOnSwingFreeze =
+          (!userKeptSlForBe && bound > 0.0 && workSL > 0.0 &&
+           MathAbs(NormalizeDouble(workSL, digits) - NormalizeDouble(bound, digits)) <=
+               epsSwing);
+      if (!(bundlePts >= (double)BreakEvenTriggerPoints && stillOnSwingFreeze))
+        g_states[st].beTpSet = true;
+    }
+    return true;
+  }
+
+  if (trade.PositionModify(tk, nWantSL, nWantTP)) {
+    if (st >= 0) {
+      g_states[st].beTpSet = true;
+      g_states[st].lastEaWrittenSL = nWantSL;
+    }
+    return true;
+  }
+
+  Print("[ManualSwingSLTP] Modify BE/TP failed. ticket=", tk,
+        " bundlePts=", DoubleToString(bundlePts, 1),
+        " wantSL=", DoubleToString(nWantSL, digits),
+        " wantTP=", DoubleToString(nWantTP, digits),
+        " err=", GetLastError());
+  return false;
+}
+
+void ProcessBundleBreakEvenForSide(const ENUM_POSITION_TYPE side) {
+  if (!BundleReadyForBreakEven(side)) return;
+
+  const double bundlePts = BundleProfitPointsSum(side);
+  DeleteAllGridPendingsOnSide(side);
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+
+    int st = StateIndexForBreakEvenLeg(tk);
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
+    if (mag != MagicNumber) {
+      st = EnsureState(tk);
+      if (st < 0) continue;
+    }
+
+    ApplyBreakEvenToLeg(tk, st, bundlePts);
+  }
+}
+
 //--------------------------- Core logic ------------------------------
 void ManageManualPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return;
@@ -1058,90 +1227,7 @@ void ManageManualPosition(const ulong tk) {
     }
   }
 
-  // 2) After profit reaches trigger, set SL to BE+ and set TP (if not done)
-  if (!g_states[st].beTpSet) {
-    if (!PositionSelectByTicket(tk)) return;
-    workSL = PositionGetDouble(POSITION_SL);
-    workTP = PositionGetDouble(POSITION_TP);
-
-    const double pPts = ProfitPointsForPosition(typ, open);
-    if (pPts >= (double)BreakEvenTriggerPoints) {
-      DeleteGridPendingsForParent(tk);
-
-      double wantSL = 0.0, wantTP = 0.0;
-      if (typ == POSITION_TYPE_BUY) {
-        wantSL = open + (double)BreakEvenPlusPoints * pt;
-        wantTP = open + (double)TPPoints * pt;
-      } else {
-        wantSL = open - (double)BreakEvenPlusPoints * pt;
-        wantTP = open - (double)TPPoints * pt;
-      }
-      wantSL = NormalizeDouble(wantSL, digits);
-      wantTP = NormalizeDouble(wantTP, digits);
-
-      if (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL)
-        wantSL = workSL;
-
-      // do not loosen SL if user already tightened it beyond our target
-      if (workSL > 0.0) {
-        if (typ == POSITION_TYPE_BUY && wantSL <= workSL) wantSL = workSL;
-        if (typ == POSITION_TYPE_SELL && wantSL >= workSL) wantSL = workSL;
-      }
-      // if user already has TP, keep it; else set ours
-      if (workTP > 0.0) wantTP = workTP;
-
-      const bool isBuy = (typ == POSITION_TYPE_BUY);
-
-      // If ideal BE+ SL is inside stops level, relax toward broker limit (not back to swing).
-      if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL)) {
-        if (BreakEvenRelaxSLToStopsLevel)
-          wantSL = AdjustBreakevenSlForStopsLevel(isBuy, wantSL, digits);
-        if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL))
-          wantSL = workSL; // may be 0, that's ok
-      }
-      // Re-apply "do not loosen" after broker snap (BUY: never move SL down vs chosen floor).
-      if (workSL > 0.0) {
-        if (typ == POSITION_TYPE_BUY && wantSL > 0.0 && wantSL <= workSL) wantSL = workSL;
-        if (typ == POSITION_TYPE_SELL && wantSL > 0.0 && wantSL >= workSL) wantSL = workSL;
-      }
-      // If TP target not acceptable now, keep current TP (or 0).
-      if (wantTP > 0.0 && !RespectStopDistanceTPOnly(isBuy, wantTP)) {
-        wantTP = workTP; // may be 0
-      }
-
-      // If nothing to change, mark done — except when profit already hit trigger but SL
-      // is still the frozen swing price (would wrongly skip BE forever).
-      const double nCurSL = (workSL > 0.0) ? NormalizeDouble(workSL, digits) : 0.0;
-      const double nCurTP = (workTP > 0.0) ? NormalizeDouble(workTP, digits) : 0.0;
-      const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
-      const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
-
-      if (nCurSL == nWantSL && nCurTP == nWantTP) {
-        const bool userKeptSlForBe =
-            (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL);
-        const double bound = g_states[st].protectBoundSL;
-        const double epsSwing = pt * 10.0;
-        const bool stillOnSwingFreeze =
-            (!userKeptSlForBe && bound > 0.0 && workSL > 0.0 &&
-             MathAbs(NormalizeDouble(workSL, digits) - NormalizeDouble(bound, digits)) <=
-                 epsSwing);
-        if (!(pPts >= (double)BreakEvenTriggerPoints && stillOnSwingFreeze))
-          g_states[st].beTpSet = true;
-        return;
-      }
-
-      if (trade.PositionModify(tk, nWantSL, nWantTP)) {
-        g_states[st].beTpSet = true;
-        g_states[st].lastEaWrittenSL = nWantSL;
-      } else {
-        Print("[ManualSwingSLTP] Modify BE/TP failed. ticket=", tk,
-              " profitPts=", DoubleToString(pPts, 1),
-              " wantSL=", DoubleToString(nWantSL, digits),
-              " wantTP=", DoubleToString(nWantTP, digits),
-              " err=", GetLastError());
-      }
-    }
-  }
+  // Break-even + TP: handled in ProcessBundleBreakEvenForSide() when sum(points) on side >= trigger.
 }
 
 //--------------------------- MT5 Events ------------------------------
@@ -1174,6 +1260,9 @@ void OnTick() {
     if (tk == 0) continue;
     ManageManualPosition(tk);
   }
+
+  ProcessBundleBreakEvenForSide(POSITION_TYPE_BUY);
+  ProcessBundleBreakEvenForSide(POSITION_TYPE_SELL);
 
   EnforceGridLegSLFreeze();
   EnforceGridPendingSLFreeze();
