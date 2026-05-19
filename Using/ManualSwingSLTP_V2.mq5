@@ -8,13 +8,11 @@
 //|  - ຕັ້ງ SL ທີ່ swing low (lookback); ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ BuyLimit grid |
 //|    (ຈຳນວນ = GridExtraPendingLegs, ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL).        |
 //|  - ເມື່ອກຳໄລ >= BreakEvenTriggerPoints: SL=entry+BreakEvenPlus, TP=entry+TPPoints |
-//|  - (v1.14) Manual BUY: M1 ຫຼື M5 ມີ EMA50>EMA200; SELL: M1 ຫຼື M5 EMA50<EMA200 |
 //|                                                                  |
 //| SELL:                                                            |
 //|  - ຕັ້ງ SL ທີ່ swing high; ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ SellLimit grid ຂຶ້ນຈາກ entry |
 //|    ຫ່າງກັນສະເໝີຕາມ GridExtraPendingLegs ຈົນບໍ່ເກີນ SL.              |
 //|  - ເມື່ອກຳໄລ >= BreakEvenTriggerPoints: SL=entry-BreakEvenPlus, TP=entry-TPPoints |
-//|  - (v1.14) Trend gate ເຊົ່ນດຽວກັນກັບ BUY (M1 OR M5)                    |
 //|                                                                   |
 //| ໝາຍເຫດ: EA ຈັດການສະເພາະ manual positions (magic != MagicNumber) |
 //| Bugfix v1.01: ລ້າງລາຍການ ticket ທີ່ປິດແລ້ວອອກຈາກ g_states — ບໍ່ດັ່ນຫຼັງມີ ~200 |
@@ -35,12 +33,10 @@
 //| v1.11: BE — ບໍ່ຕັ້ງ beTpSet ຄ້າງວົງ swing ເມື່ອກຳໄລຮອດ trigger ແລ້ວ; ຖ້າ BE+ ຕິດ |
 //|   stops level ຈະຂຍັບ SL ໃຫ້ໃກ້ຕະຫຼາດທີ່ broker ຍອມຮັບ (BreakEvenRelaxSLToStopsLevel). |
 //| v1.12: MaxLotPerLeg — ຫ້າມ lot ຕໍ່ໄມ້ເກີນຄ່າກຳນົດ (ຕັດ position / ປັບ pending). |
-//| v1.13: Trend gate — manual BUY ຕ້ອງ EMA fast > slow; manual SELL ຕ້ອງ fast < slow. |
-//| v1.14: Trend gate M1 OR M5 — BUY ຖ້າ M1 ຫຼື M5 ມີ EMA50>200; SELL ຖ້າ M1 ຫຼື M5 EMA50<200. |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.14"
-#property description "Swing SL/TP + EMA trend gate + BE + grid freeze + bundle."
+#property version   "1.12"
+#property description "Swing SL/TP + BE broker-safe SL + grid freeze + bundle + sync TP."
 
 #include <Trade/Trade.mqh>
 
@@ -78,21 +74,8 @@ input bool ShareInitialSLPriceToAllLegs = true; // same SL price on every same-s
 input bool ProtectSLFreezeBeforeBE    = true;  // before BE: SL must stay at committed price (restore if moved/cleared)
 // If freeze is OFF: ProtectSLClampNoWiden only blocks widening past commit; if freeze ON, clamp widen is redundant.
 
-input bool   UseTrendFilter           = true;   // gate manual entries by EMA trend on M1/M5 (OR)
-input bool   TrendFilterUseM1         = true;   // check PERIOD_M1 EMA50 vs EMA200
-input bool   TrendFilterUseM5         = true;   // check PERIOD_M5 EMA50 vs EMA200
-input int    TrendEMAFastPeriod       = 50;     // fast EMA (e.g. 50)
-input int    TrendEMASlowPeriod       = 200;    // slow EMA (e.g. 200)
-input int    TrendEMAShift            = 0;      // 0 = current bar, 1 = last closed bar
-input bool   TrendFilterAlert         = true;   // Alert when a manual entry is rejected
-
 //--------------------------- Globals --------------------------------
 CTrade trade;
-
-int g_hTrendEmaFastM1 = INVALID_HANDLE;
-int g_hTrendEmaSlowM1 = INVALID_HANDLE;
-int g_hTrendEmaFastM5 = INVALID_HANDLE;
-int g_hTrendEmaSlowM5 = INVALID_HANDLE;
 
 // Locked once per "wave" when first swing SL succeeds for that direction (0 = not locked).
 int g_maxBuyBundlePositions = 0;
@@ -121,157 +104,6 @@ double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
 int DigitsCount() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
 double Np(const double p) { return NormalizeDouble(p, DigitsCount()); }
 int StopsLevelPoints() { return (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL); }
-
-bool GetTrendEMAsFromHandles(const int hFast, const int hSlow,
-                            double &emaFast, double &emaSlow) {
-  emaFast = 0.0;
-  emaSlow = 0.0;
-  if (hFast == INVALID_HANDLE || hSlow == INVALID_HANDLE)
-    return false;
-  const int sh = (TrendEMAShift < 0) ? 0 : TrendEMAShift;
-  double bf[1], bs[1];
-  if (CopyBuffer(hFast, 0, sh, 1, bf) != 1) return false;
-  if (CopyBuffer(hSlow, 0, sh, 1, bs) != 1) return false;
-  emaFast = bf[0];
-  emaSlow = bs[0];
-  return (emaFast > 0.0 && emaSlow > 0.0);
-}
-
-// BUY allowed if M1 OR M5 (whichever is enabled) has EMA50 > EMA200.
-bool TrendAllowsBuy() {
-  if (!UseTrendFilter) return true;
-  if (!TrendFilterUseM1 && !TrendFilterUseM5) return true;
-
-  bool checked = false;
-  bool allowed = false;
-
-  if (TrendFilterUseM1) {
-    if (g_hTrendEmaFastM1 != INVALID_HANDLE && g_hTrendEmaSlowM1 != INVALID_HANDLE) {
-      double ef = 0.0, es = 0.0;
-      if (GetTrendEMAsFromHandles(g_hTrendEmaFastM1, g_hTrendEmaSlowM1, ef, es)) {
-        checked = true;
-        if (ef > es) allowed = true;
-      }
-    }
-  }
-  if (TrendFilterUseM5) {
-    if (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE) {
-      double ef = 0.0, es = 0.0;
-      if (GetTrendEMAsFromHandles(g_hTrendEmaFastM5, g_hTrendEmaSlowM5, ef, es)) {
-        checked = true;
-        if (ef > es) allowed = true;
-      }
-    }
-  }
-
-  if (!checked) return true; // no EMA data — do not block
-  return allowed;
-}
-
-// SELL allowed if M1 OR M5 has EMA50 < EMA200.
-bool TrendAllowsSell() {
-  if (!UseTrendFilter) return true;
-  if (!TrendFilterUseM1 && !TrendFilterUseM5) return true;
-
-  bool checked = false;
-  bool allowed = false;
-
-  if (TrendFilterUseM1) {
-    if (g_hTrendEmaFastM1 != INVALID_HANDLE && g_hTrendEmaSlowM1 != INVALID_HANDLE) {
-      double ef = 0.0, es = 0.0;
-      if (GetTrendEMAsFromHandles(g_hTrendEmaFastM1, g_hTrendEmaSlowM1, ef, es)) {
-        checked = true;
-        if (ef < es) allowed = true;
-      }
-    }
-  }
-  if (TrendFilterUseM5) {
-    if (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE) {
-      double ef = 0.0, es = 0.0;
-      if (GetTrendEMAsFromHandles(g_hTrendEmaFastM5, g_hTrendEmaSlowM5, ef, es)) {
-        checked = true;
-        if (ef < es) allowed = true;
-      }
-    }
-  }
-
-  if (!checked) return true;
-  return allowed;
-}
-
-bool IsManualPositionTicket(const ulong tk) {
-  if (tk == 0 || !PositionSelectByTicket(tk)) return false;
-  if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
-  return ((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber);
-}
-
-bool IsManualPendingOrder(const ulong ot) {
-  if (ot == 0 || !OrderSelect(ot)) return false;
-  if (OrderGetString(ORDER_SYMBOL) != _Symbol) return false;
-  return ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber);
-}
-
-bool ManualOrderTypeIsBuySide(const ENUM_ORDER_TYPE typ) {
-  return (typ == ORDER_TYPE_BUY || typ == ORDER_TYPE_BUY_LIMIT ||
-          typ == ORDER_TYPE_BUY_STOP || typ == ORDER_TYPE_BUY_STOP_LIMIT);
-}
-
-bool ManualOrderTypeIsSellSide(const ENUM_ORDER_TYPE typ) {
-  return (typ == ORDER_TYPE_SELL || typ == ORDER_TYPE_SELL_LIMIT ||
-          typ == ORDER_TYPE_SELL_STOP || typ == ORDER_TYPE_SELL_STOP_LIMIT);
-}
-
-void NotifyTrendBlocked(const string msg) {
-  Print("[ManualSwingSLTP] ", msg);
-  if (TrendFilterAlert)
-    Alert(msg);
-}
-
-// Close manual positions / delete manual pendings that violate EMA trend gate.
-// (MT5 cannot block the terminal click; we reject right after open.)
-void EnforceTrendFilterOnManualTrades() {
-  if (!UseTrendFilter) return;
-
-  trade.SetExpertMagicNumber(0);
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsManualPositionTicket(tk)) continue;
-
-    const ENUM_POSITION_TYPE typ =
-        (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-    const bool isBuy = (typ == POSITION_TYPE_BUY);
-    if (isBuy && TrendAllowsBuy()) continue;
-    if (!isBuy && TrendAllowsSell()) continue;
-
-    const string side = isBuy ? "BUY" : "SELL";
-    NotifyTrendBlocked("Trend filter: closing manual " + side +
-                       " ticket " + IntegerToString((long)tk) +
-                       " (need M1 OR M5: EMA" + IntegerToString(TrendEMAFastPeriod) +
-                       (isBuy ? " > " : " < ") + "EMA" +
-                       IntegerToString(TrendEMASlowPeriod) + ")");
-    if (!trade.PositionClose(tk))
-      Print("[ManualSwingSLTP] Trend filter: PositionClose failed tk=", tk,
-            " ret=", trade.ResultRetcode());
-  }
-
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (!IsManualPendingOrder(ot)) continue;
-
-    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    if (ManualOrderTypeIsBuySide(otyp) && TrendAllowsBuy()) continue;
-    if (ManualOrderTypeIsSellSide(otyp) && TrendAllowsSell()) continue;
-
-    const string side = ManualOrderTypeIsBuySide(otyp) ? "BUY" : "SELL";
-    NotifyTrendBlocked("Trend filter: deleting manual pending " + side +
-                       " order " + IntegerToString((long)ot));
-    if (!trade.OrderDelete(ot))
-      Print("[ManualSwingSLTP] Trend filter: OrderDelete failed ot=", ot,
-            " ret=", trade.ResultRetcode());
-  }
-}
 
 int FindStateIndex(const ulong ticket) {
   for (int i = 0; i < g_statesCount; i++) {
@@ -1150,10 +982,6 @@ void ManageManualPosition(const ulong tk) {
   if (magic == MagicNumber) return; // skip EA's own positions
 
   const ENUM_POSITION_TYPE typ = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-  if (UseTrendFilter) {
-    if (typ == POSITION_TYPE_BUY && !TrendAllowsBuy()) return;
-    if (typ == POSITION_TYPE_SELL && !TrendAllowsSell()) return;
-  }
   const double open = PositionGetDouble(POSITION_PRICE_OPEN);
   double workSL = PositionGetDouble(POSITION_SL);
   double workTP = PositionGetDouble(POSITION_TP);
@@ -1327,99 +1155,11 @@ int OnInit() {
     trade.SetTypeFilling(ORDER_FILLING_FOK);
   else
     trade.SetTypeFilling(ORDER_FILLING_RETURN);
-
-  if (UseTrendFilter) {
-    if (TrendFilterUseM1) {
-      g_hTrendEmaFastM1 = iMA(_Symbol, PERIOD_M1, TrendEMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
-      g_hTrendEmaSlowM1 = iMA(_Symbol, PERIOD_M1, TrendEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    }
-    if (TrendFilterUseM5) {
-      g_hTrendEmaFastM5 = iMA(_Symbol, PERIOD_M5, TrendEMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
-      g_hTrendEmaSlowM5 = iMA(_Symbol, PERIOD_M5, TrendEMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    }
-    const bool m1ok = (!TrendFilterUseM1) ||
-        (g_hTrendEmaFastM1 != INVALID_HANDLE && g_hTrendEmaSlowM1 != INVALID_HANDLE);
-    const bool m5ok = (!TrendFilterUseM5) ||
-        (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE);
-    if (!m1ok || !m5ok)
-      Print("[ManualSwingSLTP] Trend EMA create failed on some TF — that TF is skipped.");
-    if (m1ok || m5ok)
-      Print("[ManualSwingSLTP] Trend filter ON (M1 OR M5): BUY if EMA", TrendEMAFastPeriod,
-            " > EMA", TrendEMASlowPeriod, " on M1 or M5; SELL if < on M1 or M5; shift=",
-            IntegerToString(TrendEMAShift));
-  }
   return INIT_SUCCEEDED;
-}
-
-void OnDeinit(const int reason) {
-  if (g_hTrendEmaFastM1 != INVALID_HANDLE) {
-    IndicatorRelease(g_hTrendEmaFastM1);
-    g_hTrendEmaFastM1 = INVALID_HANDLE;
-  }
-  if (g_hTrendEmaSlowM1 != INVALID_HANDLE) {
-    IndicatorRelease(g_hTrendEmaSlowM1);
-    g_hTrendEmaSlowM1 = INVALID_HANDLE;
-  }
-  if (g_hTrendEmaFastM5 != INVALID_HANDLE) {
-    IndicatorRelease(g_hTrendEmaFastM5);
-    g_hTrendEmaFastM5 = INVALID_HANDLE;
-  }
-  if (g_hTrendEmaSlowM5 != INVALID_HANDLE) {
-    IndicatorRelease(g_hTrendEmaSlowM5);
-    g_hTrendEmaSlowM5 = INVALID_HANDLE;
-  }
-}
-
-void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest &request,
-                        const MqlTradeResult &result) {
-  if (!UseTrendFilter) return;
-  if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-  if (trans.deal == 0) return;
-  if (!HistoryDealSelect(trans.deal)) return;
-  if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol) return;
-
-  const long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
-  if (entry != DEAL_ENTRY_IN) return;
-
-  const long magic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
-  if (magic == MagicNumber) return;
-
-  const long dtype = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
-  const bool isBuy = (dtype == DEAL_TYPE_BUY);
-  const bool isSell = (dtype == DEAL_TYPE_SELL);
-  if (!isBuy && !isSell) return;
-
-  if (isBuy && TrendAllowsBuy()) return;
-  if (isSell && TrendAllowsSell()) return;
-
-  const ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-  if (posId == 0) {
-    EnforceTrendFilterOnManualTrades();
-    return;
-  }
-
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (tk == 0 || !PositionSelectByTicket(tk)) continue;
-    if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
-    if (!IsManualPositionTicket(tk)) return;
-
-    trade.SetExpertMagicNumber(0);
-    trade.SetDeviationInPoints(SlippagePoints);
-    const string side = isBuy ? "BUY" : "SELL";
-    NotifyTrendBlocked("Trend filter: rejected manual " + side +
-                       " (deal " + IntegerToString((long)trans.deal) + ")");
-    if (!trade.PositionClose(tk))
-      Print("[ManualSwingSLTP] Trend filter: fast close failed tk=", tk);
-    return;
-  }
 }
 
 void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
-
-  EnforceTrendFilterOnManualTrades();
 
   PruneStaleStates();
   ResetBundleCapIfSideFlat(true);
