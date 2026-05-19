@@ -39,11 +39,10 @@
 //| v1.14: Trend gate M1 OR M5 — BUY ຖ້າ M1 ຫຼື M5 ມີ EMA50>200; SELL ຖ້າ M1 ຫຼື M5 EMA50<200. |
 //| v1.15: BE ຕາມໄມ້ທຳອິດຝັ່ງ — trigger ຈາກກຳໄລໄມ້ແຮກ; SL BE+ ລາຄາ entry ໄມ້ແຮກ ທຸກ leg. |
 //| v1.16: MaxLotPerLeg — ຕັດ lot ທັນທີເມື່ອເປີດ manual/grid ເກີນ (magic 0 ສຳລັບ manual). |
-//| v1.17: TotalUSDSL — ຜົນລວມ bundle <= -TotalUSDSL → ປິດທຸກ leg + pending ທັນທີ. |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.17"
-#property description "Swing SL/TP + basket USD stop + EMA gate + BE + grid."
+#property version   "1.16"
+#property description "Swing SL/TP + EMA trend gate + BE + grid freeze + bundle."
 
 #include <Trade/Trade.mqh>
 
@@ -65,7 +64,6 @@ input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 2;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
 input double MaxLotPerLeg             = 0.1;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
-input double TotalUSDSL               = 200.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
 input bool   EnforceInitialBundleMax  = true;   // cap BUY/SELL "legs" to count-at-first-SL + grid legs (see header)
@@ -694,27 +692,6 @@ bool IsBundleOrderLeg(const ulong ot) {
   return (StringFind(c, "MSSLTP") == 0);
 }
 
-int CountBundleMarketPositions() {
-  int n = 0;
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (IsBundlePositionLeg(tk)) n++;
-  }
-  return n;
-}
-
-// Sum floating profit + swap for manual + MSSLTP legs on this symbol (account currency).
-double BundleFloatingProfitMoney() {
-  double sum = 0.0;
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsBundlePositionLeg(tk)) continue;
-    sum += PositionGetDouble(POSITION_PROFIT);
-    sum += PositionGetDouble(POSITION_SWAP);
-  }
-  return sum;
-}
-
 // Oldest open bundle leg on side (manual or MSSLTP) — the "first leg" for BE.
 ulong OldestBundleLegTicket(const ENUM_POSITION_TYPE side) {
   ulong oldestTk = 0;
@@ -780,49 +757,6 @@ void SetTradeMagicForOrderTicket(const ulong ot) {
     trade.SetExpertMagicNumber(MagicNumber);
   else
     trade.SetExpertMagicNumber(0);
-}
-
-void CloseAllBundlePositionsAndOrdersOnSymbol() {
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsBundlePositionLeg(tk)) continue;
-    SetTradeMagicForPositionTicket(tk);
-    if (!trade.PositionClose(tk))
-      Print("[ManualSwingSLTP] Basket close: position failed tk=", tk,
-            " ret=", trade.ResultRetcode());
-  }
-
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (!IsBundleOrderLeg(ot)) continue;
-    SetTradeMagicForOrderTicket(ot);
-    if (!trade.OrderDelete(ot))
-      Print("[ManualSwingSLTP] Basket close: order delete failed ot=", ot,
-            " ret=", trade.ResultRetcode());
-  }
-
-  g_maxBuyBundlePositions = 0;
-  g_maxSellBundlePositions = 0;
-}
-
-// Returns true if basket was closed (caller may skip rest of tick).
-bool CheckBundleTotalUSDStopLoss() {
-  if (TotalUSDSL <= 0.0) return false;
-  if (CountBundleMarketPositions() <= 0) return false;
-
-  const double moneySum = BundleFloatingProfitMoney();
-  if (moneySum > -TotalUSDSL) return false;
-
-  Print("[ManualSwingSLTP] TotalUSDSL reached: bundle floating P/L+swap = ",
-        DoubleToString(moneySum, 2), " <= -", DoubleToString(TotalUSDSL, 2),
-        ". Closing all bundle positions and pendings on ", _Symbol, ".");
-  if (TrendFilterAlert)
-    Alert("[ManualSwingSLTP] TotalUSDSL ", DoubleToString(TotalUSDSL, 2),
-          " hit — closed all bundle on ", _Symbol);
-  CloseAllBundlePositionsAndOrdersOnSymbol();
-  return true;
 }
 
 // Reduce one market position to <= MaxLotPerLeg (e.g. 0.2 → 0.1).
@@ -1655,8 +1589,6 @@ void OnTick() {
   CleanupOrphanGridPendings();
   EnforceBundleMaxPositions();
   EnforceMaxLotPerLeg();
-
-  if (CheckBundleTotalUSDStopLoss()) return;
 
   // Manage all manual positions on this symbol
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
