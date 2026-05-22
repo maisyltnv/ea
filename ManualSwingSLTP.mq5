@@ -40,9 +40,10 @@
 //| v1.15: BE ຕາມໄມ້ທຳອິດຝັ່ງ — trigger ຈາກກຳໄລໄມ້ແຮກ; SL BE+ ລາຄາ entry ໄມ້ແຮກ ທຸກ leg. |
 //| v1.16: MaxLotPerLeg — ຕັດ lot ທັນທີເມື່ອເປີດ manual/grid ເກີນ (magic 0 ສຳລັບ manual). |
 //| v1.17: TotalUSDSL — ຜົນລວມ bundle <= -TotalUSDSL → ປິດທຸກ leg + pending ທັນທີ. |
+//| v1.18: MinSLDistancePoints — ຄັ້ງທຳອິດຖ້າ entry→SL ແຄບກວ່າຄ່ານີ້ ຂະຫຍາຍ SL ໃຫ້ກວ້າງພໍນີ້. |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.17"
+#property version   "1.18"
 #property description "Swing SL/TP + basket USD stop + EMA gate + BE + grid."
 
 #include <Trade/Trade.mqh>
@@ -53,6 +54,7 @@ input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
+input int    MinSLDistancePoints      = 1500;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
 input int    BreakEvenTriggerPoints   = 500;    // first leg profit pts >= this → BE+ all legs (first leg entry)
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
@@ -516,6 +518,28 @@ double SwingHighPrice() {
   int idx = iHighest(_Symbol, SwingTF, MODE_HIGH, count, start);
   if (idx < 0) return 0.0;
   return iHigh(_Symbol, SwingTF, idx);
+}
+
+// First SL only (not ref-copy): if entry→SL is tighter than MinSLDistancePoints,
+// move SL outward so distance equals MinSLDistancePoints (BUY: lower, SELL: higher).
+double WidenSLToMinDistanceIfNeeded(const ENUM_POSITION_TYPE typ, const double entry,
+                                    double sl, const int digits) {
+  if (MinSLDistancePoints <= 0 || sl <= 0.0 || entry <= 0.0) return sl;
+  const double pt = Pt();
+  if (pt <= 0.0) return sl;
+
+  if (typ == POSITION_TYPE_BUY) {
+    if (sl >= entry) return sl;
+    const double distPts = (entry - sl) / pt;
+    if (distPts < (double)MinSLDistancePoints)
+      sl = entry - (double)MinSLDistancePoints * pt;
+  } else {
+    if (sl <= entry) return sl;
+    const double distPts = (sl - entry) / pt;
+    if (distPts < (double)MinSLDistancePoints)
+      sl = entry + (double)MinSLDistancePoints * pt;
+  }
+  return NormalizeDouble(sl, digits);
 }
 
 double ProfitPointsForPosition(const ENUM_POSITION_TYPE typ, const double open) {
@@ -1511,6 +1535,8 @@ void ManageManualPosition(const ulong tk) {
         if (typ == POSITION_TYPE_BUY) sl -= (double)FirstSLOffsetPoints * pt;
         else sl += (double)FirstSLOffsetPoints * pt;
       }
+      if (sl > 0.0)
+        sl = WidenSLToMinDistanceIfNeeded(typ, open, sl, digits);
     }
     if (sl > 0.0) sl = NormalizeDouble(sl, digits);
 
