@@ -8,7 +8,7 @@
 //|  - ຕັ້ງ SL ທີ່ swing low (lookback); ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ BuyLimit grid |
 //|    (ຈຳນວນ = GridExtraPendingLegs, ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL).        |
 //|  - ໄມ້ທຳອິດຝັ່ງນັ້ນກຳໄລ >= BreakEvenTriggerPoints → BE+ ທີ່ entry ໄມ້ທຳອິດ (ທຸກ leg ຝັ່ງດຽວກັນ) |
-//|  - (v1.14/v1.20) Trend M1 OR M5 — ກວດເມື່ອເປີດໄມ້ໃໝ່ເທົ່ານັ້ນ; ເປີດແລ້ວ→SL/TP |
+//|  - (v1.14) Manual BUY: M1 ຫຼື M5 ມີ EMA50>EMA200; SELL: M1 ຫຼື M5 EMA50<EMA200 |
 //|                                                                  |
 //| SELL:                                                            |
 //|  - ຕັ້ງ SL ທີ່ swing high; ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ SellLimit grid ຂຶ້ນຈາກ entry |
@@ -44,14 +44,9 @@
 //| v1.18: MinSLDistancePoints — ຄັ້ງທຳອິດຖ້າ entry→SL ແຄບກວ່າຄ່ານີ້ ຂະຫຍາຍ SL ໃຫ້ກວ້າງພໍນີ້. |
 //| v1.19: Strict plan — ຫຼັງວາງ grid/lock wave: ຫ້າມ manual ເພີ່ມ+pending manual; |
 //|   ກັກລາຄາ/SL/TP/vol ຂອງ EA grid pending ບໍ່ໃຫ້ຍ້າຍ.                      |
-//| v1.20: Trend filter entry-only — M1/M5 OR gate ເມື່ອເປີດໄມ້ໃໝ່ເທົ່ານັ້ນ; |
-//|   bundle ເປີດແລ້ວວິ່ນຈົນ SL/TP ແມ້ EMA ກັບທາງ (ບໍ່ປິດເພາະ trend ປ່ຽນ).   |
-//| v1.21: Entry-only — ບໍ່ລຶບ pending ທີ່ວາງແລ້ວ (manual+grid) ເມື່ອ EMA ກັບທາງ; |
-//|   ກວດ trend ພຽງຕອນສ້າງອໍເດີ/ pending ໃໝ່ (OnTradeTransaction).          |
-//| v1.22: Compile fix — ApplyStrictTradingPlan vs input name; MQL5 loop vars. |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.23"
+#property version   "1.19"
 #property description "Swing SL/TP + basket USD stop + EMA gate + BE + grid."
 
 #include <Trade/Trade.mqh>
@@ -101,7 +96,6 @@ input bool   TrendFilterUseM5         = true;   // check PERIOD_M5 EMA50 vs EMA2
 input int    TrendEMAFastPeriod       = 50;     // fast EMA (e.g. 50)
 input int    TrendEMASlowPeriod       = 200;    // slow EMA (e.g. 200)
 input int    TrendEMAShift            = 0;      // 0 = current bar, 1 = last closed bar
-input bool   TrendFilterEntryOnly     = true;   // true: gate NEW manual at click only; open legs+existing pendings kept if EMA flips
 input bool   TrendFilterAlert         = true;   // Alert when a manual entry is rejected
 
 //--------------------------- Globals --------------------------------
@@ -120,7 +114,7 @@ struct TicketState {
   ulong ticket;
   bool swingSLSet;
   bool beTpSet;
-  bool gridDone;
+  bool gridDone; ່
   double protectBoundSL;
   double lastEaWrittenSL;
   bool userTouchedSL;
@@ -141,12 +135,6 @@ double g_gridSnapSL[MAX_GRID_PENDING_SNAP];
 double g_gridSnapTP[MAX_GRID_PENDING_SNAP];
 double g_gridSnapVol[MAX_GRID_PENDING_SNAP];
 int g_gridSnapCount = 0;
-
-// Forward declarations (helpers defined later in file)
-int  CountBundleLegs(const bool buySide);
-int  FindStateIndex(const ulong ticket);
-bool PendingSlDistanceOkVsOrder(const bool isBuyLimit, const double orderPrice,
-                                const double sl);
 
 //--------------------------- Helpers --------------------------------
 double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
@@ -176,13 +164,10 @@ bool TrendAllowsBuy() {
 
   bool checked = false;
   bool allowed = false;
-  double ef = 0.0;
-  double es = 0.0;
 
   if (TrendFilterUseM1) {
     if (g_hTrendEmaFastM1 != INVALID_HANDLE && g_hTrendEmaSlowM1 != INVALID_HANDLE) {
-      ef = 0.0;
-      es = 0.0;
+      double ef = 0.0, es = 0.0;
       if (GetTrendEMAsFromHandles(g_hTrendEmaFastM1, g_hTrendEmaSlowM1, ef, es)) {
         checked = true;
         if (ef > es) allowed = true;
@@ -191,8 +176,7 @@ bool TrendAllowsBuy() {
   }
   if (TrendFilterUseM5) {
     if (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE) {
-      ef = 0.0;
-      es = 0.0;
+      double ef = 0.0, es = 0.0;
       if (GetTrendEMAsFromHandles(g_hTrendEmaFastM5, g_hTrendEmaSlowM5, ef, es)) {
         checked = true;
         if (ef > es) allowed = true;
@@ -211,13 +195,10 @@ bool TrendAllowsSell() {
 
   bool checked = false;
   bool allowed = false;
-  double ef = 0.0;
-  double es = 0.0;
 
   if (TrendFilterUseM1) {
     if (g_hTrendEmaFastM1 != INVALID_HANDLE && g_hTrendEmaSlowM1 != INVALID_HANDLE) {
-      ef = 0.0;
-      es = 0.0;
+      double ef = 0.0, es = 0.0;
       if (GetTrendEMAsFromHandles(g_hTrendEmaFastM1, g_hTrendEmaSlowM1, ef, es)) {
         checked = true;
         if (ef < es) allowed = true;
@@ -226,8 +207,7 @@ bool TrendAllowsSell() {
   }
   if (TrendFilterUseM5) {
     if (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE) {
-      ef = 0.0;
-      es = 0.0;
+      double ef = 0.0, es = 0.0;
       if (GetTrendEMAsFromHandles(g_hTrendEmaFastM5, g_hTrendEmaSlowM5, ef, es)) {
         checked = true;
         if (ef < es) allowed = true;
@@ -494,32 +474,9 @@ void EnforceGridPendingPlanFreeze() {
   }
 }
 
-// Delete manual pendings that violate EMA entry gate (not EA MSSLTP grid).
-void EnforceTrendFilterManualPendingsOnly() {
-  if (!UseTrendFilter) return;
-
-  trade.SetExpertMagicNumber(0);
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (!IsManualPendingOrder(ot)) continue;
-
-    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    if (ManualOrderTypeIsBuySide(otyp) && TrendAllowsBuy()) continue;
-    if (ManualOrderTypeIsSellSide(otyp) && TrendAllowsSell()) continue;
-
-    const string side = ManualOrderTypeIsBuySide(otyp) ? "BUY" : "SELL";
-    NotifyTrendBlocked("Trend filter: deleting manual pending " + side +
-                       " order " + IntegerToString((long)ot));
-    if (!trade.OrderDelete(ot))
-      Print("[ManualSwingSLTP] Trend filter: OrderDelete failed ot=", ot,
-            " ret=", trade.ResultRetcode());
-  }
-}
-
-// Legacy: close open manual positions + delete pendings when trend no longer allows.
-void EnforceTrendFilterOnManualTradesLegacy() {
+// Close manual positions / delete manual pendings that violate EMA trend gate.
+// (MT5 cannot block the terminal click; we reject right after open.)
+void EnforceTrendFilterOnManualTrades() {
   if (!UseTrendFilter) return;
 
   trade.SetExpertMagicNumber(0);
@@ -546,32 +503,21 @@ void EnforceTrendFilterOnManualTradesLegacy() {
             " ret=", trade.ResultRetcode());
   }
 
-  EnforceTrendFilterManualPendingsOnly();
-}
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (!IsManualPendingOrder(ot)) continue;
 
-// Tick sweep — only in legacy mode. Entry-only: no tick deletes (pendings/positions stay).
-void EnforceTrendFilterOnManualTrades() {
-  if (!UseTrendFilter || TrendFilterEntryOnly) return;
-  EnforceTrendFilterOnManualTradesLegacy();
-}
+    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    if (ManualOrderTypeIsBuySide(otyp) && TrendAllowsBuy()) continue;
+    if (ManualOrderTypeIsSellSide(otyp) && TrendAllowsSell()) continue;
 
-// Reject one manual pending order if it fails the entry trend gate.
-void RejectManualPendingIfTrendBlocks(const ulong ot) {
-  if (!UseTrendFilter || ot == 0 || !OrderSelect(ot)) return;
-  if (!IsManualPendingOrder(ot)) return;
-
-  const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-  if (ManualOrderTypeIsBuySide(otyp) && TrendAllowsBuy()) return;
-  if (ManualOrderTypeIsSellSide(otyp) && TrendAllowsSell()) return;
-
-  const string side = ManualOrderTypeIsBuySide(otyp) ? "BUY" : "SELL";
-  trade.SetExpertMagicNumber(0);
-  trade.SetDeviationInPoints(SlippagePoints);
-  NotifyTrendBlocked("Trend filter: rejected manual pending " + side +
-                     " order " + IntegerToString((long)ot));
-  if (!trade.OrderDelete(ot))
-    Print("[ManualSwingSLTP] Trend filter: OrderDelete failed ot=", ot,
-          " ret=", trade.ResultRetcode());
+    const string side = ManualOrderTypeIsBuySide(otyp) ? "BUY" : "SELL";
+    NotifyTrendBlocked("Trend filter: deleting manual pending " + side +
+                       " order " + IntegerToString((long)ot));
+    if (!trade.OrderDelete(ot))
+      Print("[ManualSwingSLTP] Trend filter: OrderDelete failed ot=", ot,
+            " ret=", trade.ResultRetcode());
+  }
 }
 
 int FindStateIndex(const ulong ticket) {
@@ -672,11 +618,8 @@ void SyncTPFromManualUserChange() {
   double curTP[MAX_TP_MANUAL_TRACK];
   ENUM_POSITION_TYPE curSide[MAX_TP_MANUAL_TRACK];
   int nMan = 0;
-  int ii = 0;
-  int jj = 0;
-  ulong tk = 0;
-  for (ii = PositionsTotal() - 1; ii >= 0 && nMan < MAX_TP_MANUAL_TRACK; ii--) {
-    tk = PositionGetTicket(ii);
+  for (int i = PositionsTotal() - 1; i >= 0 && nMan < MAX_TP_MANUAL_TRACK; i--) {
+    const ulong tk = PositionGetTicket(i);
     if (tk == 0 || !PositionSelectByTicket(tk)) continue;
     if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
     if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) continue;
@@ -691,30 +634,30 @@ void SyncTPFromManualUserChange() {
   ENUM_POSITION_TYPE side = POSITION_TYPE_BUY;
   bool deleteTP = false;
 
-  for (ii = 0; ii < nMan; ii++) {
-    const double tp = curTP[ii];
+  for (int i = 0; i < nMan; i++) {
+    const double tp = curTP[i];
     bool found = false;
     double prev = 0.0;
-    for (jj = 0; jj < g_tpManSnapshotCount; jj++) {
-      if (g_tpManTickets[jj] == curTk[ii]) {
+    for (int j = 0; j < g_tpManSnapshotCount; j++) {
+      if (g_tpManTickets[j] == curTk[i]) {
         found = true;
-        prev = g_tpManPrevTP[jj];
+        prev = g_tpManPrevTP[j];
         break;
       }
     }
     if (!found) continue;
 
     if (SyncTPDeletionToAll && prev > 0.0 && tp <= 0.0) {
-      changedTk = curTk[ii];
+      changedTk = curTk[i];
       newTP = 0.0;
-      side = curSide[ii];
+      side = curSide[i];
       deleteTP = true;
       break;
     }
     if (tp > 0.0 && MathAbs(prev - tp) > eps) {
-      changedTk = curTk[ii];
+      changedTk = curTk[i];
       newTP = NormalizeDouble(tp, digits);
-      side = curSide[ii];
+      side = curSide[i];
       deleteTP = false;
       break;
     }
@@ -726,8 +669,8 @@ void SyncTPFromManualUserChange() {
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  for (ii = PositionsTotal() - 1; ii >= 0; ii--) {
-    tk = PositionGetTicket(ii);
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
     if (tk == 0 || !PositionSelectByTicket(tk)) continue;
     if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
     const ENUM_POSITION_TYPE pt = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
@@ -749,9 +692,8 @@ void SyncTPFromManualUserChange() {
             trade.ResultRetcode());
   }
 
-  ulong ot = 0;
-  for (jj = OrdersTotal() - 1; jj >= 0; jj--) {
-    ot = OrderGetTicket(jj);
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
     if (ot == 0 || !OrderSelect(ot)) continue;
     if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
     if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
@@ -827,15 +769,14 @@ double WidenSLToMinDistanceIfNeeded(const ENUM_POSITION_TYPE typ, const double e
   const double pt = Pt();
   if (pt <= 0.0) return sl;
 
-  double distPts = 0.0;
   if (typ == POSITION_TYPE_BUY) {
     if (sl >= entry) return sl;
-    distPts = (entry - sl) / pt;
+    const double distPts = (entry - sl) / pt;
     if (distPts < (double)MinSLDistancePoints)
       sl = entry - (double)MinSLDistancePoints * pt;
   } else {
     if (sl <= entry) return sl;
-    distPts = (sl - entry) / pt;
+    const double distPts = (sl - entry) / pt;
     if (distPts < (double)MinSLDistancePoints)
       sl = entry + (double)MinSLDistancePoints * pt;
   }
@@ -914,17 +855,16 @@ int BundleExtraLegsForLock() {
 void MaybeLockBundleMaxForDirection(const ENUM_POSITION_TYPE typ) {
   if (!EnforceInitialBundleMax) return;
   const int extra = BundleExtraLegsForLock();
-  int n = 0;
   if (typ == POSITION_TYPE_BUY) {
     if (g_maxBuyBundlePositions > 0) return;
-    n = CountBundleLegs(true);
+    const int n = CountBundleLegs(true);
     g_maxBuyBundlePositions = n + extra;
     if (g_maxBuyBundlePositions < n) g_maxBuyBundlePositions = n;
     Print("[ManualSwingSLTP] BUY bundle max locked = ", g_maxBuyBundlePositions,
           " (open legs ", n, " + extra ", extra, ")");
   } else {
     if (g_maxSellBundlePositions > 0) return;
-    n = CountBundleLegs(false);
+    const int n = CountBundleLegs(false);
     g_maxSellBundlePositions = n + extra;
     if (g_maxSellBundlePositions < n) g_maxSellBundlePositions = n;
     Print("[ManualSwingSLTP] SELL bundle max locked = ", g_maxSellBundlePositions,
@@ -1371,59 +1311,53 @@ void TryPlaceGridPendings(const ulong parentTk, const ENUM_POSITION_TYPE typ,
   const string tag = GridParentTag(parentTk);
   const double gridSL = NormalizeDouble(slBound, digits);
 
-  int gi = 0;
-  double gprice = 0.0;
-  double gstep = 0.0;
-  double gspan = 0.0;
-  ulong gridOrd = 0;
-
   if (typ == POSITION_TYPE_BUY) {
     const double floorSL = slBound + minDist;
-    gspan = entry - floorSL;
-    if (gspan <= pt) {
+    const double span = entry - floorSL;
+    if (span <= pt) {
       g_states[st].gridDone = true;
       return;
     }
-    gstep = gspan / (double)(legs + 1);
-    for (gi = 1; gi <= legs; gi++) {
-      gprice = NormalizeDouble(entry - gstep * (double)gi, digits);
-      if (gprice <= floorSL) break;
-      if (gprice >= ask - minDist) continue;
-      if (HasPendingLimitNear(true, gprice)) continue;
-      if (!PendingSlDistanceOkVsOrder(true, gprice, gridSL)) continue;
-      if (!trade.BuyLimit(lots, gprice, _Symbol, gridSL, 0.0, ORDER_TIME_GTC, 0,
+    const double step = span / (double)(legs + 1);
+    for (int i = 1; i <= legs; i++) {
+      const double price = NormalizeDouble(entry - step * (double)i, digits);
+      if (price <= floorSL) break;
+      if (price >= ask - minDist) continue;
+      if (HasPendingLimitNear(true, price)) continue;
+      if (!PendingSlDistanceOkVsOrder(true, price, gridSL)) continue;
+      if (!trade.BuyLimit(lots, price, _Symbol, gridSL, 0.0, ORDER_TIME_GTC, 0,
                           tag)) {
-        Print("[ManualSwingSLTP] BuyLimit grid i=", gi, " ret=", trade.ResultRetcode(),
+        Print("[ManualSwingSLTP] BuyLimit grid i=", i, " ret=", trade.ResultRetcode(),
               " ", trade.ResultRetcodeDescription());
         break;
       }
-      gridOrd = trade.ResultOrder();
-      if (gridOrd > 0)
-        RegisterGridPendingSnapshot(gridOrd, gprice, gridSL, 0.0, lots);
+      const ulong got = trade.ResultOrder();
+      if (got > 0)
+        RegisterGridPendingSnapshot(got, price, gridSL, 0.0, lots);
     }
   } else {
     const double ceilSL = slBound - minDist;
-    gspan = ceilSL - entry;
-    if (gspan <= pt) {
+    const double span = ceilSL - entry;
+    if (span <= pt) {
       g_states[st].gridDone = true;
       return;
     }
-    gstep = gspan / (double)(legs + 1);
-    for (gi = 1; gi <= legs; gi++) {
-      gprice = NormalizeDouble(entry + gstep * (double)gi, digits);
-      if (gprice >= ceilSL) break;
-      if (gprice <= bid + minDist) continue;
-      if (HasPendingLimitNear(false, gprice)) continue;
-      if (!PendingSlDistanceOkVsOrder(false, gprice, gridSL)) continue;
-      if (!trade.SellLimit(lots, gprice, _Symbol, gridSL, 0.0, ORDER_TIME_GTC, 0,
+    const double step = span / (double)(legs + 1);
+    for (int i = 1; i <= legs; i++) {
+      const double price = NormalizeDouble(entry + step * (double)i, digits);
+      if (price >= ceilSL) break;
+      if (price <= bid + minDist) continue;
+      if (HasPendingLimitNear(false, price)) continue;
+      if (!PendingSlDistanceOkVsOrder(false, price, gridSL)) continue;
+      if (!trade.SellLimit(lots, price, _Symbol, gridSL, 0.0, ORDER_TIME_GTC, 0,
                            tag)) {
-        Print("[ManualSwingSLTP] SellLimit grid i=", gi, " ret=", trade.ResultRetcode(),
+        Print("[ManualSwingSLTP] SellLimit grid i=", i, " ret=", trade.ResultRetcode(),
               " ", trade.ResultRetcodeDescription());
         break;
       }
-      gridOrd = trade.ResultOrder();
-      if (gridOrd > 0)
-        RegisterGridPendingSnapshot(gridOrd, gprice, gridSL, 0.0, lots);
+      const ulong got = trade.ResultOrder();
+      if (got > 0)
+        RegisterGridPendingSnapshot(got, price, gridSL, 0.0, lots);
     }
   }
   g_states[st].gridDone = true;
@@ -1442,25 +1376,22 @@ void ApplySharedSwingSLPrice(const ulong anchorTk, const ENUM_POSITION_TYPE typ,
   const int kMax = 220;
   ulong list[220];
   int n = 0;
-  int si = 0;
-  ulong t2 = 0;
-  long mag = 0;
-  for (si = PositionsTotal() - 1; si >= 0 && n < kMax; si--) {
-    t2 = PositionGetTicket(si);
+  for (int i = PositionsTotal() - 1; i >= 0 && n < kMax; i--) {
+    const ulong t2 = PositionGetTicket(i);
     if (t2 == 0 || !PositionSelectByTicket(t2)) continue;
     if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
     if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != typ) continue;
-    mag = (long)PositionGetInteger(POSITION_MAGIC);
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
     const string com = PositionGetString(POSITION_COMMENT);
     if (mag == MagicNumber && StringFind(com, "MSSLTP") != 0) continue;
     if (PositionGetDouble(POSITION_SL) > 0.0) continue;
     list[n++] = t2;
   }
-  for (si = 0; si < n; si++) {
-    if (list[si] == anchorTk) {
+  for (int i = 0; i < n; i++) {
+    if (list[i] == anchorTk) {
       const ulong tmp = list[0];
-      list[0] = list[si];
-      list[si] = tmp;
+      list[0] = list[i];
+      list[i] = tmp;
       break;
     }
   }
@@ -1468,8 +1399,8 @@ void ApplySharedSwingSLPrice(const ulong anchorTk, const ENUM_POSITION_TYPE typ,
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  for (si = 0; si < n; si++) {
-    t2 = list[si];
+  for (int i = 0; i < n; i++) {
+    const ulong t2 = list[i];
     if (!PositionSelectByTicket(t2)) continue;
     const double otp = PositionGetDouble(POSITION_TP);
     if (!RespectStopsDistanceFromMarket(isBuy, sl, otp)) continue;
@@ -1478,7 +1409,7 @@ void ApplySharedSwingSLPrice(const ulong anchorTk, const ENUM_POSITION_TYPE typ,
             " ret=", trade.ResultRetcode());
       continue;
     }
-    mag = (long)PositionGetInteger(POSITION_MAGIC);
+    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
     if (mag != MagicNumber) {
       const int st2 = EnsureState(t2);
       if (st2 < 0) continue;
@@ -1651,8 +1582,8 @@ bool ProtectRestoreOrClampSL(const ulong tk, const int st,
 
   if (!ProtectSLClampNoWiden) return false;
 
-  const double nsl = NormalizeDouble(bound, digits);
   if (isBuy && curSL + eps < bound) {
+    const double nsl = NormalizeDouble(bound, digits);
     if (!RespectStopDistanceSLOnly(true, nsl)) return false;
     if (trade.PositionModify(tk, nsl, curTP)) {
       g_states[st].lastEaWrittenSL = nsl;
@@ -1660,6 +1591,7 @@ bool ProtectRestoreOrClampSL(const ulong tk, const int st,
       return true;
     }
   } else if (!isBuy && curSL > bound + eps) {
+    const double nsl = NormalizeDouble(bound, digits);
     if (!RespectStopDistanceSLOnly(false, nsl)) return false;
     if (trade.PositionModify(tk, nsl, curTP)) {
       g_states[st].lastEaWrittenSL = nsl;
@@ -1792,8 +1724,7 @@ void ManageManualPosition(const ulong tk) {
   if (magic == MagicNumber) return; // skip EA's own positions
 
   const ENUM_POSITION_TYPE typ = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-  // v1.20: open bundle keeps SL/TP/BE management even if M1/M5 EMA flips against the side.
-  if (UseTrendFilter && !TrendFilterEntryOnly) {
+  if (UseTrendFilter) {
     if (typ == POSITION_TYPE_BUY && !TrendAllowsBuy()) return;
     if (typ == POSITION_TYPE_SELL && !TrendAllowsSell()) return;
   }
@@ -1838,12 +1769,11 @@ void ManageManualPosition(const ulong tk) {
     if (refSL > 0.0) {
       sl = refSL;
     } else {
-      double sw = 0.0;
       if (typ == POSITION_TYPE_BUY) {
-        sw = SwingLowPrice();
+        double sw = SwingLowPrice();
         if (sw > 0.0) sl = sw - (double)SwingBufferPoints * pt;
       } else {
-        sw = SwingHighPrice();
+        double sw = SwingHighPrice();
         if (sw > 0.0) sl = sw + (double)SwingBufferPoints * pt;
       }
 
@@ -1906,16 +1836,10 @@ int OnInit() {
         (g_hTrendEmaFastM5 != INVALID_HANDLE && g_hTrendEmaSlowM5 != INVALID_HANDLE);
     if (!m1ok || !m5ok)
       Print("[ManualSwingSLTP] Trend EMA create failed on some TF — that TF is skipped.");
-    if (m1ok || m5ok) {
+    if (m1ok || m5ok)
       Print("[ManualSwingSLTP] Trend filter ON (M1 OR M5): BUY if EMA", TrendEMAFastPeriod,
             " > EMA", TrendEMASlowPeriod, " on M1 or M5; SELL if < on M1 or M5; shift=",
             IntegerToString(TrendEMAShift));
-      if (TrendFilterEntryOnly)
-        Print("[ManualSwingSLTP] Trend filter entry-only: gate at NEW click only; open positions + ",
-              "existing pendings (manual+grid) kept when EMA flips.");
-      else
-        Print("[ManualSwingSLTP] Trend filter legacy: closes manual positions/pendings when EMA flips.");
-    }
   }
   if (EnforceStrictTradingPlan)
     Print("[ManualSwingSLTP] Strict trading plan ON: after grid/wave lock — one manual anchor per side, ",
@@ -1945,15 +1869,6 @@ void OnDeinit(const int reason) {
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result) {
-  if (trans.type == TRADE_TRANSACTION_ORDER_ADD) {
-    if (UseTrendFilter && trans.order > 0) {
-      if (OrderSelect(trans.order) &&
-          OrderGetString(ORDER_SYMBOL) == _Symbol)
-        RejectManualPendingIfTrendBlocks(trans.order);
-    }
-    return;
-  }
-
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
   if (trans.deal == 0) return;
   if (!HistoryDealSelect(trans.deal)) return;
@@ -1968,22 +1883,23 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   const bool isSell = (dtype == DEAL_TYPE_SELL);
 
   const ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
-  int pi = 0;
-  ulong tk = 0;
-  string sideMsg = "";
 
   if (UseTrendFilter && magic != MagicNumber && (isBuy || isSell)) {
     if ((isBuy && !TrendAllowsBuy()) || (isSell && !TrendAllowsSell())) {
-      for (pi = PositionsTotal() - 1; pi >= 0; pi--) {
-        tk = PositionGetTicket(pi);
+      if (posId == 0) {
+        EnforceTrendFilterOnManualTrades();
+        return;
+      }
+      for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        const ulong tk = PositionGetTicket(i);
         if (tk == 0 || !PositionSelectByTicket(tk)) continue;
         if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
         if (!IsManualPositionTicket(tk)) return;
 
         trade.SetExpertMagicNumber(0);
         trade.SetDeviationInPoints(SlippagePoints);
-        sideMsg = isBuy ? "BUY" : "SELL";
-        NotifyTrendBlocked("Trend filter: rejected manual " + sideMsg +
+        const string side = isBuy ? "BUY" : "SELL";
+        NotifyTrendBlocked("Trend filter: rejected manual " + side +
                            " (deal " + IntegerToString((long)trans.deal) + ")");
         if (!trade.PositionClose(tk))
           Print("[ManualSwingSLTP] Trend filter: fast close failed tk=", tk);
@@ -1993,8 +1909,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   }
 
   if (MaxLotPerLeg > 0.0 && posId > 0) {
-    for (pi = PositionsTotal() - 1; pi >= 0; pi--) {
-      tk = PositionGetTicket(pi);
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
       if (tk == 0 || !PositionSelectByTicket(tk)) continue;
       if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
       if (!IsBundlePositionLeg(tk)) return;
@@ -2007,8 +1923,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       posId > 0) {
     const bool buySide = isBuy;
     if (StrictPlanActiveOnSide(buySide)) {
-      for (pi = PositionsTotal() - 1; pi >= 0; pi--) {
-        tk = PositionGetTicket(pi);
+      for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        const ulong tk = PositionGetTicket(i);
         if (tk == 0 || !PositionSelectByTicket(tk)) continue;
         if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
         if (!IsManualPositionTicket(tk)) return;
@@ -2018,8 +1934,8 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
         trade.SetExpertMagicNumber(0);
         trade.SetDeviationInPoints(SlippagePoints);
-        sideMsg = buySide ? "BUY" : "SELL";
-        NotifyStrictPlanBlocked("Strict plan: rejected extra manual " + sideMsg +
+        const string side = buySide ? "BUY" : "SELL";
+        NotifyStrictPlanBlocked("Strict plan: rejected extra manual " + side +
                                 " (deal " + IntegerToString((long)trans.deal) + ")");
         if (!trade.PositionClose(tk))
           Print("[ManualSwingSLTP] Strict plan: fast close failed tk=", tk);
