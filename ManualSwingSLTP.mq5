@@ -49,9 +49,10 @@
 //| v1.21: Entry-only — ບໍ່ລຶບ pending ທີ່ວາງແລ້ວ (manual+grid) ເມື່ອ EMA ກັບທາງ; |
 //|   ກວດ trend ພຽງຕອນສ້າງອໍເດີ/ pending ໃໝ່ (OnTradeTransaction).          |
 //| v1.22: Compile fix — ApplyStrictTradingPlan vs input name; MQL5 loop vars. |
+//| v1.24: SyncTP — ຄັດລອກ TP ໄປ manual pending ນຳ (ກ່ອນນີ້ແຕ່ EA grid pending). |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.23"
+#property version   "1.24"
 #property description "Swing SL/TP + basket USD stop + EMA gate + BE + grid."
 
 #include <Trade/Trade.mqh>
@@ -88,7 +89,7 @@ input bool   ProtectSLClampNoWiden     = true;  // if ProtectSLFreezeBeforeBE=fa
 input bool   ProtectSLRestoreIfRemoved = true;  // if SL cleared while swing phase, restore committed SL
 input bool   ProtectBEDontOverrideUserSL = true; // if SL moved after EA set swing, BE step changes TP only (keeps your SL)
 
-input bool   SyncTPWhenManualChanges = true;  // change TP on one manual → set same TP on same-side bundle + EA pendings
+input bool   SyncTPWhenManualChanges = true;  // change TP on one manual → set same TP on same-side bundle + all pendings
 input bool   SyncTPDeletionToAll     = false; // if true, clearing TP on one manual clears TP on same-side bundle
 
 input bool ShareInitialSLPriceToAllLegs = true; // same SL price on every same-side leg with SL=0; grid ONLY on anchor ticket
@@ -660,7 +661,7 @@ double AdjustBreakevenSlForStopsLevel(const bool isBuy, const double idealSl,
 }
 
 // When TP is edited on a manual position, apply the same TP to every same-side
-// market leg (manual + this EA's MSSLTP grid fills) and EA pending limits/stops.
+// market leg (manual + MSSLTP fills) and all pending limits/stops (manual + grid).
 void SyncTPFromManualUserChange() {
   if (!SyncTPWhenManualChanges) return;
   const double pt = Pt();
@@ -723,7 +724,6 @@ void SyncTPFromManualUserChange() {
   if (changedTk == 0) return;
 
   const bool isBuy = (side == POSITION_TYPE_BUY);
-  trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
   for (ii = PositionsTotal() - 1; ii >= 0; ii--) {
@@ -744,6 +744,7 @@ void SyncTPFromManualUserChange() {
     } else {
       if (ctp <= 0.0) continue;
     }
+    SetTradeMagicForPositionTicket(tk);
     if (!trade.PositionModify(tk, sl, deleteTP ? 0.0 : newTP))
       Print("[ManualSwingSLTP] SyncTP position failed tk=", tk, " ret=",
             trade.ResultRetcode());
@@ -753,17 +754,12 @@ void SyncTPFromManualUserChange() {
   for (jj = OrdersTotal() - 1; jj >= 0; jj--) {
     ot = OrderGetTicket(jj);
     if (ot == 0 || !OrderSelect(ot)) continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-    if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
+    if (!IsBundleOrderLeg(ot)) continue;
     const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
     if (isBuy) {
-      if (otyp != ORDER_TYPE_BUY_LIMIT && otyp != ORDER_TYPE_BUY_STOP &&
-          otyp != ORDER_TYPE_BUY_STOP_LIMIT)
-        continue;
+      if (!ManualOrderTypeIsBuySide(otyp)) continue;
     } else {
-      if (otyp != ORDER_TYPE_SELL_LIMIT && otyp != ORDER_TYPE_SELL_STOP &&
-          otyp != ORDER_TYPE_SELL_STOP_LIMIT)
-        continue;
+      if (!ManualOrderTypeIsSellSide(otyp)) continue;
     }
     const double op = OrderGetDouble(ORDER_PRICE_OPEN);
     const double osl = OrderGetDouble(ORDER_SL);
@@ -777,6 +773,7 @@ void SyncTPFromManualUserChange() {
     } else {
       if (otp <= 0.0) continue;
     }
+    SetTradeMagicForOrderTicket(ot);
     if (!trade.OrderModify(ot, op, osl, deleteTP ? 0.0 : newTP, ttime, exp))
       Print("[ManualSwingSLTP] SyncTP pending failed ot=", ot, " ret=",
             trade.ResultRetcode());
