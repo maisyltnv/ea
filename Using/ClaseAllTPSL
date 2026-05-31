@@ -1,63 +1,328 @@
 //+------------------------------------------------------------------+
-//| CloseProfitLoss EA                                               |
-//| Closes all positions and pending orders when the sum of each     |
-//| position's floating P/L in price points hits target or max loss.|
+//|                                              ClaseAllTPSL        |
+//|                                              CloseProfitLoss EA  |
+//|                                                                  |
+//| ຈຸດປະສົງ:                                                        |
+//| - EA ຄວບຄຸມ basket ທັງ account — ບໍ່ເປີດອໍເດີເອງ                   |
+//| - ລວມກຳໄລ/ຂາດທຸນລອຍຕົວ (ເງິນບັນຊີ) ຂອງທຸກ position ທີ່ເປີດ        |
+//| - ຮອດເປົ້າກຳໄລ ຫຼື ຂາດທຸນສູງສຸດ → ປິດ position ທັງໝົດ + ລຶບ pending |
+//|                                                                  |
+//| ກຳໄລ / ຂາດທຸນ (ເງິນ — ບໍ່ແມ່ນ point):                              |
+//| - TargetProfitMoney: ຜົນລວມ >= ຄ່ານີ້ → Close All               |
+//| - MaxLossMoney:      ຜົນລວມ <= -ຄ່ານີ້ → Close All               |
+//| - ຄິດຈາກ POSITION_PROFIT + POSITION_SWAP ທຸກໄມ້ (ທຸກ symbol)      |
+//| - ຫົວໜ່ວຍ = ສະກຸນເງິນບັນຊີ (USD, EUR … ຕາມ broker)               |
+//| - Hedge BUY+SELL: ກຳໄລ/ຂາດທຸນຖືກລວມກັນ (ຝັ່ງ + ກັບຝັ່ງ -)           |
+//|                                                                  |
+//| ຈຳກັດ lot (MaxLotPerLeg):                                        |
+//| - ຫ້າມ lot ຕໍ່ ticket/leg ເກີນຄ່າກຳນົດ (0 = ປິດ)                 |
+//| - Position ເກີນ → partial close ໃຫ້ເຫຼືອຕາມ max                  |
+//| - Pending ເກີນ → ປັບ volume; modify ບໍ່ໄດ້ → ບໍ່ລຶບ (ຮັກສາ hedge) |
+//| - Hedge: BUY 0.02 + SELL 0.02 ພ້ອມກັນໄດ້ (ຄວບຄຸມແຕ່ລະ ticket)    |
+//| - MaxLotChartSymbolOnly=true → ຈຳກັດແຕ່ symbol ຂອງ chart         |
+//| - ຕ້ອງບັນຊີ Hedging ເພື່ອ hedge ຈິງ (Netting ຈະ net ຝັ່ງຕรงຂ້າມ) |
+//|                                                                  |
+//| ເມື່ອ trigger Close All:                                         |
+//| - ປິດທຸກ position ໃນ account (ທຸກ symbol, magic, manual/EA)     |
+//| - ລຶບ pending orders ທັງໝົດ                                       |
+//|                                                                  |
+//| v1.20: ປິດທັງໝົດເມື່ອລວມ P/L ເຖິງເປົ້າ (ເດີມໃຊ້ points)           |
+//| v1.21: MaxLotPerLeg — ຈຳກັດ lot ຕໍ່ leg                          |
+//| v1.22: Hedge — partial close ຕາມ ticket; ບໍ່ລຶບ pending ເມື່ອ modify fail |
+//| v1.23: TargetProfit / MaxLoss ເປັນເງິນ (account currency)        |
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "Close all when total floating P/L in points reaches target or loss limit."
-#property version   "1.20"
+#property description "Close all when total floating P/L (money) reaches target or loss limit."
+#property version   "1.23"
 
 #include <Trade/Trade.mqh>
 
-//--- inputs (points = price distance / SYMBOL_POINT per position, summed over all positions)
-input int TargetProfitPoints = 500; // Close all when sum of points P/L >= this
-input int MaxLossPoints      = 300; // Close all when sum of points P/L <= -this
-input int    SlippagePoints  = 20;  // Slippage for closing
+//--- inputs (money = account currency; profit + swap summed over all open positions)
+input double TargetProfitMoney       = 500.0; // Close all when sum floating P/L >= this
+input double MaxLossMoney            = 300.0; // Close all when sum floating P/L <= -this
+input double MaxLotPerLeg             = 0.02;  // max lot per leg (each BUY/SELL ticket); hedge OK (0=off)
+input bool   MaxLotChartSymbolOnly    = true;  // MaxLot only on chart symbol (_Symbol)
+input int    SlippagePoints           = 20;    // Slippage for closing
 
 //--- trade object
 CTrade trade;
 
 //+------------------------------------------------------------------+
-//| Floating P/L of one position in price points (not money)         |
+//| True on hedging accounts (separate BUY/SELL tickets per symbol)  |
 //+------------------------------------------------------------------+
-double PositionProfitPoints(const ulong ticket)
+bool IsHedgingAccount()
+{
+   return (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
+}
+
+//+------------------------------------------------------------------+
+//| MaxLot scope: chart symbol only, or every symbol in the account  |
+//+------------------------------------------------------------------+
+bool IsManagedSymbolForLot(const string sym)
+{
+   if(!MaxLotChartSymbolOnly)
+      return true;
+   return (sym == _Symbol);
+}
+
+//+------------------------------------------------------------------+
+//| Normalize volume to symbol limits and MaxLotPerLeg               |
+//+------------------------------------------------------------------+
+double NormalizeVolumeForSymbol(const string sym, const double lotsIn)
+{
+   double minLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(stepLot <= 0.0)
+      stepLot = 0.01;
+
+   double lots = lotsIn;
+   if(lots < minLot)
+      lots = minLot;
+   if(lots > maxLot)
+      lots = maxLot;
+   if(MaxLotPerLeg > 0.0 && lots > MaxLotPerLeg)
+      lots = MaxLotPerLeg;
+
+   lots = MathFloor(lots / stepLot) * stepLot;
+   if(lots < minLot)
+      lots = minLot;
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Filling mode for explicit hedge-safe partial close               |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillingForSymbol(const string sym)
+{
+   const int filling = (int)SymbolInfoInteger(sym, SYMBOL_FILLING_MODE);
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
+//| Use the position's magic so manual (0) and EA orders both work   |
+//+------------------------------------------------------------------+
+void SetTradeMagicForPosition(const ulong ticket)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+      return;
+   trade.SetExpertMagicNumber((ulong)PositionGetInteger(POSITION_MAGIC));
+}
+
+//+------------------------------------------------------------------+
+//| Use the order's magic so manual (0) and EA orders both work      |
+//+------------------------------------------------------------------+
+void SetTradeMagicForOrder(const ulong ticket)
+{
+   if(ticket == 0 || !OrderSelect(ticket))
+      return;
+   trade.SetExpertMagicNumber((ulong)OrderGetInteger(ORDER_MAGIC));
+}
+
+//+------------------------------------------------------------------+
+//| Partial close one ticket only (hedging-safe; never touches other) |
+//+------------------------------------------------------------------+
+bool PartialClosePositionByTicket(const ulong ticket, const double closeVol)
+{
+   if(ticket == 0 || closeVol <= 0.0)
+      return false;
+   if(!PositionSelectByTicket(ticket))
+      return false;
+
+   SetTradeMagicForPosition(ticket);
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   if(trade.PositionClosePartial(ticket, closeVol))
+      return true;
+
+   // Fallback: explicit deal bound to this position ticket (hedging accounts).
+   const string sym = PositionGetString(POSITION_SYMBOL);
+   const long type = PositionGetInteger(POSITION_TYPE);
+
+   MqlTradeRequest req;
+   MqlTradeResult res;
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action       = TRADE_ACTION_DEAL;
+   req.position     = ticket;
+   req.symbol       = sym;
+   req.volume       = closeVol;
+   req.deviation    = SlippagePoints;
+   req.magic        = (ulong)PositionGetInteger(POSITION_MAGIC);
+   req.type_filling = GetFillingForSymbol(sym);
+
+   if(type == POSITION_TYPE_BUY)
+   {
+      req.type  = ORDER_TYPE_SELL;
+      req.price = SymbolInfoDouble(sym, SYMBOL_BID);
+   }
+   else
+   {
+      req.type  = ORDER_TYPE_BUY;
+      req.price = SymbolInfoDouble(sym, SYMBOL_ASK);
+   }
+
+   if(!OrderSend(req, res))
+   {
+      Print("[CloseProfitLoss] MaxLotPerLeg: hedge partial close failed ticket=", ticket,
+            " close=", closeVol, " err=", GetLastError());
+      return false;
+   }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_DONE_PARTIAL)
+   {
+      Print("[CloseProfitLoss] MaxLotPerLeg: hedge partial close retcode=", res.retcode,
+            " ticket=", ticket);
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Reduce one open position to <= MaxLotPerLeg (each ticket alone)  |
+//+------------------------------------------------------------------+
+bool ReducePositionVolumeToMaxLot(const ulong ticket)
+{
+   if(MaxLotPerLeg <= 0.0 || ticket == 0)
+      return false;
+   if(!PositionSelectByTicket(ticket))
+      return false;
+
+   const string sym = PositionGetString(POSITION_SYMBOL);
+   if(!IsManagedSymbolForLot(sym))
+      return false;
+
+   const double maxL = NormalizeVolumeForSymbol(sym, MaxLotPerLeg);
+   double stepLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   if(stepLot <= 0.0)
+      stepLot = 0.01;
+   const double eps = stepLot * 0.01;
+
+   bool changed = false;
+   for(int attempt = 0; attempt < 12; attempt++)
+   {
+      if(!PositionSelectByTicket(ticket))
+         break;
+
+      const double vol = PositionGetDouble(POSITION_VOLUME);
+      if(vol <= maxL + eps)
+         break;
+
+      double closeVol = vol - maxL;
+      if(stepLot > 0.0)
+         closeVol = MathFloor(closeVol / stepLot) * stepLot;
+      if(closeVol < stepLot)
+         closeVol = stepLot;
+      if(closeVol <= 0.0 || closeVol >= vol - eps)
+         break;
+
+      if(!PartialClosePositionByTicket(ticket, closeVol))
+         break;
+
+      changed = true;
+      Print("[CloseProfitLoss] MaxLotPerLeg: reduced ticket=", ticket,
+            " ", (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL"),
+            " on ", sym, " closed ", closeVol, " (max ", maxL, ")");
+   }
+   return changed;
+}
+
+//+------------------------------------------------------------------+
+//| Reduce pending order volume to <= MaxLotPerLeg                   |
+//+------------------------------------------------------------------+
+bool ReducePendingOrderVolumeToMaxLot(const ulong ticket)
+{
+   if(MaxLotPerLeg <= 0.0 || ticket == 0)
+      return false;
+   if(!OrderSelect(ticket))
+      return false;
+
+   const string sym = OrderGetString(ORDER_SYMBOL);
+   if(!IsManagedSymbolForLot(sym))
+      return false;
+
+   const double maxL = NormalizeVolumeForSymbol(sym, MaxLotPerLeg);
+   double ovol = OrderGetDouble(ORDER_VOLUME_CURRENT);
+   if(ovol <= 0.0)
+      ovol = OrderGetDouble(ORDER_VOLUME_INITIAL);
+
+   double stepLot = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+   const double eps = (stepLot > 0.0) ? stepLot * 0.01 : 0.00001;
+   if(ovol <= maxL + eps)
+      return false;
+
+   const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+   const double sl = OrderGetDouble(ORDER_SL);
+   const double tp = OrderGetDouble(ORDER_TP);
+   const ENUM_ORDER_TYPE_TIME ttime =
+      (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+   const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+
+   trade.SetDeviationInPoints(SlippagePoints);
+   SetTradeMagicForOrder(ticket);
+
+   if(trade.OrderModify(ticket, price, sl, tp, ttime, exp, maxL))
+   {
+      Print("[CloseProfitLoss] MaxLotPerLeg: pending ticket=", ticket,
+            " on ", sym, " volume ", ovol, " -> ", maxL);
+      return true;
+   }
+
+   Print("[CloseProfitLoss] MaxLotPerLeg: pending modify failed ticket=", ticket,
+         " vol=", ovol, " ret=", trade.ResultRetcode(),
+         " (order kept — hedge side not removed)");
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Enforce MaxLotPerLeg per ticket; BUY + SELL hedge both allowed   |
+//+------------------------------------------------------------------+
+void EnforceMaxLotPerLeg()
+{
+   if(MaxLotPerLeg <= 0.0)
+      return;
+
+   int i = 0;
+   for(i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = PositionGetTicket(i);
+      ReducePositionVolumeToMaxLot(ticket);
+   }
+
+   for(i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ticket = OrderGetTicket(i);
+      ReducePendingOrderVolumeToMaxLot(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Floating P/L of one position in account currency               |
+//+------------------------------------------------------------------+
+double PositionFloatingMoney(const ulong ticket)
 {
    if(ticket == 0 || !PositionSelectByTicket(ticket))
       return 0.0;
 
-   const string sym = PositionGetString(POSITION_SYMBOL);
-   const double pt  = SymbolInfoDouble(sym, SYMBOL_POINT);
-   if(pt <= 0.0)
-      return 0.0;
-
-   const double open = PositionGetDouble(POSITION_PRICE_OPEN);
-   const long   type = PositionGetInteger(POSITION_TYPE);
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      const double bid = SymbolInfoDouble(sym, SYMBOL_BID);
-      return (bid - open) / pt;
-   }
-   if(type == POSITION_TYPE_SELL)
-   {
-      const double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
-      return (open - ask) / pt;
-   }
-   return 0.0;
+   return PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
 }
 
 //+------------------------------------------------------------------+
-//| Sum floating P/L in points for all open positions                |
+//| Sum floating P/L in account currency for all open positions      |
 //+------------------------------------------------------------------+
-double TotalFloatingPoints()
+double TotalFloatingMoney()
 {
    double sum = 0.0;
    const int n = PositionsTotal();
    for(int i = 0; i < n; i++)
    {
       const ulong ticket = PositionGetTicket(i);
-      sum += PositionProfitPoints(ticket);
+      sum += PositionFloatingMoney(ticket);
    }
    return sum;
 }
@@ -71,7 +336,6 @@ void CloseAllTrades()
 
    trade.SetDeviationInPoints(SlippagePoints);
 
-   //--- Close all open positions
    int totalPos = PositionsTotal();
    for(int i = totalPos - 1; i >= 0; i--)
    {
@@ -80,6 +344,7 @@ void CloseAllTrades()
          continue;
 
       string symbol = PositionGetString(POSITION_SYMBOL);
+      SetTradeMagicForPosition(ticket);
 
       if(!trade.PositionClose(ticket))
       {
@@ -96,7 +361,6 @@ void CloseAllTrades()
       }
    }
 
-   //--- Delete all pending orders
    int totalOrd = OrdersTotal();
    for(int i = totalOrd - 1; i >= 0; i--)
    {
@@ -105,6 +369,7 @@ void CloseAllTrades()
          continue;
 
       string symbol = OrderGetString(ORDER_SYMBOL);
+      SetTradeMagicForOrder(ticket);
 
       if(!trade.OrderDelete(ticket))
       {
@@ -130,10 +395,21 @@ int OnInit()
    trade.SetDeviationInPoints(SlippagePoints);
 
    Print("[CloseProfitLoss] EA initialized. Target Profit = ",
-         IntegerToString(TargetProfitPoints),
-         " pts, Max Loss = ",
-         IntegerToString(MaxLossPoints),
-         " pts.");
+         DoubleToString(TargetProfitMoney, 2),
+         " ", AccountInfoString(ACCOUNT_CURRENCY),
+         ", Max Loss = ",
+         DoubleToString(MaxLossMoney, 2),
+         " ", AccountInfoString(ACCOUNT_CURRENCY),
+         ", MaxLotPerLeg = ",
+         DoubleToString(MaxLotPerLeg, 2),
+         ", chart symbol = ", _Symbol,
+         ", hedging account = ", (IsHedgingAccount() ? "yes" : "no"), ".");
+
+   if(MaxLotPerLeg > 0.0 && !IsHedgingAccount())
+   {
+      Print("[CloseProfitLoss] WARNING: account is netting mode — opposite orders merge; ",
+            "true BUY+SELL hedge needs a hedging account.");
+   }
 
    return(INIT_SUCCEEDED);
 }
@@ -147,35 +423,94 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
+//| Trim lot immediately when a new deal/order appears               |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                        const MqlTradeRequest& request,
+                        const MqlTradeResult& result)
+{
+   if(MaxLotPerLeg <= 0.0)
+      return;
+
+   if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+   {
+      if(trans.deal == 0 || !HistoryDealSelect(trans.deal))
+         return;
+
+      const long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_IN && entry != DEAL_ENTRY_INOUT)
+         return;
+
+      const string sym = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+      if(!IsManagedSymbolForLot(sym))
+         return;
+
+      const ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      if(posId == 0)
+         return;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         const ulong tk = PositionGetTicket(i);
+         if(tk == 0 || !PositionSelectByTicket(tk))
+            continue;
+         if((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId)
+            continue;
+         ReducePositionVolumeToMaxLot(tk);
+         return;
+      }
+      return;
+   }
+
+   if(trans.type == TRADE_TRANSACTION_ORDER_ADD ||
+      trans.type == TRADE_TRANSACTION_ORDER_UPDATE)
+   {
+      if(trans.order == 0 || !OrderSelect(trans.order))
+         return;
+
+      const string sym = OrderGetString(ORDER_SYMBOL);
+      if(!IsManagedSymbolForLot(sym))
+         return;
+
+      ReducePendingOrderVolumeToMaxLot(trans.order);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert tick                                                      |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(TargetProfitPoints <= 0 && MaxLossPoints <= 0)
+   EnforceMaxLotPerLeg();
+
+   if(TargetProfitMoney <= 0.0 && MaxLossMoney <= 0.0)
       return;
 
-   const double totalPts = TotalFloatingPoints();
+   const double totalMoney = TotalFloatingMoney();
+   const string cur = AccountInfoString(ACCOUNT_CURRENCY);
 
-   //--- Close all if target profit (in points) reached
-   if(TargetProfitPoints > 0 && totalPts >= (double)TargetProfitPoints)
+   if(TargetProfitMoney > 0.0 && totalMoney >= TargetProfitMoney)
    {
       Print("[CloseProfitLoss] Profit target reached. Total floating P/L = ",
-            DoubleToString(totalPts, 1),
-            " points (target = ",
-            IntegerToString(TargetProfitPoints),
+            DoubleToString(totalMoney, 2),
+            " ", cur,
+            " (target = ",
+            DoubleToString(TargetProfitMoney, 2),
+            " ", cur,
             "). Closing all positions and pending orders.");
 
       CloseAllTrades();
       return;
    }
 
-   //--- Close all if max loss (in points) reached
-   if(MaxLossPoints > 0 && totalPts <= -(double)MaxLossPoints)
+   if(MaxLossMoney > 0.0 && totalMoney <= -MaxLossMoney)
    {
       Print("[CloseProfitLoss] Loss limit reached. Total floating P/L = ",
-            DoubleToString(totalPts, 1),
-            " points (loss limit = -",
-            IntegerToString(MaxLossPoints),
+            DoubleToString(totalMoney, 2),
+            " ", cur,
+            " (loss limit = -",
+            DoubleToString(MaxLossMoney, 2),
+            " ", cur,
             "). Closing all positions and pending orders.");
 
       CloseAllTrades();
