@@ -2,6 +2,7 @@
 # Creates Market4You MT5.app and WeMasterTrade MT5.app on ~/Desktop
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DESKTOP="${HOME}/Desktop"
 WINE_PREFIX="${HOME}/Library/Application Support/net.metaquotes.wine.metatrader5"
 MT5_APP="${DESKTOP}/MetaTrader 5.app"
@@ -81,4 +82,6 @@ PLIST
 
 create_app "Market4You MT5" "Market4You" "net.metaquotes.wine.Market4You"
 create_app "WeMasterTrade MT5" "WeMasterTrade" "net.metaquotes.wine.WeMasterTrade"
+
+"${SCRIPT_DIR}/fix-mt5-window-position.sh" || true
 echo "Done. Double-click icons on Desktop to open each terminal."

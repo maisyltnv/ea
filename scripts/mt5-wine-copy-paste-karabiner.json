@@ -11,7 +11,7 @@
             "modifiers": { "mandatory": ["control"], "optional": ["any"] }
           },
           "to": [{ "key_code": "insert", "modifiers": ["left_control"] }],
-          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
+          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/FBS Account [1-4]\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
         },
         {
           "type": "basic",
@@ -20,7 +20,7 @@
             "modifiers": { "mandatory": ["command"], "optional": ["any"] }
           },
           "to": [{ "key_code": "insert", "modifiers": ["left_control"] }],
-          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
+          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/FBS Account [1-4]\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
         }
       ]
     },
@@ -34,7 +34,7 @@
             "modifiers": { "mandatory": ["control"], "optional": ["any"] }
           },
           "to": [{ "key_code": "insert", "modifiers": ["left_shift"] }],
-          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
+          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/FBS Account [1-4]\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
         },
         {
           "type": "basic",
@@ -43,7 +43,7 @@
             "modifiers": { "mandatory": ["command"], "optional": ["any"] }
           },
           "to": [{ "key_code": "insert", "modifiers": ["left_shift"] }],
-          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
+          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/FBS Account [1-4]\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
         }
       ]
     },
@@ -57,7 +57,7 @@
             "modifiers": { "mandatory": ["command"], "optional": ["any"] }
           },
           "to": [{ "key_code": "a", "modifiers": ["left_control"] }],
-          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
+          "conditions": [{ "type": "frontmost_application_if", "bundle_identifiers": ["^net\\.metaquotes\\.wine"], "file_paths": [".*/MetaTrader 5\\.app/.*", ".*/FBS\\.app/.*", ".*/FBS Account [1-4]\\.app/.*", ".*/Market4You MT5\\.app/.*", ".*/WeMasterTrade MT5\\.app/.*", ".*/fbs\\.app/.*"] }]
         }
       ]
     }
