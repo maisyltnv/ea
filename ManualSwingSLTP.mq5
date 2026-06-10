@@ -53,7 +53,7 @@ input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
-input int    MinSLDistancePoints      = 1500;   // first SL only: if entry→SL < this, widen SL to this (0=off)
+input int    MinSLDistancePoints      = 2500;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
 input int    BreakEvenTriggerPoints   = 500;    // first leg profit pts >= this → BE+ all legs (first leg entry)
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
@@ -65,7 +65,7 @@ input int    SlippagePoints           = 20;
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 4;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double GridLot                  = 0.0;    // 0 = same lot as parent manual position
-input double MaxLotPerLeg             = 0.02;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
+input double MaxLotPerLeg             = 0.1;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
 input double TotalUSDSL               = 200.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
