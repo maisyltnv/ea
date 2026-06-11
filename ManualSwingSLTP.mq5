@@ -55,7 +55,7 @@ input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (po
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
 input int    MinSLDistancePoints      = 2500;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
-input int    BreakEvenTriggerPoints   = 500;    // first leg profit pts >= this → BE+ all legs (first leg entry)
+input int    BreakEvenTriggerPoints   = 1000;    // first leg profit pts >= this → BE+ all legs (first leg entry)
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
 input bool   BreakEvenRelaxSLToStopsLevel = true; // if ideal BE+ SL too close to bid/ask, use tightest allowed SL
 input int    TPPoints                = 1000;   // TP distance from entry (points)
