@@ -30,23 +30,30 @@
 //| v1.21: MaxLotPerLeg — ຈຳກັດ lot ຕໍ່ leg                          |
 //| v1.22: Hedge — partial close ຕາມ ticket; ບໍ່ລຶບ pending ເມື່ອ modify fail |
 //| v1.23: TargetProfit / MaxLoss ເປັນເງິນ (account currency)        |
+//| v1.24: Shared SL — first order SL at SLPoints; all same-side legs use that price. |
 //+------------------------------------------------------------------+
 
 #property strict
-#property description "Close all when total floating P/L (money) reaches target or loss limit."
-#property version   "1.23"
+#property description "Close all on P/L target + shared SL from first order per side."
+#property version   "1.24"
 
 #include <Trade/Trade.mqh>
 
 //--- inputs (money = account currency; profit + swap summed over all open positions)
-input double TargetProfitMoney       = 200.0; // Close all when sum floating P/L >= this
-input double MaxLossMoney            = 250.0; // Close all when sum floating P/L <= -this
+input double TargetProfitMoney       = 2000.0; // Close all when sum floating P/L >= this
+input double MaxLossMoney            = 500.0; // Close all when sum floating P/L <= -this
 input double MaxLotPerLeg             = 0.01;  // max lot per leg (each BUY/SELL ticket); hedge OK (0=off)
 input bool   MaxLotChartSymbolOnly    = true;  // MaxLot only on chart symbol (_Symbol)
+input int    SLPoints               = 1000;  // SL from first order entry (points); all same-side orders share that SL price (0=off)
+input bool   SharedSLChartSymbolOnly  = true;  // shared SL only on chart symbol (_Symbol)
 input int    SlippagePoints           = 20;    // Slippage for closing
 
 //--- trade object
 CTrade trade;
+
+// Locked SL price from first order per side on chart symbol (0 = not set).
+double g_sharedSlPriceBuy  = 0.0;
+double g_sharedSlPriceSell = 0.0;
 
 //+------------------------------------------------------------------+
 //| True on hedging accounts (separate BUY/SELL tickets per symbol)  |
@@ -64,6 +71,279 @@ bool IsManagedSymbolForLot(const string sym)
    if(!MaxLotChartSymbolOnly)
       return true;
    return (sym == _Symbol);
+}
+
+bool IsManagedSymbolForSL(const string sym)
+{
+   if(!SharedSLChartSymbolOnly)
+      return true;
+   return (sym == _Symbol);
+}
+
+int DigitsForSymbol(const string sym)
+{
+   return (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+}
+
+double PointForSymbol(const string sym)
+{
+   return SymbolInfoDouble(sym, SYMBOL_POINT);
+}
+
+int StopsLevelForSymbol(const string sym)
+{
+   return (int)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
+}
+
+bool OrderTypeIsBuySide(const ENUM_ORDER_TYPE typ)
+{
+   return (typ == ORDER_TYPE_BUY || typ == ORDER_TYPE_BUY_LIMIT ||
+           typ == ORDER_TYPE_BUY_STOP || typ == ORDER_TYPE_BUY_STOP_LIMIT);
+}
+
+bool OrderTypeIsSellSide(const ENUM_ORDER_TYPE typ)
+{
+   return (typ == ORDER_TYPE_SELL || typ == ORDER_TYPE_SELL_LIMIT ||
+           typ == ORDER_TYPE_SELL_STOP || typ == ORDER_TYPE_SELL_STOP_LIMIT);
+}
+
+bool RespectStopDistanceSL(const string sym, const bool isBuy, const double sl)
+{
+   if(sl <= 0.0)
+      return true;
+   const double pt = PointForSymbol(sym);
+   if(pt <= 0.0)
+      return false;
+   const int lvl = StopsLevelForSymbol(sym);
+   const double minDist = (double)lvl * pt;
+   if(minDist <= 0.0)
+      return true;
+   const double bid = SymbolInfoDouble(sym, SYMBOL_BID);
+   const double ask = SymbolInfoDouble(sym, SYMBOL_ASK);
+   if(isBuy && (bid - sl) < (minDist - 1e-10))
+      return false;
+   if(!isBuy && (sl - ask) < (minDist - 1e-10))
+      return false;
+   return true;
+}
+
+int CountPositionsOnSide(const string sym, const bool buySide)
+{
+   int n = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym)
+         continue;
+      const long typ = PositionGetInteger(POSITION_TYPE);
+      if(buySide && typ != POSITION_TYPE_BUY)
+         continue;
+      if(!buySide && typ != POSITION_TYPE_SELL)
+         continue;
+      n++;
+   }
+   return n;
+}
+
+ulong OldestPositionOnSide(const string sym, const bool buySide)
+{
+   ulong oldestTk = 0;
+   datetime oldestTime = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk))
+         continue;
+      if(PositionGetString(POSITION_SYMBOL) != sym)
+         continue;
+      const long typ = PositionGetInteger(POSITION_TYPE);
+      if(buySide && typ != POSITION_TYPE_BUY)
+         continue;
+      if(!buySide && typ != POSITION_TYPE_SELL)
+         continue;
+      const datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      if(oldestTk == 0 || t < oldestTime)
+      {
+         oldestTime = t;
+         oldestTk = tk;
+      }
+   }
+   return oldestTk;
+}
+
+void ResetSharedSLIfSideFlat(const string sym, const bool buySide)
+{
+   if(CountPositionsOnSide(sym, buySide) > 0)
+      return;
+   if(buySide)
+      g_sharedSlPriceBuy = 0.0;
+   else
+      g_sharedSlPriceSell = 0.0;
+}
+
+double LockSharedSLFromFirstOrder(const string sym, const bool buySide)
+{
+   if(SLPoints <= 0)
+      return 0.0;
+
+   double locked = buySide ? g_sharedSlPriceBuy : g_sharedSlPriceSell;
+   if(locked > 0.0)
+      return locked;
+
+   const ulong anchorTk = OldestPositionOnSide(sym, buySide);
+   if(anchorTk == 0 || !PositionSelectByTicket(anchorTk))
+      return 0.0;
+
+   const double open = PositionGetDouble(POSITION_PRICE_OPEN);
+   const double pt = PointForSymbol(sym);
+   if(pt <= 0.0)
+      return 0.0;
+
+   const int digits = DigitsForSymbol(sym);
+   double sl = 0.0;
+   if(buySide)
+      sl = open - (double)SLPoints * pt;
+   else
+      sl = open + (double)SLPoints * pt;
+   sl = NormalizeDouble(sl, digits);
+
+   if(!RespectStopDistanceSL(sym, buySide, sl))
+   {
+      Print("[CloseProfitLoss] SharedSL: cannot lock SL for ", sym,
+            " ", (buySide ? "BUY" : "SELL"), " — stops level");
+      return 0.0;
+   }
+
+   if(buySide)
+      g_sharedSlPriceBuy = sl;
+   else
+      g_sharedSlPriceSell = sl;
+
+   Print("[CloseProfitLoss] SharedSL locked ", sym, " ",
+         (buySide ? "BUY" : "SELL"), " at ", DoubleToString(sl, digits),
+         " (first open ", DoubleToString(open, digits), " - ",
+         IntegerToString(SLPoints), " pts)");
+   return sl;
+}
+
+bool ApplySharedSLToPosition(const ulong ticket)
+{
+   if(SLPoints <= 0 || ticket == 0)
+      return false;
+   if(!PositionSelectByTicket(ticket))
+      return false;
+
+   const string sym = PositionGetString(POSITION_SYMBOL);
+   if(!IsManagedSymbolForSL(sym))
+      return false;
+
+   const long typ = PositionGetInteger(POSITION_TYPE);
+   const bool buySide = (typ == POSITION_TYPE_BUY);
+   if(typ != POSITION_TYPE_BUY && typ != POSITION_TYPE_SELL)
+      return false;
+
+   const double sl = LockSharedSLFromFirstOrder(sym, buySide);
+   if(sl <= 0.0)
+      return false;
+
+   const double curSL = PositionGetDouble(POSITION_SL);
+   const double curTP = PositionGetDouble(POSITION_TP);
+   const int digits = DigitsForSymbol(sym);
+   const double nSl = NormalizeDouble(sl, digits);
+   const double nCur = (curSL > 0.0) ? NormalizeDouble(curSL, digits) : 0.0;
+   if(nCur == nSl)
+      return true;
+
+   if(!RespectStopDistanceSL(sym, buySide, nSl))
+      return false;
+
+   SetTradeMagicForPosition(ticket);
+   trade.SetDeviationInPoints(SlippagePoints);
+   if(trade.PositionModify(ticket, nSl, curTP))
+      return true;
+
+   Print("[CloseProfitLoss] SharedSL: position modify failed tk=", ticket,
+         " ret=", trade.ResultRetcode());
+   return false;
+}
+
+bool ApplySharedSLToPending(const ulong ticket)
+{
+   if(SLPoints <= 0 || ticket == 0)
+      return false;
+   if(!OrderSelect(ticket))
+      return false;
+
+   const string sym = OrderGetString(ORDER_SYMBOL);
+   if(!IsManagedSymbolForSL(sym))
+      return false;
+
+   const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+   bool buySide = false;
+   if(OrderTypeIsBuySide(otyp))
+      buySide = true;
+   else if(OrderTypeIsSellSide(otyp))
+      buySide = false;
+   else
+      return false;
+
+   const double sl = LockSharedSLFromFirstOrder(sym, buySide);
+   if(sl <= 0.0)
+      return false;
+
+   const double curSL = OrderGetDouble(ORDER_SL);
+   const int digits = DigitsForSymbol(sym);
+   const double nSl = NormalizeDouble(sl, digits);
+   const double nCur = (curSL > 0.0) ? NormalizeDouble(curSL, digits) : 0.0;
+   if(nCur == nSl)
+      return true;
+
+   const double price = OrderGetDouble(ORDER_PRICE_OPEN);
+   const double tp = OrderGetDouble(ORDER_TP);
+   const ENUM_ORDER_TYPE_TIME ttime =
+      (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+   const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+
+   SetTradeMagicForOrder(ticket);
+   trade.SetDeviationInPoints(SlippagePoints);
+   if(trade.OrderModify(ticket, price, nSl, tp, ttime, exp))
+      return true;
+
+   Print("[CloseProfitLoss] SharedSL: pending modify failed ot=", ticket,
+         " ret=", trade.ResultRetcode());
+   return false;
+}
+
+void EnforceSharedSLAll()
+{
+   if(SLPoints <= 0)
+      return;
+
+   ResetSharedSLIfSideFlat(_Symbol, true);
+   ResetSharedSLIfSideFlat(_Symbol, false);
+
+   int i = 0;
+   for(i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong tk = PositionGetTicket(i);
+      if(tk == 0 || !PositionSelectByTicket(tk))
+         continue;
+      if(!IsManagedSymbolForSL(PositionGetString(POSITION_SYMBOL)))
+         continue;
+      ApplySharedSLToPosition(tk);
+   }
+
+   for(i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      const ulong ot = OrderGetTicket(i);
+      if(ot == 0 || !OrderSelect(ot))
+         continue;
+      if(!IsManagedSymbolForSL(OrderGetString(ORDER_SYMBOL)))
+         continue;
+      ApplySharedSLToPending(ot);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -411,6 +691,14 @@ int OnInit()
             "true BUY+SELL hedge needs a hedging account.");
    }
 
+   if(SLPoints > 0)
+   {
+      Print("[CloseProfitLoss] SharedSL ON: first order SL = ",
+            IntegerToString(SLPoints),
+            " pts from entry; all same-side legs use that SL price on ",
+            (SharedSLChartSymbolOnly ? _Symbol : "all symbols"), ".");
+   }
+
    return(INIT_SUCCEEDED);
 }
 
@@ -429,11 +717,37 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-   if(MaxLotPerLeg <= 0.0)
-      return;
-
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
+      if(trans.deal != 0 && HistoryDealSelect(trans.deal))
+      {
+         const long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_IN || entry == DEAL_ENTRY_INOUT)
+         {
+            const string sym = HistoryDealGetString(trans.deal, DEAL_SYMBOL);
+            if(IsManagedSymbolForSL(sym))
+            {
+               const ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+               if(posId > 0)
+               {
+                  for(int i = PositionsTotal() - 1; i >= 0; i--)
+                  {
+                     const ulong tk = PositionGetTicket(i);
+                     if(tk == 0 || !PositionSelectByTicket(tk))
+                        continue;
+                     if((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId)
+                        continue;
+                     ApplySharedSLToPosition(tk);
+                     break;
+                  }
+               }
+            }
+         }
+      }
+
+      if(MaxLotPerLeg <= 0.0)
+         return;
+
       if(trans.deal == 0 || !HistoryDealSelect(trans.deal))
          return;
 
@@ -469,6 +783,11 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
          return;
 
       const string sym = OrderGetString(ORDER_SYMBOL);
+      if(IsManagedSymbolForSL(sym))
+         ApplySharedSLToPending(trans.order);
+
+      if(MaxLotPerLeg <= 0.0)
+         return;
       if(!IsManagedSymbolForLot(sym))
          return;
 
@@ -482,6 +801,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 void OnTick()
 {
    EnforceMaxLotPerLeg();
+   EnforceSharedSLAll();
 
    if(TargetProfitMoney <= 0.0 && MaxLossMoney <= 0.0)
       return;
