@@ -40,7 +40,8 @@
 //| v1.18: MinSLDistancePoints — ຄັ້ງທຳອິດຖ້າ entry→SL ແຄບກວ່າຄ່ານີ້ ຂະຫຍາຍ SL ໃຫ້ກວ້າງພໍນີ້. |
 //| v1.24: SyncTP — ຄັດລອກ TP ໄປ manual pending ນຳ (ກ່ອນນີ້ແຕ່ EA grid pending). |
 //| v1.25: Removed EMA trend filter (v1.13–1.21 M1/M5 EMA50 vs EMA200 gate).   |
-//| v1.28: increaseLot — grid legs can step up lot: leg1=base, legN=base+(N-1)*increaseLot |
+//| v1.28: Removed GridLot; grid base lot = parent manual position lot.          |
+//|   increaseLot — grid legs step up lot: leg1=base, legN=base+(N-1)*increaseLot |
 //|   (0=all legs equal). Still capped by MaxLotPerLeg / NormalizeVolumeLocal.   |
 //+------------------------------------------------------------------+
 #property strict
@@ -55,7 +56,7 @@ input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
-input int    MinSLDistancePoints      = 2500;   // first SL only: if entry→SL < this, widen SL to this (0=off)
+input int    MinSLDistancePoints      = 4000;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
 input int    BreakEvenTriggerPoints   = 1000;    // first leg profit pts >= this → BE+ all legs (first leg entry)
 input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
@@ -65,11 +66,10 @@ input int    TPPoints                = 1000;   // TP distance from entry (points
 input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
-input int    GridExtraPendingLegs     = 4;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
-input double GridLot                  = 0.01;    // 0 = same lot as parent manual position
+input int    GridExtraPendingLegs     = 10;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.1;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
-input double TotalUSDSL               = 200.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
+input double TotalUSDSL               = 2000.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
 input bool   EnforceInitialBundleMax  = false;  // OFF (default): no leg cap — open UNLIMITED orders. true = cap to count-at-first-SL + grid legs
@@ -918,10 +918,10 @@ void TryPlaceGridPendings(const ulong parentTk, const ENUM_POSITION_TYPE typ,
   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
   const int digits = DigitsCount();
-  // Base lot for the first grid leg. Each further leg adds `increaseLot`
+  // Base lot for the first grid leg = the parent manual position's lot.
+  // Each further leg adds `increaseLot`
   // (leg1=base, leg2=base+increaseLot, leg3=base+2*increaseLot, …) when >0.
   double baseLots = lotsRaw;
-  if (GridLot > 0.0) baseLots = GridLot;
   if (NormalizeVolumeLocal(baseLots) <= 0.0) {
     g_states[st].gridDone = true;
     return;
