@@ -43,10 +43,14 @@
 //| v1.28: Removed GridLot; grid base lot = parent manual position lot.          |
 //|   increaseLot — grid legs step up lot: leg1=base, legN=base+(N-1)*increaseLot |
 //|   (0=all legs equal). Still capped by MaxLotPerLeg / NormalizeVolumeLocal.   |
+//| v1.29: AUTO entries (added on top of manual mgmt; old logic unchanged).      |
+//|   BUY  M5: close>EMA50 AND Stoch(9,3,3) %K crosses down to <=AutoStochBuyLevel. |
+//|   SELL M5: close<EMA50 AND Stoch(9,3,3) %K crosses up   to >=AutoStochSellLevel.|
+//|   Auto fills open with magic 0 → same manager sets swing SL / grid / BE.      |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.28"
-#property description "Swing SL/TP + basket USD stop + BE + grid."
+#property version   "1.29"
+#property description "Swing SL/TP + basket USD stop + BE + grid + M5 auto entries."
 
 #include <Trade/Trade.mqh>
 
@@ -86,8 +90,24 @@ input bool ShareInitialSLPriceToAllLegs = true; // same SL price on every same-s
 input bool ProtectSLFreezeBeforeBE    = true;  // before BE: SL must stay at committed price (restore if moved/cleared)
 // If freeze is OFF: ProtectSLClampNoWiden only blocks widening past commit; if freeze ON, clamp widen is redundant.
 
+//----------------- Auto-trade (M5 EMA50 + Stochastic 9,3,3) -----------------
+input bool   AutoTradeEnabled      = true;   // enable AUTO entries (added on top of manual management)
+input double AutoLot               = 0.01;   // lot size for AUTO BUY/SELL entries
+input bool   AutoOneBundlePerSide  = true;   // only open a new AUTO entry when that side has no open bundle
+input int    AutoEmaPeriod         = 50;     // EMA period on M5 (BUY if price>EMA, SELL if price<EMA)
+input int    AutoStochKPeriod      = 9;      // Stochastic %K period
+input int    AutoStochDPeriod      = 3;      // Stochastic %D period
+input int    AutoStochSlowing      = 3;      // Stochastic slowing
+input double AutoStochBuyLevel     = 20.0;   // BUY when %K reaches down to <= this
+input double AutoStochSellLevel    = 80.0;   // SELL when %K reaches up   to >= this
+
 //--------------------------- Globals --------------------------------
 CTrade trade;
+
+// Auto-trade indicator handles (M5) + last processed bar (one signal per bar).
+int      g_autoEmaHandle   = INVALID_HANDLE;
+int      g_autoStochHandle = INVALID_HANDLE;
+datetime g_autoLastBar     = 0;
 
 // Locked once per "wave" when first swing SL succeeds for that direction (0 = not locked).
 int g_maxBuyBundlePositions = 0;
@@ -1432,6 +1452,76 @@ void ManageManualPosition(const ulong tk) {
   // Break-even + TP: ProcessBundleBreakEvenForSide() when first leg profit >= trigger.
 }
 
+//--------------------------- Auto-trade (M5) -------------------------
+// BUY  (M5): last closed close > EMA50 AND Stoch %K crosses DOWN to <= AutoStochBuyLevel.
+// SELL (M5): last closed close < EMA50 AND Stoch %K crosses UP   to >= AutoStochSellLevel.
+// "Crosses" = prior closed bar was on the other side of the level → fires once per reach.
+bool ReadAutoSignals(bool &buySig, bool &sellSig) {
+  buySig = false;
+  sellSig = false;
+  if (g_autoEmaHandle == INVALID_HANDLE || g_autoStochHandle == INVALID_HANDLE)
+    return false;
+
+  double ema[];
+  double kmain[];
+  ArraySetAsSeries(ema, true);
+  ArraySetAsSeries(kmain, true);
+  if (CopyBuffer(g_autoEmaHandle, 0, 0, 3, ema) < 3) return false;
+  if (CopyBuffer(g_autoStochHandle, 0, 0, 3, kmain) < 3) return false; // buffer 0 = %K main
+
+  // Evaluate on the last CLOSED bar (index 1); index 2 is the prior closed bar.
+  const double closeClosed = iClose(_Symbol, PERIOD_M5, 1);
+  if (closeClosed <= 0.0) return false;
+  const double emaClosed = ema[1];
+  const double kNow  = kmain[1];
+  const double kPrev = kmain[2];
+
+  buySig  = (closeClosed > emaClosed) &&
+            (kPrev > AutoStochBuyLevel)  && (kNow <= AutoStochBuyLevel);
+  sellSig = (closeClosed < emaClosed) &&
+            (kPrev < AutoStochSellLevel) && (kNow >= AutoStochSellLevel);
+  return true;
+}
+
+void OpenAutoEntry(const bool isBuy) {
+  double lots = NormalizeVolumeLocal(AutoLot);
+  if (lots <= 0.0) return;
+  // Open with neutral magic (0) so the manual manager treats it like a hand
+  // click and applies swing SL / grid / BE / basket stop exactly the same way.
+  trade.SetExpertMagicNumber(0);
+  trade.SetDeviationInPoints(SlippagePoints);
+  const bool ok = isBuy
+      ? trade.Buy(lots, _Symbol, 0.0, 0.0, 0.0, "AUTO")
+      : trade.Sell(lots, _Symbol, 0.0, 0.0, 0.0, "AUTO");
+  if (!ok)
+    Print("[ManualSwingSLTP] Auto ", (isBuy ? "BUY" : "SELL"),
+          " open failed ret=", trade.ResultRetcode(), " ",
+          trade.ResultRetcodeDescription());
+  else
+    Print("[ManualSwingSLTP] Auto ", (isBuy ? "BUY" : "SELL"),
+          " opened lots=", DoubleToString(lots, 2));
+}
+
+void ProcessAutoTrade() {
+  if (!AutoTradeEnabled) return;
+
+  // Fire at most once per new M5 bar (signal is computed on closed-bar values).
+  const datetime curBar = iTime(_Symbol, PERIOD_M5, 0);
+  if (curBar == 0 || curBar == g_autoLastBar) return;
+
+  bool buySig = false, sellSig = false;
+  if (!ReadAutoSignals(buySig, sellSig)) return; // indicators not ready yet — retry next tick
+  g_autoLastBar = curBar;                          // mark this bar handled
+
+  if (buySig) {
+    if (AutoOneBundlePerSide && CountBundleLegs(true) > 0) return;
+    OpenAutoEntry(true);
+  } else if (sellSig) {
+    if (AutoOneBundlePerSide && CountBundleLegs(false) > 0) return;
+    OpenAutoEntry(false);
+  }
+}
+
 //--------------------------- MT5 Events ------------------------------
 int OnInit() {
   trade.SetExpertMagicNumber(MagicNumber);
@@ -1444,10 +1534,24 @@ int OnInit() {
   else
     trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
+  // Auto-trade indicators on M5 (buffer 0 of Stochastic = %K main line).
+  if (AutoTradeEnabled) {
+    g_autoEmaHandle = iMA(_Symbol, PERIOD_M5, AutoEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    g_autoStochHandle = iStochastic(_Symbol, PERIOD_M5, AutoStochKPeriod,
+                                    AutoStochDPeriod, AutoStochSlowing,
+                                    MODE_SMA, STO_LOWHIGH);
+    if (g_autoEmaHandle == INVALID_HANDLE || g_autoStochHandle == INVALID_HANDLE) {
+      Print("[ManualSwingSLTP] Failed to create auto-trade indicator handles.");
+      return INIT_FAILED;
+    }
+  }
+
   return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason) {
+  if (g_autoEmaHandle != INVALID_HANDLE) IndicatorRelease(g_autoEmaHandle);
+  if (g_autoStochHandle != INVALID_HANDLE) IndicatorRelease(g_autoStochHandle);
 }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -1488,6 +1592,9 @@ void OnTick() {
   EnforceMaxLotPerLeg();
 
   if (CheckBundleTotalUSDStopLoss()) return;
+
+  // AUTO entries (opens magic-0 positions; the manager loop below sets swing SL/grid).
+  ProcessAutoTrade();
 
   // Manage all manual positions on this symbol
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
