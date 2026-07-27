@@ -47,10 +47,15 @@
 //|   BUY  M5: close>EMA50 AND Stoch(9,3,3) %K crosses down to <=AutoStochBuyLevel. |
 //|   SELL M5: close<EMA50 AND Stoch(9,3,3) %K crosses up   to >=AutoStochSellLevel.|
 //|   Auto fills open with magic 0 → same manager sets swing SL / grid / BE.      |
+//| v1.30: AUTO trend filter — BUY also needs EMA50>EMA200, SELL EMA50<EMA200 (M5).|
+//| v1.31: Count-based exit per side (replaces old break-even + TPPoints):        |
+//|   1 pos → shared TP = first entry ± TP1OrderPoints; 2 pos → ± TP2OrderPoints;  |
+//|   >=3 pos → clear TP, close that side when its P/L+swap >= TPMoney. Old BE/TP  |
+//|   functions remain defined but are no longer called.                          |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.29"
-#property description "Swing SL/TP + basket USD stop + BE + grid + M5 auto entries."
+#property version   "1.31"
+#property description "Swing SL/TP + basket USD stop + grid + M5 auto entries + count-based TP."
 
 #include <Trade/Trade.mqh>
 
@@ -62,10 +67,15 @@ input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (po
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
 input int    MinSLDistancePoints      = 10000;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
-input int    BreakEvenTriggerPoints   = 1000;    // first leg profit pts >= this → BE+ all legs (first leg entry)
-input int    BreakEvenPlusPoints      = 20;     // SL to entry +/- this (points)
-input bool   BreakEvenRelaxSLToStopsLevel = true; // if ideal BE+ SL too close to bid/ask, use tightest allowed SL
-input int    TPPoints                = 1000;   // TP distance from entry (points)
+input int    BreakEvenTriggerPoints   = 1000;    // (UNUSED since v1.31: old break-even, replaced by count-based TP)
+input int    BreakEvenPlusPoints      = 20;     // (UNUSED since v1.31)
+input bool   BreakEvenRelaxSLToStopsLevel = true; // (UNUSED since v1.31)
+input int    TPPoints                = 1000;   // (UNUSED since v1.31: replaced by TP1OrderPoints/TP2OrderPoints)
+
+//------- Count-based exit (per direction; replaces old break-even + TPPoints) -------
+input int    TP1OrderPoints          = 1000;   // 1 open position on the side: shared TP = first entry ± this (points)
+input int    TP2OrderPoints          = 500;    // 2 open positions: shared TP = first entry ± this (points)
+input double TPMoney                 = 200.0; // >=3 open positions: close that side when its P/L+swap >= this ($)
 
 input int    SlippagePoints           = 20;
 
@@ -94,7 +104,8 @@ input bool ProtectSLFreezeBeforeBE    = true;  // before BE: SL must stay at com
 input bool   AutoTradeEnabled      = true;   // enable AUTO entries (added on top of manual management)
 input double AutoLot               = 0.01;   // lot size for AUTO BUY/SELL entries
 input bool   AutoOneBundlePerSide  = true;   // only open a new AUTO entry when that side has no open bundle
-input int    AutoEmaPeriod         = 50;     // EMA period on M5 (BUY if price>EMA, SELL if price<EMA)
+input int    AutoEmaPeriod         = 50;     // fast EMA period on M5 (BUY if price>EMA, SELL if price<EMA)
+input int    AutoEmaSlowPeriod     = 200;    // slow EMA period on M5 trend filter (BUY needs EMA50>EMA200, SELL EMA50<EMA200)
 input int    AutoStochKPeriod      = 9;      // Stochastic %K period
 input int    AutoStochDPeriod      = 3;      // Stochastic %D period
 input int    AutoStochSlowing      = 3;      // Stochastic slowing
@@ -105,9 +116,10 @@ input double AutoStochSellLevel    = 80.0;   // SELL when %K reaches up   to >= 
 CTrade trade;
 
 // Auto-trade indicator handles (M5) + last processed bar (one signal per bar).
-int      g_autoEmaHandle   = INVALID_HANDLE;
-int      g_autoStochHandle = INVALID_HANDLE;
-datetime g_autoLastBar     = 0;
+int      g_autoEmaHandle     = INVALID_HANDLE;
+int      g_autoEmaSlowHandle = INVALID_HANDLE;
+int      g_autoStochHandle   = INVALID_HANDLE;
+datetime g_autoLastBar       = 0;
 
 // Locked once per "wave" when first swing SL succeeds for that direction (0 = not locked).
 int g_maxBuyBundlePositions = 0;
@@ -1361,6 +1373,137 @@ void ProcessBundleBreakEvenForSide(const ENUM_POSITION_TYPE side) {
   }
 }
 
+//------------------- Count-based TP / basket profit exit -------------
+// Per direction, decided by number of OPEN market positions on that side:
+//   1 position  → shared TP = first(oldest) entry ± TP1OrderPoints (positions + pendings).
+//   2 positions → shared TP = first(oldest) entry ± TP2OrderPoints (positions + pendings).
+//   >=3         → no price TP (cleared); close that whole side when its P/L+swap >= TPMoney.
+
+// Sum floating profit + swap for bundle legs on ONE side (account currency).
+double BundleSideFloatingProfitMoney(const ENUM_POSITION_TYPE side) {
+  double sum = 0.0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    sum += PositionGetDouble(POSITION_PROFIT);
+    sum += PositionGetDouble(POSITION_SWAP);
+  }
+  return sum;
+}
+
+// Close all bundle positions AND pendings on ONE side.
+void CloseBundleSide(const ENUM_POSITION_TYPE side) {
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    SetTradeMagicForPositionTicket(tk);
+    if (!trade.PositionClose(tk))
+      Print("[ManualSwingSLTP] TPMoney close position failed tk=", tk,
+            " ret=", trade.ResultRetcode());
+  }
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (!IsBundleOrderLeg(ot)) continue;
+    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    if (isBuy != ManualOrderTypeIsBuySide(otyp)) continue;
+    SetTradeMagicForOrderTicket(ot);
+    if (!trade.OrderDelete(ot))
+      Print("[ManualSwingSLTP] TPMoney delete pending failed ot=", ot,
+            " ret=", trade.ResultRetcode());
+  }
+  if (isBuy) g_maxBuyBundlePositions = 0;
+  else       g_maxSellBundlePositions = 0;
+}
+
+// Apply one shared TP price to all bundle positions + pendings on a side.
+// tp <= 0 clears TP (used in the >=3 money-mode state).
+void ApplySharedTPToSide(const ENUM_POSITION_TYPE side, const double tp,
+                         const int digits) {
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  const double pt = Pt();
+  const double eps = (pt > 0.0) ? pt / 2.0 : 0.0000001;
+  const bool clear = (tp <= 0.0);
+  const double ntp = clear ? 0.0 : NormalizeDouble(tp, digits);
+
+  trade.SetDeviationInPoints(SlippagePoints);
+
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    const double csl = PositionGetDouble(POSITION_SL);
+    const double ctp = PositionGetDouble(POSITION_TP);
+    if (clear) {
+      if (ctp <= 0.0) continue;
+    } else {
+      if (ctp > 0.0 && MathAbs(ctp - ntp) <= eps) continue;
+    }
+    SetTradeMagicForPositionTicket(tk);
+    if (!trade.PositionModify(tk, csl, ntp))
+      Print("[ManualSwingSLTP] Count-TP position modify failed tk=", tk,
+            " ret=", trade.ResultRetcode());
+  }
+
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (!IsBundleOrderLeg(ot)) continue;
+    const ENUM_ORDER_TYPE otyp = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    if (isBuy != ManualOrderTypeIsBuySide(otyp)) continue;
+    const double op = OrderGetDouble(ORDER_PRICE_OPEN);
+    const double osl = OrderGetDouble(ORDER_SL);
+    const double otp = OrderGetDouble(ORDER_TP);
+    if (clear) {
+      if (otp <= 0.0) continue;
+    } else {
+      if (otp > 0.0 && MathAbs(otp - ntp) <= eps) continue;
+    }
+    const ENUM_ORDER_TYPE_TIME ttime =
+        (ENUM_ORDER_TYPE_TIME)OrderGetInteger(ORDER_TYPE_TIME);
+    const datetime exp = (datetime)OrderGetInteger(ORDER_TIME_EXPIRATION);
+    SetTradeMagicForOrderTicket(ot);
+    if (!trade.OrderModify(ot, op, osl, ntp, ttime, exp))
+      Print("[ManualSwingSLTP] Count-TP pending modify failed ot=", ot,
+            " ret=", trade.ResultRetcode());
+  }
+}
+
+void ProcessCountBasedTPForSide(const ENUM_POSITION_TYPE side) {
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  const int n = CountBundleLegs(isBuy); // OPEN market positions on this side only
+  if (n <= 0) return;
+
+  const double pt = Pt();
+  if (pt <= 0.0) return;
+  const int digits = DigitsCount();
+
+  if (n >= 3) {
+    // Money mode: drop any price TP, close the whole side once profit >= TPMoney.
+    ApplySharedTPToSide(side, 0.0, digits); // clear stray TP from the 2-order state
+    if (TPMoney > 0.0 && BundleSideFloatingProfitMoney(side) >= TPMoney)
+      CloseBundleSide(side);
+    return;
+  }
+
+  // n == 1 or 2 → one shared TP measured from the first (oldest) entry.
+  const ulong firstTk = OldestBundleLegTicket(side);
+  if (firstTk == 0 || !PositionSelectByTicket(firstTk)) return;
+  const double firstEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+  const int tpPts = (n == 1) ? TP1OrderPoints : TP2OrderPoints;
+  if (tpPts <= 0) return;
+
+  double tp = isBuy ? (firstEntry + (double)tpPts * pt)
+                    : (firstEntry - (double)tpPts * pt);
+  tp = NormalizeDouble(tp, digits);
+  if (!RespectStopDistanceTPOnly(isBuy, tp)) return; // too close to market for broker
+
+  ApplySharedTPToSide(side, tp, digits);
+}
+
 //--------------------------- Core logic ------------------------------
 void ManageManualPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return;
@@ -1453,32 +1596,37 @@ void ManageManualPosition(const ulong tk) {
 }
 
 //--------------------------- Auto-trade (M5) -------------------------
-// BUY  (M5): last closed close > EMA50 AND Stoch %K crosses DOWN to <= AutoStochBuyLevel.
-// SELL (M5): last closed close < EMA50 AND Stoch %K crosses UP   to >= AutoStochSellLevel.
+// BUY  (M5): close > EMA50 AND EMA50 > EMA200 AND Stoch %K crosses DOWN to <= AutoStochBuyLevel.
+// SELL (M5): close < EMA50 AND EMA50 < EMA200 AND Stoch %K crosses UP   to >= AutoStochSellLevel.
 // "Crosses" = prior closed bar was on the other side of the level → fires once per reach.
 bool ReadAutoSignals(bool &buySig, bool &sellSig) {
   buySig = false;
   sellSig = false;
-  if (g_autoEmaHandle == INVALID_HANDLE || g_autoStochHandle == INVALID_HANDLE)
+  if (g_autoEmaHandle == INVALID_HANDLE || g_autoEmaSlowHandle == INVALID_HANDLE ||
+      g_autoStochHandle == INVALID_HANDLE)
     return false;
 
   double ema[];
+  double emaSlow[];
   double kmain[];
   ArraySetAsSeries(ema, true);
+  ArraySetAsSeries(emaSlow, true);
   ArraySetAsSeries(kmain, true);
   if (CopyBuffer(g_autoEmaHandle, 0, 0, 3, ema) < 3) return false;
+  if (CopyBuffer(g_autoEmaSlowHandle, 0, 0, 3, emaSlow) < 3) return false;
   if (CopyBuffer(g_autoStochHandle, 0, 0, 3, kmain) < 3) return false; // buffer 0 = %K main
 
   // Evaluate on the last CLOSED bar (index 1); index 2 is the prior closed bar.
   const double closeClosed = iClose(_Symbol, PERIOD_M5, 1);
   if (closeClosed <= 0.0) return false;
-  const double emaClosed = ema[1];
+  const double emaClosed     = ema[1];
+  const double emaSlowClosed = emaSlow[1];
   const double kNow  = kmain[1];
   const double kPrev = kmain[2];
 
-  buySig  = (closeClosed > emaClosed) &&
+  buySig  = (closeClosed > emaClosed) && (emaClosed > emaSlowClosed) &&
             (kPrev > AutoStochBuyLevel)  && (kNow <= AutoStochBuyLevel);
-  sellSig = (closeClosed < emaClosed) &&
+  sellSig = (closeClosed < emaClosed) && (emaClosed < emaSlowClosed) &&
             (kPrev < AutoStochSellLevel) && (kNow >= AutoStochSellLevel);
   return true;
 }
@@ -1537,10 +1685,12 @@ int OnInit() {
   // Auto-trade indicators on M5 (buffer 0 of Stochastic = %K main line).
   if (AutoTradeEnabled) {
     g_autoEmaHandle = iMA(_Symbol, PERIOD_M5, AutoEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    g_autoEmaSlowHandle = iMA(_Symbol, PERIOD_M5, AutoEmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
     g_autoStochHandle = iStochastic(_Symbol, PERIOD_M5, AutoStochKPeriod,
                                     AutoStochDPeriod, AutoStochSlowing,
                                     MODE_SMA, STO_LOWHIGH);
-    if (g_autoEmaHandle == INVALID_HANDLE || g_autoStochHandle == INVALID_HANDLE) {
+    if (g_autoEmaHandle == INVALID_HANDLE || g_autoEmaSlowHandle == INVALID_HANDLE ||
+        g_autoStochHandle == INVALID_HANDLE) {
       Print("[ManualSwingSLTP] Failed to create auto-trade indicator handles.");
       return INIT_FAILED;
     }
@@ -1551,6 +1701,7 @@ int OnInit() {
 
 void OnDeinit(const int reason) {
   if (g_autoEmaHandle != INVALID_HANDLE) IndicatorRelease(g_autoEmaHandle);
+  if (g_autoEmaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_autoEmaSlowHandle);
   if (g_autoStochHandle != INVALID_HANDLE) IndicatorRelease(g_autoStochHandle);
 }
 
@@ -1603,8 +1754,9 @@ void OnTick() {
     ManageManualPosition(tk);
   }
 
-  ProcessBundleBreakEvenForSide(POSITION_TYPE_BUY);
-  ProcessBundleBreakEvenForSide(POSITION_TYPE_SELL);
+  // Count-based TP / basket-profit exit (replaces old break-even + TPPoints).
+  ProcessCountBasedTPForSide(POSITION_TYPE_BUY);
+  ProcessCountBasedTPForSide(POSITION_TYPE_SELL);
 
   EnforceGridLegSLFreeze();
   EnforceGridPendingSLFreeze();
