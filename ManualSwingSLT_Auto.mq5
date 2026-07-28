@@ -52,9 +52,11 @@
 //|   1 pos → shared TP = first entry ± TP1OrderPoints; 2 pos → ± TP2OrderPoints;  |
 //|   >=3 pos → clear TP, close that side when its P/L+swap >= TPMoney. Old BE/TP  |
 //|   functions remain defined but are no longer called.                          |
+//| v1.32: AutoMaxSameDirection — cap consecutive same-direction AUTO entries      |
+//|   (default 2); the opposite signal resets the streak (trend-flip).            |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.31"
+#property version   "1.32"
 #property description "Swing SL/TP + basket USD stop + grid + M5 auto entries + count-based TP."
 
 #include <Trade/Trade.mqh>
@@ -111,6 +113,7 @@ input int    AutoStochDPeriod      = 3;      // Stochastic %D period
 input int    AutoStochSlowing      = 3;      // Stochastic slowing
 input double AutoStochBuyLevel     = 20.0;   // BUY when %K reaches down to <= this
 input double AutoStochSellLevel    = 80.0;   // SELL when %K reaches up   to >= this
+input int    AutoMaxSameDirection  = 2;      // max consecutive same-direction AUTO entries (0=unlimited); resets when the opposite signal fires
 
 //--------------------------- Globals --------------------------------
 CTrade trade;
@@ -120,6 +123,11 @@ int      g_autoEmaHandle     = INVALID_HANDLE;
 int      g_autoEmaSlowHandle = INVALID_HANDLE;
 int      g_autoStochHandle   = INVALID_HANDLE;
 datetime g_autoLastBar       = 0;
+
+// Consecutive same-direction AUTO entries (trend-end limiter, AutoMaxSameDirection).
+// A BUY signal resets the SELL streak and vice-versa (trend flip → fresh count).
+int      g_autoBuyStreak     = 0;
+int      g_autoSellStreak    = 0;
 
 // Locked once per "wave" when first swing SL succeeds for that direction (0 = not locked).
 int g_maxBuyBundlePositions = 0;
@@ -1631,9 +1639,9 @@ bool ReadAutoSignals(bool &buySig, bool &sellSig) {
   return true;
 }
 
-void OpenAutoEntry(const bool isBuy) {
+bool OpenAutoEntry(const bool isBuy) {
   double lots = NormalizeVolumeLocal(AutoLot);
-  if (lots <= 0.0) return;
+  if (lots <= 0.0) return false;
   // Open with neutral magic (0) so the manual manager treats it like a hand
   // click and applies swing SL / grid / BE / basket stop exactly the same way.
   trade.SetExpertMagicNumber(0);
@@ -1648,6 +1656,7 @@ void OpenAutoEntry(const bool isBuy) {
   else
     Print("[ManualSwingSLTP] Auto ", (isBuy ? "BUY" : "SELL"),
           " opened lots=", DoubleToString(lots, 2));
+  return ok;
 }
 
 void ProcessAutoTrade() {
@@ -1662,11 +1671,15 @@ void ProcessAutoTrade() {
   g_autoLastBar = curBar;                          // mark this bar handled
 
   if (buySig) {
+    g_autoSellStreak = 0; // opposite trend signal → reset the other side's streak
+    if (AutoMaxSameDirection > 0 && g_autoBuyStreak >= AutoMaxSameDirection) return; // trend-end limit
     if (AutoOneBundlePerSide && CountBundleLegs(true) > 0) return;
-    OpenAutoEntry(true);
+    if (OpenAutoEntry(true)) g_autoBuyStreak++;
   } else if (sellSig) {
+    g_autoBuyStreak = 0;  // opposite trend signal → reset the other side's streak
+    if (AutoMaxSameDirection > 0 && g_autoSellStreak >= AutoMaxSameDirection) return; // trend-end limit
     if (AutoOneBundlePerSide && CountBundleLegs(false) > 0) return;
-    OpenAutoEntry(false);
+    if (OpenAutoEntry(false)) g_autoSellStreak++;
   }
 }
 
