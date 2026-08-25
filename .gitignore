@@ -1,0 +1,9 @@
+# MetaTrader build artifacts
+*.ex5
+*.ex4
+
+# Compile / build logs
+*.log
+
+# macOS
+.DS_Store
