@@ -1,63 +1,17 @@
 //+------------------------------------------------------------------+
-//|                                              ManualSwingSLTP.mq5 |
+//| ManualSwingSLT_Auto.mq5                                          |
+//| Manual manager + AUTO entries. Manages magic != MagicNumber.     |
 //|                                                                  |
-//| ຈຸດປະສົງ (Manual manager):                                       |
-//| - ທ່ານເປີດ BUY/SELL ເອງ (manual) ແລ້ວ EA ຈະຊ່ວຍຕັ້ງ SL/TP ອັດຕະໂນມັດ |
-//|                                                                  |
-//| BUY:                                                             |
-//|  - ຕັ້ງ SL ທີ່ swing low (lookback); ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ BuyLimit grid |
-//|    (ຈຳນວນ = GridExtraPendingLegs, ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL).        |
-//|  - ໄມ້ທຳອິດຝັ່ງນັ້ນກຳໄລ >= BreakEvenTriggerPoints → BE+ ທີ່ entry ໄມ້ທຳອິດ (ທຸກ leg ຝັ່ງດຽວກັນ) |
-//|  - ເປີດ BUY/SELL manual ໄດ້ອິດສະຫຼະ (ບໍ່ມີ EMA trend gate)              |
-//|                                                                  |
-//| SELL:                                                            |
-//|  - ຕັ້ງ SL ທີ່ swing high; ຫຼັງຕັ້ງ SL ສຳເລັດ ອາດວາງ SellLimit grid ຂຶ້ນຈາກ entry |
-//|    ຫ່າງກັນສະເໝີຕາມ GridExtraPendingLegs ຈົນບໍ່ເກີນ SL.              |
-//|  - ໄມ້ທຳອິດ SELL ກຳໄລຮອດ trigger → BE+ ທີ່ entry ໄມ້ທຳອິດ (ທຸກ leg ຝັ່ງດຽວກັນ) |
-//|                                                                   |
-//| ໝາຍເຫດ: EA ຈັດການສະເພາະ manual positions (magic != MagicNumber) |
-//| Bugfix v1.01: ລ້າງລາຍການ ticket ທີ່ປິດແລ້ວອອກຈາກ g_states — ບໍ່ດັ່ນຫຼັງມີ ~200 |
-//|   ອໍເດີເກົ່າ EnsureState ຈະເຕັມ ແລະ ອໍເດີໃໝ່ຈະບໍ່ຖືກຕັ້ງ SL ອີກ.        |
-//| v1.02–1.03: ຫຼັງຕັ້ງ swing SL ວາງ pending grid ຈຳນວນ GridExtraPendingLegs, |
-//|   ຫ່າງກັນສະເໝີລະຫວ່າງ entry ແລະ SL (ບໍ່ລະເມີດ SL).              |
-//| v1.05: Optional max bundle per side = legs at first SL lock + grid legs; |
-//|   excess market positions closed (newest first) — broker cannot block clicks. |
-//| v1.06: Protect SL — clamp widen beyond EA swing/ref; restore SL if removed; |
-//|   optional: do not override user-moved SL in the break-even step (TP still). |
-//| v1.07: When you change TP on a manual position, copy that TP to all same-side |
-//|   bundle legs (manual + MSSLTP fills) and EA grid pendings on this symbol.   |
-//| v1.09: Shared initial SL = one price on all legs with SL=0; grid only on the |
-//|   ticket being managed. Before BE, optional full SL freeze at that price   |
-//|   (restore if dragged/removed) to reduce over-trading.                      |
-//| v1.10: Grid pendings use the same SL as parent (first) position; freeze      |
-//|   pending SL while parent is in swing phase (same as ProtectSLFreezeBeforeBE). |
-//| v1.11: BE — ບໍ່ຕັ້ງ beTpSet ຄ້າງວົງ swing ເມື່ອກຳໄລຮອດ trigger ແລ້ວ; ຖ້າ BE+ ຕິດ |
-//|   stops level ຈະຂຍັບ SL ໃຫ້ໃກ້ຕະຫຼາດທີ່ broker ຍອມຮັບ (BreakEvenRelaxSLToStopsLevel). |
-//| v1.12: MaxLotPerLeg — ຫ້າມ lot ຕໍ່ໄມ້ເກີນຄ່າກຳນົດ (ຕັດ position / ປັບ pending). |
-//| v1.15: BE ຕາມໄມ້ທຳອິດຝັ່ງ — trigger ຈາກກຳໄລໄມ້ແຮກ; SL BE+ ລາຄາ entry ໄມ້ແຮກ ທຸກ leg. |
-//| v1.16: MaxLotPerLeg — ຕັດ lot ທັນທີເມື່ອເປີດ manual/grid ເກີນ (magic 0 ສຳລັບ manual). |
-//| v1.17: TotalUSDSL — ຜົນລວມ bundle <= -TotalUSDSL → ປິດທຸກ leg + pending ທັນທີ. |
-//| v1.18: MinSLDistancePoints — ຄັ້ງທຳອິດຖ້າ entry→SL ແຄບກວ່າຄ່ານີ້ ຂະຫຍາຍ SL ໃຫ້ກວ້າງພໍນີ້. |
-//| v1.24: SyncTP — ຄັດລອກ TP ໄປ manual pending ນຳ (ກ່ອນນີ້ແຕ່ EA grid pending). |
-//| v1.25: Removed EMA trend filter (v1.13–1.21 M1/M5 EMA50 vs EMA200 gate).   |
-//| v1.28: Removed GridLot; grid base lot = parent manual position lot.          |
-//|   increaseLot — grid legs step up lot: leg1=base, legN=base+(N-1)*increaseLot |
-//|   (0=all legs equal). Still capped by MaxLotPerLeg / NormalizeVolumeLocal.   |
-//| v1.29: AUTO entries (added on top of manual mgmt; old logic unchanged).      |
-//|   BUY  M5: close>EMA50 AND Stoch(9,3,3) %K crosses down to <=AutoStochBuyLevel. |
-//|   SELL M5: close<EMA50 AND Stoch(9,3,3) %K crosses up   to >=AutoStochSellLevel.|
-//|   Auto fills open with magic 0 → same manager sets swing SL / grid / BE.      |
-//| v1.30: AUTO trend filter — BUY also needs EMA50>EMA200, SELL EMA50<EMA200 (M5).|
-//| v1.31: Count-based exit per side (replaces old break-even + TPPoints):        |
-//|   1 pos → shared TP = first entry ± TP1OrderPoints; 2 pos → ± TP2OrderPoints;  |
-//|   >=3 pos → clear TP, close that side when its P/L+swap >= TPMoney. Old BE/TP  |
-//|   functions remain defined but are no longer called.                          |
-//| v1.32: AutoMaxSameDirection — cap consecutive same-direction AUTO entries      |
-//|   (default 2); the opposite signal resets the streak (trend-flip).            |
+//| Manager: swing SL (+grid pendings, increaseLot), count-based TP  |
+//|   per side (1..5 legs = TP1..TP5OrderPoints; >=6 = TPMoney close),|
+//|   TotalUSDSL basket stop, MaxLotPerLeg, SyncTP, SL protection.    |
+//| AUTO (AutoTF): BUY EMA50>EMA200 & close>EMA50 & %K<=BuyLevel;     |
+//|   SELL mirror. Max AutoMaxSameDirection in a row. Opens magic 0.  |
+//| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.32"
-#property description "Swing SL/TP + basket USD stop + grid + M5 auto entries + count-based TP."
+#property version   "1.35"
+#property description "Swing SL/TP + basket USD stop + grid + auto entries (AutoTF) + count-based TP."
 
 #include <Trade/Trade.mqh>
 
@@ -67,25 +21,23 @@ input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 0;      // extra buffer beyond swing (points)
 input int    FirstSLOffsetPoints      = 500;    // apply ONLY to the first SL: BUY subtract, SELL add (points)
-input int    MinSLDistancePoints      = 10000;   // first SL only: if entry→SL < this, widen SL to this (0=off)
-
-input int    BreakEvenTriggerPoints   = 1000;    // (UNUSED since v1.31: old break-even, replaced by count-based TP)
-input int    BreakEvenPlusPoints      = 20;     // (UNUSED since v1.31)
-input bool   BreakEvenRelaxSLToStopsLevel = true; // (UNUSED since v1.31)
-input int    TPPoints                = 1000;   // (UNUSED since v1.31: replaced by TP1OrderPoints/TP2OrderPoints)
+input int    MinSLDistancePoints      = 20000;   // first SL only: if entry→SL < this, widen SL to this (0=off)
 
 //------- Count-based exit (per direction; replaces old break-even + TPPoints) -------
-input int    TP1OrderPoints          = 1000;   // 1 open position on the side: shared TP = first entry ± this (points)
-input int    TP2OrderPoints          = 500;    // 2 open positions: shared TP = first entry ± this (points)
-input double TPMoney                 = 200.0; // >=3 open positions: close that side when its P/L+swap >= this ($)
+input int    TP1OrderPoints          = 1500;   // 1 open position on the side: shared TP = first entry ± this (points)
+input int    TP2OrderPoints          = 1200;   // 2 open positions: shared TP = first entry ± this (points)
+input int    TP3OrderPoints          = 900;    // 3 open positions: shared TP = first entry ± this (points)
+input int    TP4OrderPoints          = 600;    // 4 open positions: shared TP = first entry ± this (points)
+input int    TP5OrderPoints          = 300;    // 5 open positions: shared TP = first entry ± this (points)
+input double TPMoney                 = 1000.0; // >=6 open positions: close that side when its P/L+swap >= this ($)
 
 input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
-input int    GridExtraPendingLegs     = 9;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
+input int    GridExtraPendingLegs     = 20;     // extra BuyLimit/SellLimit count; equal spacing entry↔SL
 input double increaseLot              = 0.01;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.2;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
-input double TotalUSDSL               = 2500.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
+input double TotalUSDSL               = 12000.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
 input bool   EnforceInitialBundleMax  = false;  // OFF (default): no leg cap — open UNLIMITED orders. true = cap to count-at-first-SL + grid legs
@@ -102,12 +54,13 @@ input bool ShareInitialSLPriceToAllLegs = true; // same SL price on every same-s
 input bool ProtectSLFreezeBeforeBE    = true;  // before BE: SL must stay at committed price (restore if moved/cleared)
 // If freeze is OFF: ProtectSLClampNoWiden only blocks widening past commit; if freeze ON, clamp widen is redundant.
 
-//----------------- Auto-trade (M5 EMA50 + Stochastic 9,3,3) -----------------
+//----------------- Auto-trade (AutoTF EMA50 + Stochastic 9,3,3) -----------------
 input bool   AutoTradeEnabled      = true;   // enable AUTO entries (added on top of manual management)
+input ENUM_TIMEFRAMES AutoTF       = PERIOD_H1; // timeframe for all AUTO signals (EMA50/EMA200/Stoch/close)
 input double AutoLot               = 0.01;   // lot size for AUTO BUY/SELL entries
 input bool   AutoOneBundlePerSide  = true;   // only open a new AUTO entry when that side has no open bundle
-input int    AutoEmaPeriod         = 50;     // fast EMA period on M5 (BUY if price>EMA, SELL if price<EMA)
-input int    AutoEmaSlowPeriod     = 200;    // slow EMA period on M5 trend filter (BUY needs EMA50>EMA200, SELL EMA50<EMA200)
+input int    AutoEmaPeriod         = 50;     // fast EMA period on AutoTF (BUY if price>EMA, SELL if price<EMA)
+input int    AutoEmaSlowPeriod     = 200;    // slow EMA period on AutoTF trend filter (BUY needs EMA50>EMA200, SELL EMA50<EMA200)
 input int    AutoStochKPeriod      = 9;      // Stochastic %K period
 input int    AutoStochDPeriod      = 3;      // Stochastic %D period
 input int    AutoStochSlowing      = 3;      // Stochastic slowing
@@ -118,7 +71,7 @@ input int    AutoMaxSameDirection  = 2;      // max consecutive same-direction A
 //--------------------------- Globals --------------------------------
 CTrade trade;
 
-// Auto-trade indicator handles (M5) + last processed bar (one signal per bar).
+// Auto-trade indicator handles (AutoTF) + last processed bar (one signal per bar).
 int      g_autoEmaHandle     = INVALID_HANDLE;
 int      g_autoEmaSlowHandle = INVALID_HANDLE;
 int      g_autoStochHandle   = INVALID_HANDLE;
@@ -242,26 +195,6 @@ bool RespectStopDistanceSLOnly(const bool isBuy, const double sl) {
 
 bool RespectStopDistanceTPOnly(const bool isBuy, const double tp) {
   return RespectStopsDistanceFromMarket(isBuy, 0.0, tp);
-}
-
-// If ideal break-even SL violates stops level, snap to the tightest valid SL
-// (BUY: just below bid; SELL: just above ask) so BE can still run on tight brokers.
-double AdjustBreakevenSlForStopsLevel(const bool isBuy, const double idealSl,
-                                      const int digits) {
-  const double pt = Pt();
-  if (pt <= 0.0) return NormalizeDouble(idealSl, digits);
-  if (RespectStopDistanceSLOnly(isBuy, idealSl))
-    return NormalizeDouble(idealSl, digits);
-  const int lvl = (int)MathMax(StopsLevelPoints(), 1);
-  const double minDist = (double)lvl * pt;
-  const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-  const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-  double adj;
-  if (isBuy)
-    adj = bid - minDist - pt;
-  else
-    adj = ask + minDist + pt;
-  return NormalizeDouble(adj, digits);
 }
 
 // When TP is edited on a manual position, apply the same TP to every same-side
@@ -658,40 +591,6 @@ ulong OldestBundleLegTicket(const ENUM_POSITION_TYPE side) {
   return oldestTk;
 }
 
-bool GetFirstLegAnchor(const ENUM_POSITION_TYPE side, ulong &anchorTk,
-                       double &anchorOpen, double &anchorProfitPts) {
-  anchorTk = 0;
-  anchorOpen = 0.0;
-  anchorProfitPts = 0.0;
-  anchorTk = OldestBundleLegTicket(side);
-  if (anchorTk == 0 || !PositionSelectByTicket(anchorTk)) return false;
-  anchorOpen = PositionGetDouble(POSITION_PRICE_OPEN);
-  anchorProfitPts = ProfitPointsForPosition(side, anchorOpen);
-  return true;
-}
-
-bool BundleReadyForBreakEven(const ENUM_POSITION_TYPE side) {
-  if (BreakEvenTriggerPoints <= 0) return false;
-  if (CountBundleLegs(side == POSITION_TYPE_BUY) <= 0) return false;
-  ulong anchorTk = 0;
-  double anchorOpen = 0.0, anchorPts = 0.0;
-  if (!GetFirstLegAnchor(side, anchorTk, anchorOpen, anchorPts)) return false;
-  return anchorPts >= (double)BreakEvenTriggerPoints;
-}
-
-int StateIndexForBreakEvenLeg(const ulong tk) {
-  if (!PositionSelectByTicket(tk)) return -1;
-  const long mag = (long)PositionGetInteger(POSITION_MAGIC);
-  if (mag != MagicNumber) return FindStateIndex(tk);
-  const string c = PositionGetString(POSITION_COMMENT);
-  const string prefix = "MSSLTP";
-  if (StringFind(c, prefix) != 0) return -1;
-  const ulong parentTk =
-      (ulong)StringToInteger(StringSubstr(c, (int)StringLen(prefix)));
-  if (parentTk == 0) return -1;
-  return FindStateIndex(parentTk);
-}
-
 void SetTradeMagicForPositionTicket(const ulong tk) {
   if (!PositionSelectByTicket(tk)) return;
   if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber)
@@ -868,32 +767,6 @@ void DeleteGridPendingsForParent(const ulong parentTicket) {
     if (OrderGetString(ORDER_COMMENT) != tag) continue;
     if (!trade.OrderDelete(ot))
       Print("[ManualSwingSLTP] OrderDelete grid failed ticket=", ot, " ret=", trade.ResultRetcode());
-  }
-}
-
-void DeleteAllGridPendingsOnSide(const ENUM_POSITION_TYPE side) {
-  const string prefix = "MSSLTP";
-  trade.SetExpertMagicNumber(MagicNumber);
-  trade.SetDeviationInPoints(SlippagePoints);
-  for (int j = OrdersTotal() - 1; j >= 0; j--) {
-    const ulong ot = OrderGetTicket(j);
-    if (ot == 0 || !OrderSelect(ot)) continue;
-    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
-    if ((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber) continue;
-    const string c = OrderGetString(ORDER_COMMENT);
-    if (StringFind(c, prefix) != 0) continue;
-    const ENUM_ORDER_TYPE otype = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-    const bool isBuySide =
-        (otype == ORDER_TYPE_BUY || otype == ORDER_TYPE_BUY_LIMIT ||
-         otype == ORDER_TYPE_BUY_STOP || otype == ORDER_TYPE_BUY_STOP_LIMIT);
-    const bool isSellSide =
-        (otype == ORDER_TYPE_SELL || otype == ORDER_TYPE_SELL_LIMIT ||
-         otype == ORDER_TYPE_SELL_STOP || otype == ORDER_TYPE_SELL_STOP_LIMIT);
-    if (side == POSITION_TYPE_BUY && !isBuySide) continue;
-    if (side == POSITION_TYPE_SELL && !isSellSide) continue;
-    if (!trade.OrderDelete(ot))
-      Print("[ManualSwingSLTP] OrderDelete grid side failed ot=", ot,
-            " ret=", trade.ResultRetcode());
   }
 }
 
@@ -1268,124 +1141,11 @@ bool ProtectRestoreOrClampSL(const ulong tk, const int st,
   return false;
 }
 
-// BE+TP for one leg: SL at first-leg entry (+/- BE+); TP from this leg's entry.
-bool ApplyBreakEvenToLeg(const ulong tk, const int st, const ENUM_POSITION_TYPE side,
-                         const double anchorOpen, const double anchorProfitPts) {
-  if (!PositionSelectByTicket(tk)) return false;
-
-  const double legOpen = PositionGetDouble(POSITION_PRICE_OPEN);
-  double workSL = PositionGetDouble(POSITION_SL);
-  double workTP = PositionGetDouble(POSITION_TP);
-
-  const double pt = Pt();
-  if (pt <= 0.0) return false;
-  const int digits = DigitsCount();
-
-  trade.SetExpertMagicNumber(MagicNumber);
-  trade.SetDeviationInPoints(SlippagePoints);
-
-  double wantSL = 0.0, wantTP = 0.0;
-  if (side == POSITION_TYPE_BUY) {
-    wantSL = anchorOpen + (double)BreakEvenPlusPoints * pt;
-    wantTP = legOpen + (double)TPPoints * pt;
-  } else {
-    wantSL = anchorOpen - (double)BreakEvenPlusPoints * pt;
-    wantTP = legOpen - (double)TPPoints * pt;
-  }
-  wantSL = NormalizeDouble(wantSL, digits);
-  wantTP = NormalizeDouble(wantTP, digits);
-
-  if (st >= 0 && ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL)
-    wantSL = workSL;
-
-  if (workSL > 0.0) {
-    if (side == POSITION_TYPE_BUY && wantSL <= workSL) wantSL = workSL;
-    if (side == POSITION_TYPE_SELL && wantSL >= workSL) wantSL = workSL;
-  }
-  if (workTP > 0.0) wantTP = workTP;
-
-  const bool isBuy = (side == POSITION_TYPE_BUY);
-
-  if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL)) {
-    if (BreakEvenRelaxSLToStopsLevel)
-      wantSL = AdjustBreakevenSlForStopsLevel(isBuy, wantSL, digits);
-    if (wantSL > 0.0 && !RespectStopDistanceSLOnly(isBuy, wantSL))
-      wantSL = workSL;
-  }
-  if (workSL > 0.0) {
-    if (side == POSITION_TYPE_BUY && wantSL > 0.0 && wantSL <= workSL) wantSL = workSL;
-    if (side == POSITION_TYPE_SELL && wantSL > 0.0 && wantSL >= workSL) wantSL = workSL;
-  }
-  if (wantTP > 0.0 && !RespectStopDistanceTPOnly(isBuy, wantTP))
-    wantTP = workTP;
-
-  const double nCurSL = (workSL > 0.0) ? NormalizeDouble(workSL, digits) : 0.0;
-  const double nCurTP = (workTP > 0.0) ? NormalizeDouble(workTP, digits) : 0.0;
-  const double nWantSL = (wantSL > 0.0) ? NormalizeDouble(wantSL, digits) : 0.0;
-  const double nWantTP = (wantTP > 0.0) ? NormalizeDouble(wantTP, digits) : 0.0;
-
-  if (nCurSL == nWantSL && nCurTP == nWantTP) {
-    if (st >= 0) {
-      const bool userKeptSlForBe =
-          (ProtectBEDontOverrideUserSL && g_states[st].userTouchedSL);
-      const double bound = g_states[st].protectBoundSL;
-      const double epsSwing = pt * 10.0;
-      const bool stillOnSwingFreeze =
-          (!userKeptSlForBe && bound > 0.0 && workSL > 0.0 &&
-           MathAbs(NormalizeDouble(workSL, digits) - NormalizeDouble(bound, digits)) <=
-               epsSwing);
-      if (!(anchorProfitPts >= (double)BreakEvenTriggerPoints && stillOnSwingFreeze))
-        g_states[st].beTpSet = true;
-    }
-    return true;
-  }
-
-  if (trade.PositionModify(tk, nWantSL, nWantTP)) {
-    if (st >= 0) {
-      g_states[st].beTpSet = true;
-      g_states[st].lastEaWrittenSL = nWantSL;
-    }
-    return true;
-  }
-
-  Print("[ManualSwingSLTP] Modify BE/TP failed. ticket=", tk,
-        " firstLegPts=", DoubleToString(anchorProfitPts, 1),
-        " wantSL=", DoubleToString(nWantSL, digits),
-        " wantTP=", DoubleToString(nWantTP, digits),
-        " err=", GetLastError());
-  return false;
-}
-
-void ProcessBundleBreakEvenForSide(const ENUM_POSITION_TYPE side) {
-  if (!BundleReadyForBreakEven(side)) return;
-
-  ulong anchorTk = 0;
-  double anchorOpen = 0.0, anchorPts = 0.0;
-  if (!GetFirstLegAnchor(side, anchorTk, anchorOpen, anchorPts)) return;
-
-  DeleteAllGridPendingsOnSide(side);
-
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsBundlePositionLeg(tk)) continue;
-    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
-
-    int st = StateIndexForBreakEvenLeg(tk);
-    const long mag = (long)PositionGetInteger(POSITION_MAGIC);
-    if (mag != MagicNumber) {
-      st = EnsureState(tk);
-      if (st < 0) continue;
-    }
-
-    ApplyBreakEvenToLeg(tk, st, side, anchorOpen, anchorPts);
-  }
-}
-
 //------------------- Count-based TP / basket profit exit -------------
 // Per direction, decided by number of OPEN market positions on that side:
-//   1 position  → shared TP = first(oldest) entry ± TP1OrderPoints (positions + pendings).
-//   2 positions → shared TP = first(oldest) entry ± TP2OrderPoints (positions + pendings).
-//   >=3         → no price TP (cleared); close that whole side when its P/L+swap >= TPMoney.
+//   1..5 positions → shared TP = first(oldest) entry ± TP{n}OrderPoints (positions + pendings).
+//                    (1→TP1, 2→TP2, 3→TP3, 4→TP4, 5→TP5)
+//   >=6            → no price TP (cleared); close that whole side when its P/L+swap >= TPMoney.
 
 // Sum floating profit + swap for bundle legs on ONE side (account currency).
 double BundleSideFloatingProfitMoney(const ENUM_POSITION_TYPE side) {
@@ -1489,19 +1249,27 @@ void ProcessCountBasedTPForSide(const ENUM_POSITION_TYPE side) {
   if (pt <= 0.0) return;
   const int digits = DigitsCount();
 
-  if (n >= 3) {
+  if (n >= 6) {
     // Money mode: drop any price TP, close the whole side once profit >= TPMoney.
-    ApplySharedTPToSide(side, 0.0, digits); // clear stray TP from the 2-order state
+    ApplySharedTPToSide(side, 0.0, digits); // clear stray TP from the <=5-order state
     if (TPMoney > 0.0 && BundleSideFloatingProfitMoney(side) >= TPMoney)
       CloseBundleSide(side);
     return;
   }
 
-  // n == 1 or 2 → one shared TP measured from the first (oldest) entry.
+  // n == 1..5 → one shared TP measured from the first (oldest) entry.
   const ulong firstTk = OldestBundleLegTicket(side);
   if (firstTk == 0 || !PositionSelectByTicket(firstTk)) return;
   const double firstEntry = PositionGetDouble(POSITION_PRICE_OPEN);
-  const int tpPts = (n == 1) ? TP1OrderPoints : TP2OrderPoints;
+  int tpPts = 0;
+  switch (n) {
+    case 1:  tpPts = TP1OrderPoints; break;
+    case 2:  tpPts = TP2OrderPoints; break;
+    case 3:  tpPts = TP3OrderPoints; break;
+    case 4:  tpPts = TP4OrderPoints; break;
+    case 5:  tpPts = TP5OrderPoints; break;
+    default: tpPts = 0; break;
+  }
   if (tpPts <= 0) return;
 
   double tp = isBuy ? (firstEntry + (double)tpPts * pt)
@@ -1600,12 +1368,12 @@ void ManageManualPosition(const ulong tk) {
     }
   }
 
-  // Break-even + TP: ProcessBundleBreakEvenForSide() when first leg profit >= trigger.
+  // Exit handling: ProcessCountBasedTPForSide() (called from OnTick).
 }
 
-//--------------------------- Auto-trade (M5) -------------------------
-// BUY  (M5): close > EMA50 AND EMA50 > EMA200 AND Stoch %K crosses DOWN to <= AutoStochBuyLevel.
-// SELL (M5): close < EMA50 AND EMA50 < EMA200 AND Stoch %K crosses UP   to >= AutoStochSellLevel.
+//--------------------------- Auto-trade (AutoTF) -------------------------
+// BUY  (AutoTF): close > EMA50 AND EMA50 > EMA200 AND Stoch %K crosses DOWN to <= AutoStochBuyLevel.
+// SELL (AutoTF): close < EMA50 AND EMA50 < EMA200 AND Stoch %K crosses UP   to >= AutoStochSellLevel.
 // "Crosses" = prior closed bar was on the other side of the level → fires once per reach.
 bool ReadAutoSignals(bool &buySig, bool &sellSig) {
   buySig = false;
@@ -1625,7 +1393,7 @@ bool ReadAutoSignals(bool &buySig, bool &sellSig) {
   if (CopyBuffer(g_autoStochHandle, 0, 0, 3, kmain) < 3) return false; // buffer 0 = %K main
 
   // Evaluate on the last CLOSED bar (index 1); index 2 is the prior closed bar.
-  const double closeClosed = iClose(_Symbol, PERIOD_M5, 1);
+  const double closeClosed = iClose(_Symbol, AutoTF, 1);
   if (closeClosed <= 0.0) return false;
   const double emaClosed     = ema[1];
   const double emaSlowClosed = emaSlow[1];
@@ -1662,8 +1430,8 @@ bool OpenAutoEntry(const bool isBuy) {
 void ProcessAutoTrade() {
   if (!AutoTradeEnabled) return;
 
-  // Fire at most once per new M5 bar (signal is computed on closed-bar values).
-  const datetime curBar = iTime(_Symbol, PERIOD_M5, 0);
+  // Fire at most once per new AutoTF bar (signal is computed on closed-bar values).
+  const datetime curBar = iTime(_Symbol, AutoTF, 0);
   if (curBar == 0 || curBar == g_autoLastBar) return;
 
   bool buySig = false, sellSig = false;
@@ -1695,11 +1463,11 @@ int OnInit() {
   else
     trade.SetTypeFilling(ORDER_FILLING_RETURN);
 
-  // Auto-trade indicators on M5 (buffer 0 of Stochastic = %K main line).
+  // Auto-trade indicators on AutoTF (buffer 0 of Stochastic = %K main line).
   if (AutoTradeEnabled) {
-    g_autoEmaHandle = iMA(_Symbol, PERIOD_M5, AutoEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    g_autoEmaSlowHandle = iMA(_Symbol, PERIOD_M5, AutoEmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
-    g_autoStochHandle = iStochastic(_Symbol, PERIOD_M5, AutoStochKPeriod,
+    g_autoEmaHandle = iMA(_Symbol, AutoTF, AutoEmaPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    g_autoEmaSlowHandle = iMA(_Symbol, AutoTF, AutoEmaSlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+    g_autoStochHandle = iStochastic(_Symbol, AutoTF, AutoStochKPeriod,
                                     AutoStochDPeriod, AutoStochSlowing,
                                     MODE_SMA, STO_LOWHIGH);
     if (g_autoEmaHandle == INVALID_HANDLE || g_autoEmaSlowHandle == INVALID_HANDLE ||
