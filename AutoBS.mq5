@@ -9,10 +9,11 @@
 //| money are computed separately, never combined.                   |
 //|                                                                  |
 //| Start : you click BUY (or SELL) at exactly LotSize (0.01).       |
-//| Pause : you click the same side at StopSignalLot (0.02) ->       |
-//|         pendings are deleted and NO new orders are opened, but    |
-//|         open positions are kept and still managed. Close that     |
-//|         0.02 order to resume.                                     |
+//| Stop  : you click the same side at StopSignalLot (0.02). That is  |
+//|         a COMMAND, not a trade: the 0.02 order is closed at once,  |
+//|         the pending ladder is deleted, open positions are LEFT     |
+//|         ALONE (and no longer touched), and the EA stays off until  |
+//|         you click LotSize (0.01) again.                            |
 //| Other lots (0.05, 0.3, ...) are IGNORED — trade them by hand.    |
 //| Requires a HEDGING account.                                      |
 //+------------------------------------------------------------------+
@@ -28,7 +29,7 @@ enum ENUM_BS_DIR { BS_BUY = 0, BS_SELL = 1 };
 input ENUM_BS_DIR Direction      = BS_BUY;  // side this instance manages
 input long   MagicNumber         = 8801;    // MUST differ per instance (BUY 8801 / SELL 8802)
 input double LotSize             = 0.01;    // fixed lot, and the manual START signal lot
-input double StopSignalLot       = 0.02;    // manual PAUSE switch: while open -> no new orders, pendings deleted
+input double StopSignalLot       = 0.02;    // manual STOP command: closes itself, kills the ladder, latches the EA off
 input int    GridDistancePoints  = 1000;    // spacing between grid levels
 input int    PendingCount        = 3;       // pendings kept beyond the deepest fill
 input int    TPStartPoints       = 1000;    // TP when exactly 1 position is open
@@ -45,9 +46,30 @@ input bool   AutoStartForTest    = false;   // BACKTEST ONLY: start a cycle with
 //--------------------------- Globals -------------------------------
 CTrade trade;
 
-bool   g_active = false;   // true once a cycle is running
-bool   g_paused = false;   // true while a manual StopSignalLot order is open
-double g_anchor = 0.0;     // entry price of the cycle's FIRST position
+bool     g_active     = false; // true once a cycle is running
+bool     g_stopped    = false; // latched by the StopSignalLot command
+datetime g_stopTime   = 0;     // when the stop command was executed
+datetime g_cycleStart = 0;     // ONLY positions opened at/after this belong to the cycle
+double   g_anchor     = 0.0;   // entry price of the cycle's FIRST position
+
+// State survives recompile / terminal restart so abandoned positions are never
+// re-adopted by a later cycle.
+string GvKey(const string k) {
+  return "AutoBS_" + IntegerToString(MagicNumber) + "_" + k;
+}
+void SaveState() {
+  GlobalVariableSet(GvKey("cycleStart"), (double)g_cycleStart);
+  GlobalVariableSet(GvKey("stopTime"),   (double)g_stopTime);
+  GlobalVariableSet(GvKey("stopped"),    g_stopped ? 1.0 : 0.0);
+}
+void LoadState() {
+  if (GlobalVariableCheck(GvKey("cycleStart")))
+    g_cycleStart = (datetime)GlobalVariableGet(GvKey("cycleStart"));
+  if (GlobalVariableCheck(GvKey("stopTime")))
+    g_stopTime = (datetime)GlobalVariableGet(GvKey("stopTime"));
+  if (GlobalVariableCheck(GvKey("stopped")))
+    g_stopped = (GlobalVariableGet(GvKey("stopped")) > 0.5);
+}
 
 //--------------------------- Helpers -------------------------------
 double Pt() { return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
@@ -71,6 +93,10 @@ bool IsMyPosition(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return false;
   if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
   if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != MyPosType()) return false;
+  // Positions opened before the current cycle started are NOT ours - this is
+  // what keeps a stopped cycle's leftovers out of the next one.
+  if (g_cycleStart > 0 &&
+      (datetime)PositionGetInteger(POSITION_TIME) < g_cycleStart) return false;
   const long mg = (long)PositionGetInteger(POSITION_MAGIC);
   if (mg == MagicNumber) return true;
   if (mg == 0 && VolEq(PositionGetDouble(POSITION_VOLUME), LotSize)) return true;
@@ -126,14 +152,16 @@ double FirstEntryPrice() {
   return found ? best : 0.0;
 }
 
-// Manual position on this side whose volume equals `lot` (0 = none).
-ulong FindManualPositionWithLot(const double lot) {
+// Manual position on this side whose volume equals `lot`, opened at/after
+// `minTime` (0 = any time). Returns 0 when there is none.
+ulong FindManualPositionWithLot(const double lot, const datetime minTime) {
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     const ulong tk = PositionGetTicket(i);
     if (tk == 0 || !PositionSelectByTicket(tk)) continue;
     if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
     if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != MyPosType()) continue;
     if ((long)PositionGetInteger(POSITION_MAGIC) != 0) continue;
+    if (minTime > 0 && (datetime)PositionGetInteger(POSITION_TIME) < minTime) continue;
     if (VolEq(PositionGetDouble(POSITION_VOLUME), lot)) return tk;
   }
   return 0;
@@ -278,6 +306,9 @@ void CloseEverything() {
 bool OpenFirstPosition() {
   const double lots = NormalizeLots(LotSize);
   if (lots <= 0.0) return false;
+  // Stamp the new cycle BEFORE opening so older positions stay disowned.
+  g_cycleStart = TimeCurrent();
+  SaveState();
   trade.SetExpertMagicNumber(MagicNumber);
   trade.SetDeviationInPoints(SlippagePoints);
 
@@ -298,7 +329,7 @@ bool OpenFirstPosition() {
 void RestartCycle() {
   CloseEverything();
   g_anchor = 0.0;
-  if (g_paused) { g_active = false; return; }  // paused: bank the profit, open nothing
+  if (g_stopped) { g_active = false; return; }  // stopped: bank the profit, open nothing
   if (OpenFirstPosition()) MaintainGrid();
 }
 
@@ -410,8 +441,10 @@ int OnInit() {
     Print("[AutoBS] WARNING: LotSize equals StopSignalLot — the start and stop "
           "signals cannot be told apart.");
 
+  LoadState();
+
   // Re-adopt an in-progress cycle after a restart/recompile.
-  if (CountMyPositions() > 0) {
+  if (!g_stopped && CountMyPositions() > 0) {
     g_anchor = FirstEntryPrice();
     g_active = true;
     Print("[AutoBS] resumed existing cycle, anchor=", DoubleToString(g_anchor, Dg()));
@@ -424,37 +457,41 @@ void OnDeinit(const int reason) {}
 void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
 
-  // --- PAUSE switch: while a manual order at StopSignalLot is open, the EA
-  // stops opening anything new and removes the pending ladder, but it LEAVES
-  // the open positions alone and keeps managing their exits. Close that
-  // StopSignalLot order to resume normal operation.
-  const bool wasPaused = g_paused;
-  g_paused = (FindManualPositionWithLot(StopSignalLot) != 0);
+  // --- STOP command: a manual order at StopSignalLot is a COMMAND, not a trade.
+  // Close it at once, delete the pending ladder, leave open positions untouched,
+  // and latch the EA off until a NEW manual LotSize order arrives.
+  const ulong stopTk = FindManualPositionWithLot(StopSignalLot, 0);
+  if (stopTk != 0) {
+    trade.SetDeviationInPoints(SlippagePoints);
+    trade.SetExpertMagicNumber(0);
+    if (!trade.PositionClose(stopTk))
+      Print("[AutoBS] could not close the stop command order, ret=", trade.ResultRetcode());
 
-  if (g_paused) {
-    if (!wasPaused)
-      Print("[AutoBS] PAUSED by manual ", DoubleToString(StopSignalLot, 2),
-            " — pendings deleted, open positions kept.");
-    DeleteMyPendings();
-    if (g_active && CountMyPositions() > 0) {
-      if (g_anchor <= 0.0) g_anchor = FirstEntryPrice();
-      if (g_anchor > 0.0) ManageExits();   // still honour TP / basket rules
-    } else if (CountMyPositions() == 0) {
-      g_active = false;
-      g_anchor = 0.0;
-    }
-    return;                                 // never open anything while paused
+    DeleteMyPendings();          // remove the ladder
+    g_stopped    = true;
+    g_stopTime   = TimeCurrent();
+    g_cycleStart = g_stopTime;   // disown everything opened before now
+    g_active     = false;
+    g_anchor     = 0.0;
+    SaveState();
+    Print("[AutoBS] STOPPED by manual ", DoubleToString(StopSignalLot, 2),
+          " — pendings deleted, open positions left untouched. "
+          "Click ", DoubleToString(LotSize, 2), " to start again.");
+    return;
   }
-  if (wasPaused) Print("[AutoBS] RESUMED (stop order closed).");
 
-  // --- Idle: wait for a manual order at exactly LotSize to start a cycle.
+  // --- Idle / stopped: only a manual LotSize order opened AFTER the stop starts
+  // a new cycle. Positions left over from the stopped cycle are ignored.
   if (!g_active) {
-    const ulong startTk = FindManualPositionWithLot(LotSize);
+    const ulong startTk = FindManualPositionWithLot(LotSize, g_stopTime);
     if (startTk != 0 && PositionSelectByTicket(startTk)) {
-      g_anchor = PositionGetDouble(POSITION_PRICE_OPEN);
-      g_active = true;
+      g_cycleStart = (datetime)PositionGetInteger(POSITION_TIME);
+      g_anchor     = PositionGetDouble(POSITION_PRICE_OPEN);
+      g_active     = true;
+      g_stopped    = false;
+      SaveState();
       Print("[AutoBS] START signal detected, anchor=", DoubleToString(g_anchor, Dg()));
-    } else if (AutoStartForTest) {
+    } else if (AutoStartForTest && !g_stopped) {
       if (!OpenFirstPosition()) return;   // backtest: trigger ourselves
       g_active = true;
     } else {
@@ -481,7 +518,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result) {
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-  if (g_paused || !g_active || g_anchor <= 0.0) return;
+  if (g_stopped || !g_active || g_anchor <= 0.0) return;
   MaintainGrid();   // refill the ladder as soon as a level fills
 }
 //+------------------------------------------------------------------+
