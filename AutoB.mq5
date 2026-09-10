@@ -1,9 +1,10 @@
 //+------------------------------------------------------------------+
-//| AutoBS.mq5 - BUY and SELL together (Mode input selects the side) |
+//| AutoB.mq5 - BUY side only                                        |
 //| Engine: AutoBS_Core.mqh  (keep it in the same folder)            |
 //+------------------------------------------------------------------+
 #property strict
 #property version   "2.00"
-#property description "AutoBS - manual-triggered grid, BUY+SELL, per-side basket money exit."
+#property description "AutoB - manual-triggered grid, BUY only."
 
+#define BS_FIXED_MODE BS_BUY_ONLY
 #include "AutoBS_Core.mqh"
