@@ -36,6 +36,7 @@ input double BasketTPMoney       = 1000.0;  // money mode: close all at this pro
 input double BasketSLMoney       = 5000.0;  // close all + go idle at this loss ($)
 input int    MaxPendings         = 30;      // safety cap on pending orders
 input int    SlippagePoints      = 30;
+input bool   AutoStartForTest    = false;   // BACKTEST ONLY: start a cycle without the manual trigger
 
 #define MAX_LEVEL 300
 
@@ -435,11 +436,16 @@ void OnTick() {
   // --- Idle: wait for a manual order at exactly LotSize to start a cycle.
   if (!g_active) {
     const ulong startTk = FindManualPositionWithLot(LotSize);
-    if (startTk == 0) return;
-    if (!PositionSelectByTicket(startTk)) return;
-    g_anchor = PositionGetDouble(POSITION_PRICE_OPEN);
-    g_active = true;
-    Print("[AutoBS] START signal detected, anchor=", DoubleToString(g_anchor, Dg()));
+    if (startTk != 0 && PositionSelectByTicket(startTk)) {
+      g_anchor = PositionGetDouble(POSITION_PRICE_OPEN);
+      g_active = true;
+      Print("[AutoBS] START signal detected, anchor=", DoubleToString(g_anchor, Dg()));
+    } else if (AutoStartForTest) {
+      if (!OpenFirstPosition()) return;   // backtest: trigger ourselves
+      g_active = true;
+    } else {
+      return;                              // live: keep waiting for the manual click
+    }
   }
 
   // --- Side went flat: open the next cycle immediately.
