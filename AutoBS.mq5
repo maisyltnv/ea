@@ -9,8 +9,10 @@
 //| money are computed separately, never combined.                   |
 //|                                                                  |
 //| Start : you click BUY (or SELL) at exactly LotSize (0.01).       |
-//| Stop  : you click the same side at StopSignalLot (0.02) ->       |
-//|         everything closes immediately and the EA goes idle.      |
+//| Pause : you click the same side at StopSignalLot (0.02) ->       |
+//|         pendings are deleted and NO new orders are opened, but    |
+//|         open positions are kept and still managed. Close that     |
+//|         0.02 order to resume.                                     |
 //| Other lots (0.05, 0.3, ...) are IGNORED — trade them by hand.    |
 //| Requires a HEDGING account.                                      |
 //+------------------------------------------------------------------+
@@ -26,7 +28,7 @@ enum ENUM_BS_DIR { BS_BUY = 0, BS_SELL = 1 };
 input ENUM_BS_DIR Direction      = BS_BUY;  // side this instance manages
 input long   MagicNumber         = 8801;    // MUST differ per instance (BUY 8801 / SELL 8802)
 input double LotSize             = 0.01;    // fixed lot, and the manual START signal lot
-input double StopSignalLot       = 0.02;    // manual STOP signal lot
+input double StopSignalLot       = 0.02;    // manual PAUSE switch: while open -> no new orders, pendings deleted
 input int    GridDistancePoints  = 1000;    // spacing between grid levels
 input int    PendingCount        = 3;       // pendings kept beyond the deepest fill
 input int    TPStartPoints       = 1000;    // TP when exactly 1 position is open
@@ -44,6 +46,7 @@ input bool   AutoStartForTest    = false;   // BACKTEST ONLY: start a cycle with
 CTrade trade;
 
 bool   g_active = false;   // true once a cycle is running
+bool   g_paused = false;   // true while a manual StopSignalLot order is open
 double g_anchor = 0.0;     // entry price of the cycle's FIRST position
 
 //--------------------------- Helpers -------------------------------
@@ -295,6 +298,7 @@ bool OpenFirstPosition() {
 void RestartCycle() {
   CloseEverything();
   g_anchor = 0.0;
+  if (g_paused) { g_active = false; return; }  // paused: bank the profit, open nothing
   if (OpenFirstPosition()) MaintainGrid();
 }
 
@@ -420,18 +424,28 @@ void OnDeinit(const int reason) {}
 void OnTick() {
   if (!SymbolInfoInteger(_Symbol, SYMBOL_SELECT)) SymbolSelect(_Symbol, true);
 
-  // --- STOP signal: a manual order at StopSignalLot closes everything, always.
-  const ulong stopTk = FindManualPositionWithLot(StopSignalLot);
-  if (stopTk != 0) {
-    Print("[AutoBS] STOP signal detected (manual ", DoubleToString(StopSignalLot, 2), ")");
-    CloseEverything();
-    trade.SetDeviationInPoints(SlippagePoints);
-    trade.SetExpertMagicNumber(0);
-    trade.PositionClose(stopTk);   // close the signal order itself
-    g_active = false;
-    g_anchor = 0.0;
-    return;
+  // --- PAUSE switch: while a manual order at StopSignalLot is open, the EA
+  // stops opening anything new and removes the pending ladder, but it LEAVES
+  // the open positions alone and keeps managing their exits. Close that
+  // StopSignalLot order to resume normal operation.
+  const bool wasPaused = g_paused;
+  g_paused = (FindManualPositionWithLot(StopSignalLot) != 0);
+
+  if (g_paused) {
+    if (!wasPaused)
+      Print("[AutoBS] PAUSED by manual ", DoubleToString(StopSignalLot, 2),
+            " — pendings deleted, open positions kept.");
+    DeleteMyPendings();
+    if (g_active && CountMyPositions() > 0) {
+      if (g_anchor <= 0.0) g_anchor = FirstEntryPrice();
+      if (g_anchor > 0.0) ManageExits();   // still honour TP / basket rules
+    } else if (CountMyPositions() == 0) {
+      g_active = false;
+      g_anchor = 0.0;
+    }
+    return;                                 // never open anything while paused
   }
+  if (wasPaused) Print("[AutoBS] RESUMED (stop order closed).");
 
   // --- Idle: wait for a manual order at exactly LotSize to start a cycle.
   if (!g_active) {
@@ -467,7 +481,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result) {
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-  if (!g_active || g_anchor <= 0.0) return;
+  if (g_paused || !g_active || g_anchor <= 0.0) return;
   MaintainGrid();   // refill the ladder as soon as a level fills
 }
 //+------------------------------------------------------------------+
