@@ -75,6 +75,20 @@ struct EntrySnap
 
 EntrySnap g_snaps[];
 
+// Connection state.
+//
+// The EA stays on the chart whether or not the journal is reachable, and shows
+// what it is doing in the chart comment. The first version returned
+// INIT_FAILED when the opening handshake did not succeed, which makes
+// MetaTrader REMOVE the expert from the chart -- so a single network hiccup at
+// startup, or a terminal that had not finished connecting yet, looked exactly
+// like "I dragged it on and it vanished", with the reason buried in a log
+// nobody had opened yet. A journal must not delete itself because the wifi
+// blinked.
+bool   g_ready      = false;   // the handshake has succeeded at least once
+string g_status     = "starting";
+int    g_fails      = 0;
+
 // One set of indicator handles per symbol, created on first use and kept for
 // the life of the EA. Declared here rather than beside HandlesFor() because a
 // global has to precede the first function that reads it.
@@ -91,59 +105,101 @@ bool      g_warned_webreq = false;
 datetime  g_last_push     = 0;
 
 //+------------------------------------------------------------------+
+// Shows the EA's own state in the top-left of the chart, so the trader can see
+// at a glance whether the journal is receiving. Reading a log to find out
+// whether a background process is alive is a thing people do once.
+void Status(const string state)
+{
+   g_status = state;
+   Comment(StringFormat("Trading Journal %s\n%s\naccount %I64d   last deal #%I64d",
+                        EA_VERSION, state,
+                        AccountInfoInteger(ACCOUNT_LOGIN), g_last_ticket));
+}
+
 int OnInit()
 {
+   ArrayResize(g_snaps, 0);
+
+   // The two things that are genuinely unrecoverable without the trader
+   // editing the inputs. Even these keep the EA on the chart, so the message
+   // sits in front of them in the chart comment instead of in a log.
    if(StringLen(ApiKey) < 8)
    {
       Print("TradingJournal: no ApiKey set. Create an ingest key in the app and ",
             "paste it into the EA's inputs.");
-      return(INIT_FAILED);
+      Status("NOT RUNNING - no ingest key set in the EA inputs");
+      return(INIT_SUCCEEDED);
    }
    if(StringFind(ApiUrl, "http") != 0)
    {
       Print("TradingJournal: ApiUrl must start with http:// or https://");
-      return(INIT_FAILED);
+      Status("NOT RUNNING - ApiUrl must start with https://");
+      return(INIT_SUCCEEDED);
    }
 
-   ArrayResize(g_snaps, 0);
+   EventSetTimer(MathMax(10, PushSeconds));
+   Status("connecting...");
 
-   // Say hello before sending anything. A wrong key or a URL that was never
-   // allowed in Tools > Options then shows up as one clear line in the Experts
-   // log, instead of as a push that silently fails every minute.
+   // Try the handshake now, but treat a failure as something to retry on the
+   // timer rather than as a reason to leave the chart. A terminal that is
+   // still authorising, a VPN coming up, a broker reconnect -- all of these
+   // resolve themselves within a minute.
+   if(!Hello())
+   {
+      Print("TradingJournal: could not reach ", ApiUrl, " yet - will keep trying ",
+            "every ", MathMax(10, PushSeconds), "s. If this never clears, add ",
+            ApiUrl, " under Tools > Options > Experts > Allow WebRequest for listed URL.");
+      return(INIT_SUCCEEDED);
+   }
+
+   // Connected. Send straight away rather than after a minute, so a trader who
+   // has just installed this sees something immediately.
+   Push(SendHistory && !g_backfilled);
+   return(INIT_SUCCEEDED);
+}
+
+// Hello performs the opening handshake. Returns true once the journal has
+// answered; sets the chart status either way.
+bool Hello()
+{
    string resp;
    int code = Post("/api/v1/ingest/hello", "{}", resp);
+
    if(code == 401)
    {
       Print("TradingJournal: that ingest key was refused. Create a new one in the app.");
-      return(INIT_FAILED);
+      Status("NOT RUNNING - the ingest key was refused (401)");
+      return(false);
    }
    if(code <= 0)
    {
-      Print("TradingJournal: could not reach ", ApiUrl, ". Add it under ",
-            "Tools > Options > Expert Advisors > Allow WebRequest for listed URL.");
-      return(INIT_FAILED);
+      g_fails++;
+      Status(StringFormat("cannot reach the journal (%d attempt%s) - check Tools > Options > Experts",
+                          g_fails, g_fails == 1 ? "" : "s"));
+      return(false);
    }
    if(code >= 300)
    {
-      Print("TradingJournal: the journal answered ", code, ": ", resp);
-      return(INIT_FAILED);
+      g_fails++;
+      Print("TradingJournal: the journal answered ", code, ": ", StringSubstr(resp, 0, 200));
+      Status(StringFormat("the journal answered %d", code));
+      return(false);
    }
 
    g_last_ticket = (long)JsonNumber(resp, "lastTicket");
+   g_ready = true;
+   g_fails = 0;
    PrintFormat("TradingJournal %s connected. The journal holds deals up to ticket %I64d.",
                EA_VERSION, g_last_ticket);
-
-   EventSetTimer(MathMax(10, PushSeconds));
-   // The first push happens straight away rather than after a minute, so a
-   // trader who has just installed this sees something immediately.
-   Push(SendHistory && !g_backfilled);
-   return(INIT_SUCCEEDED);
+   Status("connected");
+   return(true);
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
    ReleaseHandles();
+   Comment("");
    // One last push on the way out: a terminal being closed for the night
    // should not lose the last minute of a basket that is still open.
    if(reason != REASON_INITFAILED)
@@ -152,6 +208,12 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
+   // Not connected yet: retry the handshake instead of pushing into the void.
+   if(!g_ready)
+   {
+      if(!Hello())
+         return;
+   }
    Push(SendHistory && !g_backfilled);
 }
 
@@ -378,6 +440,8 @@ void Push(const bool backfill)
    }
    if(code <= 0)
    {
+      g_ready = false;   // re-handshake on the next tick rather than pushing blind
+      Status("lost contact with the journal - retrying");
       Print("TradingJournal: push failed to reach ", ApiUrl,
             " (is it still allowed under Tools > Options?)");
       return;
@@ -411,6 +475,8 @@ void Push(const bool backfill)
                   (int)JsonNumber(resp, "alerts"));
    }
    g_last_push = TimeCurrent();
+   g_ready = true;
+   Status(StringFormat("connected - last sent %s", TimeToString(TimeCurrent(), TIME_MINUTES)));
    PruneSnaps();
 }
 
