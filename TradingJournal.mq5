@@ -40,7 +40,7 @@
 #property description "Sends this account's deals, open positions and account"
 #property description "state to your Trading Journal workspace. Places no orders."
 
-input string   ApiUrl        = "https://journal.lsys.online"; // Journal address
+input string   ApiUrl        = "https://tradingjournal.lsys.online"; // Journal address
 input string   ApiKey        = "";                            // Ingest key (tjk_...)
 input int      PushSeconds   = 60;                            // Seconds between pushes
 input bool     SendHistory   = true;                          // Backfill history on first run
