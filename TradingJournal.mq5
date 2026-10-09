@@ -47,13 +47,13 @@ input bool     SendHistory   = true;                          // Backfill histor
 input int      HistoryDays   = 365;                           // How far back to backfill
 input ENUM_TIMEFRAMES SnapTimeframe = PERIOD_M15;             // Timeframe for entry snapshots
 input int      AdxPeriod     = 14;                            // ADX period
-input int      StochK        = 5;                             // Stochastic %K
+input int      StochK        = 9;                             // Stochastic %K
 input int      StochD        = 3;                             // Stochastic %D
 input int      StochSlow     = 3;                             // Stochastic slowing
 input int      RsiPeriod     = 14;                            // RSI period
 input int      AtrPeriod     = 14;                            // ATR period
-input int      MaFast        = 20;                            // Fast MA period
-input int      MaSlow        = 50;                            // Slow MA period
+input int      MaFast        = 50;                            // Fast MA period
+input int      MaSlow        = 200;                            // Slow MA period
 input bool     Verbose       = false;                         // Log every push
 
 #define EA_VERSION "1.00"
@@ -200,10 +200,18 @@ void OnDeinit(const int reason)
    EventKillTimer();
    ReleaseHandles();
    Comment("");
-   // One last push on the way out: a terminal being closed for the night
-   // should not lose the last minute of a basket that is still open.
-   if(reason != REASON_INITFAILED)
-      Push(false);
+   // NO network call here, deliberately.
+   //
+   // The first version made a last push on the way out, so that a terminal
+   // closed for the night did not lose the final minute of an open basket.
+   // But MetaTrader allows an expert only a short moment to unload, and
+   // WebRequest blocks for up to its full timeout -- so removing the EA, or
+   // closing the terminal while the link was slow, hung the unload until the
+   // terminal killed it. That is what "Abnormal termination" in the log means.
+   //
+   // Nothing is actually lost: deals are keyed on the broker's own ticket and
+   // the EA re-sends a window on every start, so the next session carries
+   // whatever this one did not.
 }
 
 void OnTimer()
