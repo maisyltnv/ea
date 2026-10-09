@@ -838,27 +838,48 @@ int Post(const string path, const string body, string &response)
                     "X-TJ-Key: " + ApiKey + "\r\n";
    string result_headers;
 
-   StringToCharArray(body, data, 0, StringLen(body), CP_UTF8);
-   // StringToCharArray appends a terminating zero, which would be sent as part
-   // of the body and make the JSON invalid.
-   int len = ArraySize(data) - 1;
-   if(len < 0) len = 0;
-   ArrayResize(data, len);
+   // Build the body as UTF-8 bytes.
+   //
+   // count = -1 copies the WHOLE string INCLUDING its terminating zero and
+   // returns how many elements it wrote, so dropping exactly one leaves the
+   // bytes to send. The previous version passed count = StringLen(body), which
+   // does NOT append a terminating zero -- and then subtracted one anyway,
+   // chopping a real byte off every request. A two-byte body of {} went out as
+   // { and the server never saw valid JSON. It also used StringLen, which
+   // counts CHARACTERS: any non-ASCII in a broker comment would have truncated
+   // the body further.
+   int n = StringToCharArray(body, data, 0, -1, CP_UTF8);
+   ArrayResize(data, n > 0 ? n - 1 : 0);
 
    ResetLastError();
    int code = WebRequest("POST", url, headers, 30000, data, result, result_headers);
+   int err  = GetLastError();
+
    if(code == -1)
    {
       if(!g_warned_webreq)
       {
          PrintFormat("TradingJournal: WebRequest refused (error %d). Add %s under "
-                     "Tools > Options > Expert Advisors > Allow WebRequest for listed URL.",
-                     GetLastError(), ApiUrl);
+                     "Tools > Options > Experts > Allow WebRequest for listed URL.",
+                     err, ApiUrl);
          g_warned_webreq = true;
       }
       response = "";
       return(-1);
    }
+
    response = CharArrayToString(result, 0, ArraySize(result), CP_UTF8);
+
+   // Anything that is not a normal HTTP answer gets reported in full, once.
+   // MetaTrader does not always return an HTTP status here: under Wine it can
+   // surface an internal code with an empty body, and without the error number
+   // and the response headers there is nothing to diagnose from.
+   if(code < 100 || code > 599)
+   {
+      PrintFormat("TradingJournal: WebRequest returned %d (not an HTTP status), "
+                  "GetLastError=%d, %d body bytes, headers: [%s]",
+                  code, err, ArraySize(result),
+                  StringSubstr(result_headers, 0, 300));
+   }
    return(code);
 }
