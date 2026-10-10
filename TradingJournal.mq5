@@ -36,7 +36,7 @@
 //  Trading is never affected: this EA places no orders and holds no locks.
 //
 #property copyright "Trading Journal"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Sends this account's deals, open positions and account"
 #property description "state to your Trading Journal workspace. Places no orders."
 
@@ -55,8 +55,11 @@ input int      AtrPeriod     = 14;                            // ATR period
 input int      MaFast        = 50;                            // Fast MA period
 input int      MaSlow        = 200;                            // Slow MA period
 input bool     Verbose       = false;                         // Log every push
+input bool     ScanMarketWatch = true;                        // Scan Market Watch for unusual volume
+input int      ScanSeconds   = 300;                           // Seconds between scans (min 60)
+input int      ScanMax       = 40;                            // Most symbols in one scan
 
-#define EA_VERSION "1.00"
+#define EA_VERSION "1.10"
 
 // Entry snapshots waiting to be sent, keyed by position ticket.
 //
@@ -103,6 +106,15 @@ long      g_last_ticket   = 0;     // highest deal ticket the journal already ho
 bool      g_backfilled    = false;
 bool      g_warned_webreq = false;
 datetime  g_last_push     = 0;
+
+// The volume scanner (docs/scanner-design.md). Its own schedule, its own
+// endpoint, its own error state: nothing here may touch g_ready or the sync.
+#define SCAN_WINDOW 4     // completed M15 bars in the window = the last hour
+#define SCAN_DAYS   28    // calendar days searched for the baseline
+#define SCAN_KEEP   20    // baseline days sent (the most recent ones)
+#define SCAN_BARS   3000  // M15 bars read per symbol: comfortably > 28 days
+datetime  g_last_scan     = 0;
+int       g_scan_last_err = 0;
 
 //+------------------------------------------------------------------+
 // Shows the EA's own state in the top-left of the chart, so the trader can see
@@ -223,6 +235,13 @@ void OnTimer()
          return;
    }
    Push(SendHistory && !g_backfilled);
+
+   // After the sync, never instead of it, and only while the journal is
+   // reachable. TimeLocal, not TimeCurrent: the broker's clock stands still
+   // when the market is closed, and the schedule should not.
+   if(ScanMarketWatch && g_ready &&
+      TimeLocal() - g_last_scan >= MathMax(60, ScanSeconds))
+      Scan();
 }
 
 //+------------------------------------------------------------------+
@@ -348,6 +367,174 @@ double ReadOne(const int handle, const int buffer)
          return(v[0]);
       Sleep(50);
    }
+   return(EMPTY_VALUE);
+}
+
+//+------------------------------------------------------------------+
+//| Volume scanner.                                                  |
+//|                                                                  |
+//| Sends RAW numbers for every symbol in Market Watch; the journal  |
+//| computes relative volume. MQL5 has no test harness and the       |
+//| server does, and a formula fix there needs no recompile here.    |
+//|                                                                  |
+//| Never waits: a handle that has not calculated yet is simply      |
+//| omitted this round, and a symbol whose history is still          |
+//| downloading is sent as "loading". Forty symbols each waiting     |
+//| half a second would freeze the timer for minutes.                |
+//+------------------------------------------------------------------+
+void Scan()
+{
+   g_last_scan = TimeLocal();
+
+   int total = SymbolsTotal(true);
+   int limit = MathMax(1, ScanMax);
+   string items = "";
+   int sent = 0;
+   int i = 0;
+   for(; i < total && sent < limit; i++)
+   {
+      string sym = SymbolName(i, true);
+      if(sym == "")
+         continue;
+      if(SymbolInfoInteger(sym, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+         continue;
+      if(sent > 0)
+         items += ",";
+      items += ScanSymbol(sym);
+      sent++;
+   }
+   bool capped = (i < total);
+
+   string body = "{";
+   body += "\"t\":" + IntegerToString((long)TimeGMT()) + ",";
+   body += "\"st\":" + IntegerToString((long)TimeCurrent()) + ",";
+   body += "\"ea\":\"" + EA_VERSION + "\",";
+   body += "\"tf\":\"M15\",";
+   body += "\"capped\":" + (capped ? "true" : "false") + ",";
+   body += "\"symbols\":[" + items + "]";
+   body += "}";
+
+   string resp;
+   int code = Post("/api/v1/ingest/scan", body, resp);
+   if(code >= 200 && code < 300)
+   {
+      g_scan_last_err = 0;
+      if(Verbose)
+         PrintFormat("TradingJournal: scanned %d symbols%s", sent, capped ? " (capped)" : "");
+      return;
+   }
+   // Each kind of failure is reported once, not every five minutes.
+   if(code == g_scan_last_err)
+      return;
+   g_scan_last_err = code;
+   if(code == 404)
+      Print("TradingJournal: this journal has no volume scanner yet. Trades are still being sent.");
+   else if(code == 429)
+   {
+      if(Verbose) Print("TradingJournal: scanner asked to slow down.");
+   }
+   else if(code > 0)
+      PrintFormat("TradingJournal: scan refused (%d): %s -- trades are still being sent.",
+                  code, StringSubstr(resp, 0, 200));
+   // code <= 0: Post() has already said why, and the sync reconnects.
+}
+
+// One symbol: the last hour of COMPLETED M15 bars, and the same clock window
+// on each earlier day, by the broker's clock.
+string ScanSymbol(const string sym)
+{
+   string out = "{\"s\":" + JsonStr(sym);
+
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   int n = CopyRates(sym, PERIOD_M15, 0, SCAN_BARS, r);
+   if(n < SCAN_WINDOW + 2)
+      return(out + ",\"loading\":true}");   // history still downloading
+
+   // r[0] is the bar still forming and always reads low; r[1] is the newest
+   // completed one. The window is anchored by CLOCK, not by bar count, so a
+   // weekend gap inside four bars cannot stretch it across two days.
+   datetime last  = r[1].time;
+   datetime start = last - (SCAN_WINDOW - 1) * 900;
+   bool     useReal = (r[1].real_volume > 0);
+
+   long window = 0;
+   for(int j = 1; j < n && r[j].time >= start; j++)
+      window += useReal ? r[j].real_volume : r[j].tick_volume;
+
+   // A bar belongs to day d when it falls in [start - d days, start - d days
+   // + one hour). The series runs newest first, so d only grows with j.
+   long day_sum[SCAN_DAYS + 1];
+   ArrayInitialize(day_sum, 0);
+   long span = SCAN_WINDOW * 900;
+   for(int j = 1; j < n; j++)
+   {
+      long x = (long)(start - r[j].time);
+      if(x <= 0)
+         continue;
+      long d = (x + 86399) / 86400;
+      if(d > SCAN_DAYS)
+         break;
+      if(d * 86400 - x < span)
+         day_sum[d] += useReal ? r[j].real_volume : r[j].tick_volume;
+   }
+   // Days with nothing are a closed market, not a quiet one: left out.
+   string base = "";
+   int kept = 0;
+   for(int d = 1; d <= SCAN_DAYS && kept < SCAN_KEEP; d++)
+   {
+      if(day_sum[d] <= 0)
+         continue;
+      if(kept > 0)
+         base += ",";
+      base += IntegerToString(day_sum[d]);
+      kept++;
+   }
+
+   double c1h = EMPTY_VALUE, c1d = EMPTY_VALUE;
+   for(int j = 1; j < n; j++)
+   {
+      if(c1h == EMPTY_VALUE && r[j].time < start)
+         c1h = r[j].close;                       // the price an hour ago
+      if(r[j].time <= last - 86400)
+      {
+         c1d = r[j].close;                       // and a day ago
+         break;
+      }
+   }
+
+   out += ",\"vk\":\"" + (useReal ? "real" : "tick") + "\"";
+   out += ",\"w\":" + IntegerToString(window);
+   out += ",\"base\":[" + base + "]";
+   out += ",\"bt\":" + IntegerToString((long)last);
+   out += Opt("c", r[1].close);
+   out += Opt("c1h", c1h);
+   out += Opt("c1d", c1d);
+
+   int h = HandlesFor(sym);
+   if(h >= 0)
+   {
+      out += Opt("adx", ReadDone(g_handles[h].adx, 0));
+      out += Opt("k",   ReadDone(g_handles[h].stoch, 0));
+      out += Opt("maf", ReadDone(g_handles[h].ma_fast, 0));
+      out += Opt("mas", ReadDone(g_handles[h].ma_slow, 0));
+   }
+   out += Opt("spr", (double)SymbolInfoInteger(sym, SYMBOL_SPREAD));
+   out += ",\"dg\":" + IntegerToString(SymbolInfoInteger(sym, SYMBOL_DIGITS));
+   out += "}";
+   return(out);
+}
+
+// The value on the last COMPLETED bar, without waiting. EMPTY_VALUE (and so
+// omitted from the JSON) when the handle has not calculated yet.
+double ReadDone(const int handle, const int buffer)
+{
+   if(handle == INVALID_HANDLE || BarsCalculated(handle) <= 0)
+      return(EMPTY_VALUE);
+   double v[];
+   if(CopyBuffer(handle, buffer, 1, 1, v) == 1 &&
+      v[0] != EMPTY_VALUE && MathIsValidNumber(v[0]))
+      return(v[0]);
    return(EMPTY_VALUE);
 }
 
