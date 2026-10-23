@@ -4,13 +4,14 @@
 //|                                                                  |
 //| Manager: swing SL (+grid pendings, increaseLot), count-based TP  |
 //|   per side (1..5 legs = TP1..TP5OrderPoints; >=6 = TPMoney close),|
-//|   per-side USD stop, MaxLotPerLeg, SL protection.              |
+//|   per-side USD stop, MaxLotPerLeg, SL protection,                |
+//|   MinAddDistancePoints (manual add while losing needs >= N pts). |
 //| AUTO (AutoTF): BUY EMA50>EMA200 & close>EMA50 & %K<=BuyLevel;     |
 //|   SELL mirror. Max AutoMaxSameDirection in a row. Opens magic 0.  |
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.00"
+#property version   "2.10"
 #property description "MGridBSAuto - auto grid, swing SL, 6-tier shared TP, per-side USD stop."
 
 #include <Trade/Trade.mqh>
@@ -39,6 +40,7 @@ input int    GridExtraPendingLegs     = 20;     // MAX number of BuyLimit/SellLi
 input int    GridDistancePoints       = 1000;   // fixed spacing between legs (points). 0 = spread evenly between entry and SL
 input double increaseLot              = 0.01;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.3;    // max lot per leg; open 0.2 → partial close to 0.1 (0=off)
+input int    MinAddDistancePoints     = 4000;   // manual add while side is losing: first entry→price must be >= this, else close it back (0=off)
 input double TotalUSDSL               = 12000.0;  // basket max loss ($): close ALL bundle legs if sum(P/L+swap)<=-this (0=off)
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
 
@@ -94,6 +96,7 @@ struct TicketState {
   double protectBoundSL;
   double lastEaWrittenSL;
   bool userTouchedSL;
+  bool addChecked;   // MinAddDistancePoints already evaluated for this ticket
 };
 
 TicketState g_states[200];
@@ -146,6 +149,7 @@ int EnsureState(const ulong ticket) {
   g_states[g_statesCount].protectBoundSL = 0.0;
   g_states[g_statesCount].lastEaWrittenSL = 0.0;
   g_states[g_statesCount].userTouchedSL = false;
+  g_states[g_statesCount].addChecked = false;
   g_statesCount++;
   return g_statesCount - 1;
 }
@@ -454,6 +458,62 @@ ulong OldestBundleLegTicket(const ENUM_POSITION_TYPE side) {
     }
   }
   return oldestTk;
+}
+
+// Was this position opened by a pending order (limit/stop) rather than a market click?
+bool OpenedByPendingOrder(const ulong posId) {
+  if (posId == 0 || !HistorySelectByPosition((long)posId)) return false;
+  const int n = HistoryOrdersTotal();
+  for (int i = 0; i < n; i++) {
+    const ulong ot = HistoryOrderGetTicket(i);
+    if (ot == 0) continue;
+    if ((ulong)HistoryOrderGetInteger(ot, ORDER_POSITION_ID) != posId) continue;
+    const ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)HistoryOrderGetInteger(ot, ORDER_TYPE);
+    return (typ != ORDER_TYPE_BUY && typ != ORDER_TYPE_SELL);
+  }
+  return false;
+}
+
+// MinAddDistancePoints: a manual market click added while the side is LOSING is
+// allowed only when oldest entry→price >= MinAddDistancePoints; otherwise close
+// it back immediately. Side in profit → always allowed. AUTO, grid fills and
+// your own pendings are not checked. Returns true if the position was closed.
+bool CheckMinAddDistance(const ulong tk) {
+  if (MinAddDistancePoints <= 0 || tk == 0) return false;
+  if (!PositionSelectByTicket(tk)) return false;
+  if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+  if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) return false; // grid fill
+  if (StringFind(PositionGetString(POSITION_COMMENT), "AUTO") == 0) return false;
+  if (OpenedByPendingOrder((ulong)PositionGetInteger(POSITION_IDENTIFIER))) return false;
+  if (!PositionSelectByTicket(tk)) return false;
+
+  const ENUM_POSITION_TYPE side = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+  const datetime myTime = (datetime)PositionGetInteger(POSITION_TIME);
+  const ulong firstTk = OldestBundleLegTicket(side);
+  if (firstTk == 0 || firstTk == tk || !PositionSelectByTicket(firstTk)) return false; // first leg of side
+  if ((datetime)PositionGetInteger(POSITION_TIME) > myTime) return false;
+  const double firstEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+
+  const double pt = Pt();
+  if (pt <= 0.0) return false;
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  const double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                             : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  const double lossPts = isBuy ? (firstEntry - price) / pt : (price - firstEntry) / pt;
+  if (lossPts <= 0.0) return false;                          // side in profit → allowed
+  if (lossPts >= (double)MinAddDistancePoints) return false; // far enough → allowed
+
+  trade.SetDeviationInPoints(SlippagePoints);
+  SetTradeMagicForPositionTicket(tk);
+  if (!trade.PositionClose(tk)) {
+    Print("[MGridBSAuto] MinAddDistance: close failed tk=", tk, " ret=", trade.ResultRetcode());
+    return false;
+  }
+  const string msg = StringFormat("%s add blocked: first entry→price only %d pts < %d",
+                                  (isBuy ? "BUY" : "SELL"), (int)lossPts, MinAddDistancePoints);
+  Print("[MGridBSAuto] ", msg, " tk=", tk);
+  Alert("[MGridBSAuto] ", msg);
+  return true;
 }
 
 void SetTradeMagicForPositionTicket(const ulong tk) {
@@ -1274,6 +1334,15 @@ void ManageManualPosition(const ulong tk) {
   if (pt <= 0.0) return;
   const int digits = DigitsCount();
 
+  // Fallback over-trading guard if OnTradeTransaction was missed (fresh ticket only).
+  if (!g_states[st].addChecked) {
+    g_states[st].addChecked = true;
+    if (TimeCurrent() - (datetime)PositionGetInteger(POSITION_TIME) <= 5 &&
+        CheckMinAddDistance(tk))
+      return;
+    if (!PositionSelectByTicket(tk)) return;
+  }
+
   trade.SetExpertMagicNumber(MagicNumber); // for modifications only
   trade.SetDeviationInPoints(SlippagePoints);
 
@@ -1468,13 +1537,17 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   int pi = 0;
   ulong tk = 0;
 
-  if (MaxLotPerLeg > 0.0 && posId > 0) {
+  if (posId > 0) {
     for (pi = PositionsTotal() - 1; pi >= 0; pi--) {
       tk = PositionGetTicket(pi);
       if (tk == 0 || !PositionSelectByTicket(tk)) continue;
       if ((ulong)PositionGetInteger(POSITION_IDENTIFIER) != posId) continue;
       if (!IsBundlePositionLeg(tk)) return;
-      ReducePositionVolumeToMaxLot(tk);
+      // Over-trading guard first: a blocked manual add is closed, nothing else to do.
+      const int st = EnsureState(tk);
+      if (st >= 0) g_states[st].addChecked = true;
+      if (CheckMinAddDistance(tk)) return;
+      if (MaxLotPerLeg > 0.0) ReducePositionVolumeToMaxLot(tk);
       return;
     }
   }

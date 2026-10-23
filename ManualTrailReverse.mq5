@@ -1,6 +1,7 @@
 //+------------------------------------------------------------------+
-//| TrailReverse.mq5                                                 |
-//| ໄມ້ດຽວ + stop ກົງກັນຂ້າມທີ່ trail ຕາມລາຄາ; stop ຕິດ = reverse        |
+//| ManualTrailReverse.mq5                                           |
+//| ເຈົ້າກົດ BUY/SELL ເອງ → EA ຮັບໄມ້ນັ້ນ ວາງ stop ກົງກັນຂ້າມ trail ຕາມລາຄາ;   |
+//| stop ຕິດ = reverse ຕໍ່ໄປອັດຕະໂນມັດ. ບໍ່ມີໄມ້ → ລໍຖ້າກົດ.                |
 //+------------------------------------------------------------------+
 #property copyright "maisyltnv"
 #property version   "1.00"
@@ -10,21 +11,22 @@
 
 enum TR_SIDE { TR_BUY = 0, TR_SELL = 1 };
 
-input TR_SIDE FirstSide             = TR_BUY;  // ໄມ້ທຳອິດ
-input double  LotSize               = 0.01;    // lot ເລີ່ມຕົ້ນ
-input double  IncreaseLot           = 0.0;     // ເພີ່ມ lot ທຸກຄັ້ງທີ່ reverse (0 = ຄົງທີ່)
+input double  IncreaseLot           = 0.0;     // ເພີ່ມ lot ທຸກຄັ້ງທີ່ reverse (0 = ຄົງທີ່ = lot ທີ່ກົດ)
 input int     ReverseDistancePoints = 200;     // ຫ່າງ stop reverse ຈາກລາຄາ (ຈຸດ)
 input int     TrailStepPoints       = 10;      // ຍ້າຍ stop ເມື່ອຕ່າງ >= ຈຸດນີ້
 input double  DailyProfitTargetUSD  = 50;      // ກຳໄລຕໍ່ມື້ → ປິດໝົດ ຢຸດຮອດມື້ໃໝ່ (0 = ປິດ)
 input double  DailyLossLimitUSD     = 200;     // ຂາດທຶນຕໍ່ມື້ → ປິດໝົດ ຢຸດຮອດມື້ໃໝ່ (0 = ປິດ)
-input long    MagicNumber           = 7701;
+input long    MagicNumber           = 7702;    // magic ຂອງໄມ້ reverse (ໄມ້ທີ່ກົດເປັນ magic 0)
 input int     SlippagePoints        = 30;
 
 CTrade   trade;
-double   g_point   = 0.0;
-int      g_digits  = 0;
-datetime g_stopDay = 0;        // ມື້ທີ່ຢຸດແລ້ວ (0 = ຍັງເທຣດ)
-string   g_gvStopDay;
+double   g_point     = 0.0;
+int      g_digits    = 0;
+datetime g_stopDay   = 0;      // ມື້ທີ່ຢຸດແລ້ວ (0 = ຍັງເທຣດ)
+ulong    g_chain     = 0;      // ticket ໄມ້ magic-0 ທີ່ຮັບມາ (0 = ບໍ່ມີ)
+datetime g_waitSince = 0;      // ຮັບສະເພາະໄມ້ທີ່ກົດຫຼັງເວລານີ້
+ulong    g_adopted[];          // position id ທີ່ຮັບມາ (ສຳລັບຄິດກຳໄລມື້ນີ້)
+string   g_gvStopDay, g_gvChain;
 
 //+------------------------------------------------------------------+
 double Norm(const double p) { return NormalizeDouble(p, g_digits); }
@@ -48,7 +50,22 @@ int ReverseDist()
 
 datetime DayStart() { return iTime(_Symbol, PERIOD_D1, 0); }
 
+bool IsAdoptedId(const ulong posId)
+{
+   for (int i = 0; i < ArraySize(g_adopted); i++) if (g_adopted[i] == posId) return true;
+   return false;
+}
+
+void RememberAdopted(const ulong posId)
+{
+   if (IsAdoptedId(posId)) return;
+   const int n = ArraySize(g_adopted);
+   ArrayResize(g_adopted, n + 1);
+   g_adopted[n] = posId;
+}
+
 //+------------------------------------------------------------------+
+// ໄມ້ຂອງ chain = magic ຂອງ EA ຫຼື ໄມ້ magic-0 ທີ່ຮັບມາ (g_chain)
 int MyPositions(ulong &tickets[])
 {
    ArrayResize(tickets, 0);
@@ -57,12 +74,31 @@ int MyPositions(ulong &tickets[])
       const ulong tk = PositionGetTicket(i);
       if (tk == 0 || !PositionSelectByTicket(tk)) continue;
       if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if (PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      const bool mine = (PositionGetInteger(POSITION_MAGIC) == MagicNumber) || (tk == g_chain);
+      if (!mine) continue;
       const int n = ArraySize(tickets);
       ArrayResize(tickets, n + 1);
       tickets[n] = tk;
    }
    return ArraySize(tickets);
+}
+
+// ໄມ້ magic-0 ໃໝ່ສຸດທີ່ກົດຫຼັງ g_waitSince (0 = ບໍ່ມີ)
+ulong FindManualClick()
+{
+   ulong    best  = 0;
+   datetime tBest = 0;
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      const ulong tk = PositionGetTicket(i);
+      if (tk == 0 || !PositionSelectByTicket(tk)) continue;
+      if (PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if (PositionGetInteger(POSITION_MAGIC) != 0) continue;
+      const datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      if (t < g_waitSince) continue;
+      if (best == 0 || t > tBest || (t == tBest && tk > best)) { best = tk; tBest = t; }
+   }
+   return best;
 }
 
 void DeleteMyPendings(const ulong keep = 0)
@@ -94,7 +130,7 @@ ulong FindReversePending(const ENUM_ORDER_TYPE want)
 }
 
 //+------------------------------------------------------------------+
-// ກຳໄລມື້ນີ້ = ປິດແລ້ວ (deal ຂອງ magic ນີ້) + ລອຍຢູ່
+// ກຳໄລມື້ນີ້ = ປິດແລ້ວ (deal ຂອງ magic ນີ້ ຫຼື ໄມ້ທີ່ຮັບມາ) + ລອຍຢູ່
 double DailyPL()
 {
    double pl = 0.0;
@@ -107,7 +143,9 @@ double DailyPL()
          const ulong d = HistoryDealGetTicket(i);
          if (d == 0) continue;
          if (HistoryDealGetString(d, DEAL_SYMBOL) != _Symbol) continue;
-         if (HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber) continue;
+         const bool mine = (HistoryDealGetInteger(d, DEAL_MAGIC) == MagicNumber) ||
+                           IsAdoptedId((ulong)HistoryDealGetInteger(d, DEAL_POSITION_ID));
+         if (!mine) continue;
          if ((datetime)HistoryDealGetInteger(d, DEAL_TIME) < from) continue;
          pl += HistoryDealGetDouble(d, DEAL_PROFIT)
              + HistoryDealGetDouble(d, DEAL_SWAP)
@@ -130,16 +168,14 @@ void CloseAll()
    DeleteMyPendings();
 }
 
-//+------------------------------------------------------------------+
-bool OpenMarket(const TR_SIDE side, const double lot)
+void SetChain(const ulong tk)
 {
-   bool ok;
-   if (side == TR_BUY) ok = trade.Buy(lot, _Symbol, 0.0, 0.0, 0.0, "TrailReverse");
-   else                ok = trade.Sell(lot, _Symbol, 0.0, 0.0, 0.0, "TrailReverse");
-   if (!ok) Print("Open ", (side == TR_BUY ? "BUY" : "SELL"), " failed: ", trade.ResultRetcodeDescription());
-   return ok;
+   g_chain = tk;
+   if (tk == 0) GlobalVariableDel(g_gvChain);
+   else         GlobalVariableSet(g_gvChain, (double)tk);
 }
 
+//+------------------------------------------------------------------+
 // ວາງ stop ກົງກັນຂ້າມ ຫ່າງ ReverseDist ຈາກລາຄາປະຈຸບັນ
 bool PlaceReverse(const TR_SIDE posSide, const double lot)
 {
@@ -148,12 +184,12 @@ bool PlaceReverse(const TR_SIDE posSide, const double lot)
    if (posSide == TR_BUY)
    {
       const double p = Norm(SymbolInfoDouble(_Symbol, SYMBOL_BID) - dist);
-      ok = trade.SellStop(lot, p, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "TR reverse");
+      ok = trade.SellStop(lot, p, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "MTR reverse");
    }
    else
    {
       const double p = Norm(SymbolInfoDouble(_Symbol, SYMBOL_ASK) + dist);
-      ok = trade.BuyStop(lot, p, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "TR reverse");
+      ok = trade.BuyStop(lot, p, _Symbol, 0.0, 0.0, ORDER_TIME_GTC, 0, "MTR reverse");
    }
    if (!ok) Print("Place reverse failed: ", trade.ResultRetcodeDescription());
    return ok;
@@ -192,6 +228,7 @@ void Process()
    {
       g_stopDay = 0;
       GlobalVariableDel(g_gvStopDay);
+      g_waitSince = TimeCurrent();
    }
    if (g_stopDay != 0) return;
 
@@ -201,6 +238,7 @@ void Process()
        (DailyLossLimitUSD   > 0 && pl <= -DailyLossLimitUSD))
    {
       CloseAll();
+      SetChain(0);
       g_stopDay = day;
       GlobalVariableSet(g_gvStopDay, (double)day);
       Print("Daily ", (pl > 0 ? "target" : "loss limit"), " hit: ", DoubleToString(pl, 2), " USD — stop until next day");
@@ -223,14 +261,22 @@ void Process()
       }
       for (int i = 0; i < n; i++)
          if (pos[i] != newest) trade.PositionClose(pos[i]);
+      SetChain(newest);
       return;
    }
 
-   // ບໍ່ມີໄມ້ → ເລີ່ມໃໝ່ຈາກ LotSize
+   // ບໍ່ມີໄມ້ → ລຶບ pending ແລ້ວລໍຖ້າເຈົ້າກົດ BUY/SELL
    if (n == 0)
    {
+      if (g_chain != 0) { SetChain(0); g_waitSince = TimeCurrent(); }
       DeleteMyPendings();
-      if (!OpenMarket(FirstSide, NormLot(LotSize))) return;
+      const ulong click = FindManualClick();
+      if (click == 0) return;
+      if (!PositionSelectByTicket(click)) return;
+      SetChain(click);
+      RememberAdopted((ulong)PositionGetInteger(POSITION_IDENTIFIER));
+      Print("Adopted your ", (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY" : "SELL"),
+            " ", DoubleToString(PositionGetDouble(POSITION_VOLUME), 2), " ticket ", click);
       n = MyPositions(pos);
       if (n == 0) return;
    }
@@ -250,13 +296,14 @@ void ShowStatus()
 {
    ulong pos[];
    const int n = MyPositions(pos);
-   string s = "TrailReverse  magic " + (string)MagicNumber + "\n";
+   string s = "ManualTrailReverse  magic " + (string)MagicNumber + "\n";
    s += "Daily P/L: " + DoubleToString(DailyPL(), 2) + " USD  (TP " + DoubleToString(DailyProfitTargetUSD, 0)
       + " / SL -" + DoubleToString(DailyLossLimitUSD, 0) + ")\n";
    if (g_stopDay != 0) s += "STOPPED until next day\n";
    else if (n > 0 && PositionSelectByTicket(pos[0]))
       s += "Pos: " + ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? "BUY " : "SELL ")
          + DoubleToString(PositionGetDouble(POSITION_VOLUME), 2) + "  reverse @ " + (string)ReverseDist() + " pts\n";
+   else s += "Waiting for your BUY/SELL click\n";
    Comment(s);
 }
 
@@ -265,7 +312,9 @@ int OnInit()
 {
    g_point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    g_digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   g_gvStopDay = "TrailReverse_StopDay_" + _Symbol + "_" + (string)MagicNumber;
+   g_gvStopDay = "ManualTrailReverse_StopDay_" + _Symbol + "_" + (string)MagicNumber;
+   g_gvChain   = "ManualTrailReverse_Chain_"   + _Symbol + "_" + (string)MagicNumber;
+   g_waitSince = TimeCurrent();   // ໄມ້ທີ່ມີກ່ອນເປີດ EA ບໍ່ຮັບ — ກົດໃໝ່ຫຼັງເປີດ EA
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(SlippagePoints);
@@ -280,6 +329,17 @@ int OnInit()
       g_stopDay = (datetime)GlobalVariableGet(g_gvStopDay);
       if (g_stopDay != DayStart()) { g_stopDay = 0; GlobalVariableDel(g_gvStopDay); }
    }
+   // chain ທີ່ຄ້າງກ່ອນ restart → ຮັບຕໍ່
+   if (GlobalVariableCheck(g_gvChain))
+   {
+      const ulong tk = (ulong)GlobalVariableGet(g_gvChain);
+      if (tk != 0 && PositionSelectByTicket(tk) && PositionGetString(POSITION_SYMBOL) == _Symbol)
+      {
+         g_chain = tk;
+         RememberAdopted((ulong)PositionGetInteger(POSITION_IDENTIFIER));
+      }
+      else GlobalVariableDel(g_gvChain);
+   }
    return INIT_SUCCEEDED;
 }
 
@@ -291,7 +351,7 @@ void OnTick()
    ShowStatus();
 }
 
-// ຕອບໂຕ້ທັນທີເມື່ອ stop ຕິດ — ປິດໄມ້ເກົ່າໂດຍບໍ່ລໍ tick ຖັດໄປ
+// ຕອບໂຕ້ທັນທີເມື່ອ stop ຕິດ ຫຼື ເຈົ້າກົດ — ບໍ່ລໍ tick ຖັດໄປ
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
