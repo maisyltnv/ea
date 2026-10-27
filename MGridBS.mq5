@@ -14,7 +14,7 @@
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.11"
 #property description "MGridBS - grid, shared SL/TP you can trail, 6-tier TP, per-side USD stop, over-trading guards."
 
 #include <Trade/Trade.mqh>
@@ -24,7 +24,7 @@ input long   MagicNumber              = 909090; // EA will manage positions with
 input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 200;    // SL = swing low - this (BUY) / swing high + this (SELL), points
-input int    MinSLDistancePoints      = 1000;   // first SL only: if entry→SL < this, push SL out to exactly this (0=off)
+input int    MinSLDistancePoints      = 1200;   // first SL only: if entry→SL < this, push SL out to exactly this (0=off)
 
 //------- Shared TP per side -------
 input double TPRiskReward             = 1.5;    // TP = first entry + this x (first entry→first SL); same TP on every leg (0=off)
@@ -33,11 +33,11 @@ input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 3;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
-input int    GridFullDistancePoints   = 1000;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
-input double increaseLot              = 0.01;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
+input int    GridFullDistancePoints   = 1200;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
+input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.03;   // max lot per leg; bigger open is partially closed down to this (0=off)
 input int    MinOrdersBeforeAdd       = 2;      // manual add while side is losing: side must already have >= this open legs (grid level 1 filled), else close it back (0=off)
-input double MaxTotalLot              = 0.1;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
+input double MaxTotalLot              = 0.2;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
 input int    MaxTotalOrders           = 0;      // per side: open positions must stay <= this; manual add over it is closed back, grid stops (0=off)
 input double SideLossPercent          = 5.0;    // per side: floating P/L+swap <= -this % of day base → close that side only (0=off)
 input double DailyLossPercent         = 10.0;   // account daily loss (closed+floating) vs day-start base: close all + stop until next day (0=off)
@@ -81,10 +81,12 @@ double g_eaTP[2]   = {0.0, 0.0};   // last tier TP the EA wrote (to detect your 
 
 // Daily loss stop (account-wide). Trading day = DayStartHourLao Lao time.
 datetime g_dayKey     = 0;      // GMT time the current trading day started
-double   g_dayBase    = 0.0;    // min(balance, equity) at day start
+double   g_dayBase    = 0.0;    // effective base = g_dayBase0 + deposits/withdrawals since g_dayBaseAt
+double   g_dayBase0   = 0.0;    // min(balance, equity) when the day started
+datetime g_dayBaseAt  = 0;      // server time g_dayBase0 was taken (balance ops after this adjust the base)
 bool     g_dayStopped = false;  // DailyLossPercent hit → no trading until next day
 datetime g_dayStopAt  = 0;      // server time the stop fired (safety: auto-clear after 24h)
-string   g_gvDayKey, g_gvDayBase, g_gvDayStop, g_gvDayStopAt;
+string   g_gvDayKey, g_gvDayBase, g_gvDayBaseAt, g_gvDayStop, g_gvDayStopAt;
 
 struct TicketState {
   ulong ticket;
@@ -548,15 +550,49 @@ datetime LaoDayStartGMT() {
 
 // New trading day → new base = min(balance, equity), stop cleared. Saved to
 // GlobalVariables so a restart keeps the same base / stop state.
+// Deposits / withdrawals / credit / corrections booked after the base was taken.
+// They move balance+equity without any trading, so the base must move with them.
+double DayBalanceOps() {
+  if (g_dayBaseAt <= 0) return 0.0;
+  double sum = 0.0;
+  if (!HistorySelect(g_dayBaseAt, TimeCurrent() + 86400)) return 0.0;
+  for (int i = HistoryDealsTotal() - 1; i >= 0; i--) {
+    const ulong d = HistoryDealGetTicket(i);
+    if (d == 0) continue;
+    if ((datetime)HistoryDealGetInteger(d, DEAL_TIME) <= g_dayBaseAt) continue;
+    const long type = HistoryDealGetInteger(d, DEAL_TYPE);
+    if (type != DEAL_TYPE_BALANCE && type != DEAL_TYPE_CREDIT &&
+        type != DEAL_TYPE_CORRECTION && type != DEAL_TYPE_BONUS) continue;
+    sum += HistoryDealGetDouble(d, DEAL_PROFIT);
+  }
+  return sum;
+}
+
+// Effective base = raw day-start base + balance ops since. Logs when it changes.
+void RefreshDayBase() {
+  if (g_dayBase0 <= 0.0 && g_dayBaseAt <= 0) return;
+  const double ops = DayBalanceOps();
+  const double nb = MathMax(0.0, g_dayBase0 + ops);
+  if (MathAbs(nb - g_dayBase) < 0.005) return;
+  Print("[MGridBS] Day base adjusted: ", DoubleToString(g_dayBase0, 2),
+        (ops >= 0 ? " + " : " - "), DoubleToString(MathAbs(ops), 2),
+        " (deposits/withdrawals today) = ", DoubleToString(nb, 2),
+        "  limit = -", DoubleToString(nb * DailyLossPercent / 100.0, 2));
+  g_dayBase = nb;
+}
+
 void UpdateTradingDay() {
   const datetime key = LaoDayStartGMT();
-  if (key == g_dayKey && g_dayBase > 0.0) return;
+  if (key == g_dayKey && g_dayBaseAt > 0) return;
   g_dayKey = key;
-  g_dayBase = MathMin(AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+  g_dayBase0 = MathMin(AccountInfoDouble(ACCOUNT_BALANCE), AccountInfoDouble(ACCOUNT_EQUITY));
+  g_dayBaseAt = TimeCurrent();
+  g_dayBase = g_dayBase0;
   g_dayStopped = false;
   g_dayStopAt = 0;
   GlobalVariableSet(g_gvDayKey, (double)key);
-  GlobalVariableSet(g_gvDayBase, g_dayBase);
+  GlobalVariableSet(g_gvDayBase, g_dayBase0);
+  GlobalVariableSet(g_gvDayBaseAt, (double)g_dayBaseAt);
   GlobalVariableDel(g_gvDayStop);
   GlobalVariableDel(g_gvDayStopAt);
   Print("[MGridBS] New trading day (Lao ", TimeToString(key - (ServerGMTOffsetSec() - 7 * 3600), TIME_DATE | TIME_MINUTES),
@@ -569,12 +605,16 @@ void RestoreTradingDayFromGV() {
   const datetime key = (datetime)GlobalVariableGet(g_gvDayKey);
   if (key != LaoDayStartGMT()) return;          // stale → UpdateTradingDay() starts fresh
   g_dayKey = key;
-  g_dayBase = GlobalVariableGet(g_gvDayBase);
+  g_dayBase0 = GlobalVariableGet(g_gvDayBase);
+  // Older builds had no DayBaseAt: treat the base as taken at day start.
+  g_dayBaseAt = GlobalVariableCheck(g_gvDayBaseAt) ? (datetime)GlobalVariableGet(g_gvDayBaseAt) : key;
+  g_dayBase = g_dayBase0;
   g_dayStopped = GlobalVariableCheck(g_gvDayStop) &&
                  (datetime)GlobalVariableGet(g_gvDayStop) == key;
   g_dayStopAt = GlobalVariableCheck(g_gvDayStopAt) ? (datetime)GlobalVariableGet(g_gvDayStopAt) : 0;
   Print("[MGridBS] Trading day restored. Base = ", DoubleToString(g_dayBase, 2),
         g_dayStopped ? " — STOPPED for today" : "");
+  RefreshDayBase();                              // deposit while EA was off → base follows
 }
 
 double DailyPL() { return AccountInfoDouble(ACCOUNT_EQUITY) - g_dayBase; }
@@ -583,6 +623,8 @@ double DailyPL() { return AccountInfoDouble(ACCOUNT_EQUITY) - g_dayBase; }
 bool CheckDailyLoss() {
   if (DailyLossPercent <= 0.0) return false;
   UpdateTradingDay();
+  static datetime lastBaseRefresh = 0;          // catch balance ops the event handler missed
+  if (TimeCurrent() - lastBaseRefresh >= 60) { RefreshDayBase(); lastBaseRefresh = TimeCurrent(); }
   if (g_dayBase <= 0.0) return false;
 
   // Safety net: a stop never lasts more than 24h, whatever the day math says.
@@ -628,6 +670,9 @@ void ShowDailyStatus() {
   string s = "MGridBS  day base " + DoubleToString(g_dayBase, 2)
            + "  P/L " + DoubleToString(pl, 2) + " (" + DoubleToString(pl / g_dayBase * 100.0, 2) + "%)"
            + "  limit -" + DoubleToString(DailyLossPercent, 1) + "%";
+  if (MathAbs(g_dayBase - g_dayBase0) >= 0.005)
+    s += "  (start " + DoubleToString(g_dayBase0, 2) + (g_dayBase >= g_dayBase0 ? " + " : " - ")
+       + DoubleToString(MathAbs(g_dayBase - g_dayBase0), 2) + " deposit/withdrawal)";
   const int shift = ServerGMTOffsetSec() - 7 * 3600;
   s += "\nLao time " + TimeToString(TimeCurrent() - shift, TIME_DATE | TIME_MINUTES)
      + "   day started " + TimeToString(g_dayKey - shift, TIME_DATE | TIME_MINUTES) + " Lao"
@@ -1552,6 +1597,7 @@ int OnInit() {
   // Daily loss stop state survives restarts / re-attach (keyed by magic, account-wide).
   g_gvDayKey  = "MGridBS_DayKey_"  + IntegerToString(MagicNumber);
   g_gvDayBase = "MGridBS_DayBase_" + IntegerToString(MagicNumber);
+  g_gvDayBaseAt = "MGridBS_DayBaseAt_" + IntegerToString(MagicNumber);
   g_gvDayStop = "MGridBS_DayStop_" + IntegerToString(MagicNumber);
   g_gvDayStopAt = "MGridBS_DayStopAt_" + IntegerToString(MagicNumber);
   if (DailyLossPercent > 0.0) RestoreTradingDayFromGV();
@@ -1593,6 +1639,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
   if (trans.deal == 0) return;
   if (!HistoryDealSelect(trans.deal)) return;
+  const long dtype = HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+  if (dtype == DEAL_TYPE_BALANCE || dtype == DEAL_TYPE_CREDIT ||
+      dtype == DEAL_TYPE_CORRECTION || dtype == DEAL_TYPE_BONUS) {
+    RefreshDayBase();                            // deposit / withdrawal → base follows at once
+    return;
+  }
   if (HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol) return;
 
   const long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
