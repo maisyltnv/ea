@@ -14,7 +14,7 @@
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.11"
+#property version   "1.14"
 #property description "MGridBS - grid, shared SL/TP you can trail, 6-tier TP, per-side USD stop, over-trading guards."
 
 #include <Trade/Trade.mqh>
@@ -35,12 +35,15 @@ input bool   UseGridPendingOrders     = true;   // after swing SL is set
 input int    GridExtraPendingLegs     = 3;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
 input int    GridFullDistancePoints   = 1200;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
 input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
-input double MaxLotPerLeg             = 0.03;   // max lot per leg; bigger open is partially closed down to this (0=off)
+input double MaxLotPerLeg             = 0.01;   // max lot per leg; bigger open is partially closed down to this (0=off)
 input int    MinOrdersBeforeAdd       = 2;      // manual add while side is losing: side must already have >= this open legs (grid level 1 filled), else close it back (0=off)
-input double MaxTotalLot              = 0.2;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
+input double MaxTotalLot              = 0.05;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
 input int    MaxTotalOrders           = 0;      // per side: open positions must stay <= this; manual add over it is closed back, grid stops (0=off)
-input double SideLossPercent          = 5.0;    // per side: floating P/L+swap <= -this % of day base → close that side only (0=off)
-input double DailyLossPercent         = 10.0;   // account daily loss (closed+floating) vs day-start base: close all + stop until next day (0=off)
+input bool   AllowManualAdd           = false;  // false: once any order is open on this symbol, every extra manual order (BUY/SELL, market or your own pending) is closed back — only the EA grid fills. true = old add rules (MinOrdersBeforeAdd / MaxTotal*)
+input int    BETriggerPoints          = 500;    // first order in profit >= this (points) → SL of every leg on that side moved ONCE to first entry ± BELockPoints (0=off)
+input int    BELockPoints             = 50;     // break-even lock: BUY SL = first entry + this, SELL SL = first entry - this (points)
+input double SideLossPercent          = 15.0;    // per side: floating P/L+swap <= -this % of day base → close that side only (0=off)
+input double DailyLossPercent         = 30.0;   // account daily loss (closed+floating) vs day-start base: close all + stop until next day (0=off)
 input int    DayStartHourLao          = 5;      // trading day starts at this hour, Lao time (GMT+7); base = min(balance, equity) then
 input int    ServerGMTOffsetHours     = 3;      // broker server time vs GMT (FBS: +3 summer, +2 winter). Chart warns if the terminal disagrees
 input bool   GridOnRefSLEntries       = false;  // if false, skip grid when SL copied from another manual (stack)
@@ -63,6 +66,19 @@ input int    AutoStochSlowing      = 3;      // Stochastic slowing
 input double AutoStochBuyLevel     = 20.0;   // BUY when %K reaches down to <= this
 input double AutoStochSellLevel    = 80.0;   // SELL when %K reaches up   to >= this
 
+//----------------- Entry filter: your Buy/Sell click must pass, else closed at once -----------------
+// Your own pendings (Limit/Stop) and EA grid fills are NOT checked.
+input bool   UseEntryFilter           = true;
+input ENUM_TIMEFRAMES FilterEmaTF     = PERIOD_M5;  // EMA trend timeframe
+input int    FilterEmaFast            = 50;     // BUY needs EMA fast > EMA slow, SELL needs fast < slow
+input int    FilterEmaSlow            = 200;
+input ENUM_TIMEFRAMES FilterStochTF   = PERIOD_M1;  // Stochastic timeframe (current bar value at the click)
+input int    FilterStochK             = 9;
+input int    FilterStochD             = 3;
+input int    FilterStochSlowing       = 3;
+input double FilterBuyStochMax        = 20.0;   // BUY needs %K <= this
+input double FilterSellStochMin       = 80.0;   // SELL needs %K >= this
+
 //--------------------------- Globals --------------------------------
 CTrade trade;
 
@@ -70,12 +86,17 @@ CTrade trade;
 int      g_autoEmaHandle     = INVALID_HANDLE;
 int      g_autoEmaSlowHandle = INVALID_HANDLE;
 int      g_autoStochHandle   = INVALID_HANDLE;
+int      g_fEmaFastHandle    = INVALID_HANDLE;   // entry filter
+int      g_fEmaSlowHandle    = INVALID_HANDLE;
+int      g_fStochHandle      = INVALID_HANDLE;
 datetime g_autoLastBar       = 0;
 
 
 // Per-side shared levels (index 0 = BUY, 1 = SELL). Reset when the side is flat.
 double g_sideSL[2] = {0.0, 0.0};   // committed side SL (you may only tighten it)
 double g_sideSL0[2] = {0.0, 0.0};  // FIRST side SL (grid geometry + TP use this, tightening does not move them)
+datetime g_sideStopAt[2] = {0, 0}; // server time the side was last force-closed (late grid fills closed for 10 s)
+bool   g_beDone[2]  = {false, false}; // break-even already applied on this side (once per side cycle)
 double g_userTP[2] = {0.0, 0.0};   // TP you set on the oldest leg (0 = none → tier TP)
 double g_eaTP[2]   = {0.0, 0.0};   // last tier TP the EA wrote (to detect your edit)
 
@@ -120,6 +141,7 @@ void ResetSideLevels(const ENUM_POSITION_TYPE side) {
   g_sideSL0[k] = 0.0;
   g_userTP[k] = 0.0;
   g_eaTP[k]   = 0.0;
+  g_beDone[k] = false;
 }
 
 // Grid legs for an entry→SL distance: full count at >= GridFullDistancePoints,
@@ -376,6 +398,24 @@ double BundleFloatingProfitMoney() {
 }
 
 // Oldest open bundle leg on side (manual or MSSLTP) — the "first leg" for BE.
+// Oldest leg you clicked yourself (magic != EA) on one side; 0 if none.
+ulong OldestManualLegTicket(const ENUM_POSITION_TYPE side) {
+  ulong oldestTk = 0;
+  datetime oldestTime = 0;
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    const datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+    if (oldestTk == 0 || t < oldestTime) {
+      oldestTime = t;
+      oldestTk = tk;
+    }
+  }
+  return oldestTk;
+}
+
 ulong OldestBundleLegTicket(const ENUM_POSITION_TYPE side) {
   ulong oldestTk = 0;
   datetime oldestTime = 0;
@@ -686,10 +726,132 @@ void ShowDailyStatus() {
   Comment(s);
 }
 
+// AllowManualAdd=false: a manual order (market click OR your own pending that
+// filled) opened while ANY other order is already open on this symbol — BUY or
+// SELL, in profit or not — is closed back. EA grid fills are never touched.
+// Returns true if closed.
+bool CheckNoManualAdd(const ulong tk) {
+  if (AllowManualAdd || tk == 0) return false;
+  if (!PositionSelectByTicket(tk)) return false;
+  if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+  if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) return false; // grid fill
+  const long myMsc = (long)PositionGetInteger(POSITION_TIME_MSC);
+  const bool isBuy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+
+  int older = 0;                                  // orders that were open before this one
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong t2 = PositionGetTicket(i);
+    if (t2 == tk || !IsBundlePositionLeg(t2)) continue;
+    const long msc = (long)PositionGetInteger(POSITION_TIME_MSC);
+    if (msc < myMsc || (msc == myMsc && t2 < tk)) older++;
+  }
+  if (older == 0) return false;                   // first order → allowed
+
+  trade.SetDeviationInPoints(SlippagePoints);
+  SetTradeMagicForPositionTicket(tk);
+  if (!trade.PositionClose(tk)) {
+    Print("[MGridBS] AllowManualAdd: close failed tk=", tk, " ret=", trade.ResultRetcode());
+    return false;
+  }
+  const string msg = StringFormat("Add blocked: %d order(s) already open — your %s was closed (AllowManualAdd=false)",
+                                  older, (isBuy ? "BUY" : "SELL"));
+  Print("[MGridBS] ", msg, " tk=", tk);
+  Alert("[MGridBS] ", msg);
+  return true;
+}
+
+// Current (forming bar, shift 0) value of buffer 0; false if not ready.
+bool IndNow(const int handle, double &v) {
+  if (handle == INVALID_HANDLE) return false;
+  double b[];
+  if (CopyBuffer(handle, 0, 0, 1, b) != 1) return false;
+  v = b[0];
+  return (v != EMPTY_VALUE);
+}
+
+// Entry filter for a Buy/Sell CLICK (market order): values at the moment of the
+// click. BUY: EMA fast > slow on FilterEmaTF and %K <= FilterBuyStochMax.
+// SELL: EMA fast < slow and %K >= FilterSellStochMin. Not met → closed at once.
+// Your own pendings (Limit/Stop) and EA grid fills are NOT checked.
+// Returns true if closed.
+bool CheckEntryFilter(const ulong tk) {
+  if (!UseEntryFilter || tk == 0) return false;
+  if (!PositionSelectByTicket(tk)) return false;
+  if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+  if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) return false;    // grid fill
+  if (OpenedByPendingOrder((ulong)PositionGetInteger(POSITION_IDENTIFIER))) return false; // your pending
+  if (!PositionSelectByTicket(tk)) return false;
+  const bool isBuy = ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY);
+
+  double ef = 0.0, es = 0.0, k = 0.0;
+  string why = "";
+  if (!IndNow(g_fEmaFastHandle, ef) || !IndNow(g_fEmaSlowHandle, es) || !IndNow(g_fStochHandle, k)) {
+    why = "indicator data not ready";
+  } else {
+    const string tfE = EnumToString(FilterEmaTF), tfS = EnumToString(FilterStochTF);
+    if (isBuy) {
+      if (!(ef > es)) why += StringFormat("%s EMA%d %.2f <= EMA%d %.2f; ", tfE, FilterEmaFast, ef, FilterEmaSlow, es);
+      if (!(k <= FilterBuyStochMax)) why += StringFormat("%s Stoch %.1f > %.0f; ", tfS, k, FilterBuyStochMax);
+    } else {
+      if (!(ef < es)) why += StringFormat("%s EMA%d %.2f >= EMA%d %.2f; ", tfE, FilterEmaFast, ef, FilterEmaSlow, es);
+      if (!(k >= FilterSellStochMin)) why += StringFormat("%s Stoch %.1f < %.0f; ", tfS, k, FilterSellStochMin);
+    }
+  }
+  if (why == "") return false;                    // all conditions met
+
+  trade.SetDeviationInPoints(SlippagePoints);
+  SetTradeMagicForPositionTicket(tk);
+  if (!trade.PositionClose(tk)) {
+    Print("[MGridBS] EntryFilter: close failed tk=", tk, " ret=", trade.ResultRetcode());
+    return false;
+  }
+  const string msg = StringFormat("%s blocked (entry filter): %s", (isBuy ? "BUY" : "SELL"), why);
+  Print("[MGridBS] ", msg, " tk=", tk);
+  Alert("[MGridBS] ", msg);
+  return true;
+}
+
 // All over-trading guards for a fresh manual click. Returns true if closed.
 bool CheckManualAddGuards(const ulong tk) {
+  if (CheckEntryFilter(tk)) return true;              // EMA/Stoch conditions at the click
+  if (!AllowManualAdd) return CheckNoManualAdd(tk);   // no adds at all
   if (CheckMinOrdersBeforeAdd(tk)) return true;
   return CheckMaxTotals(tk);
+}
+
+// Break-even (once per side): first order in profit >= BETriggerPoints →
+// side SL = first entry ± BELockPoints. EnforceSideSL then copies it to every
+// leg and deletes grid pendings beyond it; RearmGridForSide stops for the side.
+// An SL you already moved better than that is left alone.
+void ApplyBreakEven(const ENUM_POSITION_TYPE side) {
+  if (BETriggerPoints <= 0) return;
+  const int k = SideIdx(side);
+  if (g_beDone[k] || g_sideSL[k] <= 0.0) return;   // done / swing SL not set yet
+  ulong firstTk = OldestManualLegTicket(side);
+  if (firstTk == 0) firstTk = OldestBundleLegTicket(side);
+  if (firstTk == 0 || !PositionSelectByTicket(firstTk)) return;
+
+  const double pt = Pt();
+  if (pt <= 0.0) return;
+  const int digits = DigitsCount();
+  const bool isBuy = (side == POSITION_TYPE_BUY);
+  const double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+  const double px = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+  const double profitPts = isBuy ? (px - entry) / pt : (entry - px) / pt;
+  if (profitPts < (double)BETriggerPoints) return;
+
+  g_beDone[k] = true;
+  const double beSL = NormalizeDouble(isBuy ? entry + BELockPoints * pt : entry - BELockPoints * pt, digits);
+  const double eps = pt * 0.5;
+  if (isBuy ? (g_sideSL[k] >= beSL - eps) : (g_sideSL[k] <= beSL + eps)) {
+    Print("[MGridBS] ", (isBuy ? "BUY" : "SELL"), " break-even reached — your SL ",
+          DoubleToString(g_sideSL[k], digits), " is already better than ", DoubleToString(beSL, digits));
+    return;
+  }
+  g_sideSL[k] = beSL;
+  Print("[MGridBS] ", (isBuy ? "BUY" : "SELL"), " break-even: first order +",
+        DoubleToString(profitPts, 0), " pts → SL of every leg = ", DoubleToString(beSL, digits),
+        " (entry ", (isBuy ? "+" : "-"), IntegerToString(BELockPoints), ")");
 }
 
 // Side SL: one price for every leg + grid pending on the side.
@@ -1090,8 +1252,9 @@ void TryPlaceGridPendings(const ulong parentTk, const ENUM_POSITION_TYPE typ,
 }
 
 // Is a bundle leg still sitting on (or very near) this grid price?
-bool HasBundlePositionNear(const ENUM_POSITION_TYPE side, const double price) {
-  const double tol = Pt() * 2.0;
+// `tol` must cover fill slippage (a limit filled 4 points off its price is
+// still that level) — callers pass ~half the grid step, never just 2 points.
+bool HasBundlePositionNear(const ENUM_POSITION_TYPE side, const double price, const double tol) {
   if (tol <= 0.0) return false;
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     const ulong tk = PositionGetTicket(i);
@@ -1108,8 +1271,12 @@ bool HasBundlePositionNear(const ENUM_POSITION_TYPE side, const double price) {
 // the SL never moves the levels; levels beyond the current SL are skipped.
 void RearmGridForSide(const ENUM_POSITION_TYPE side) {
   if (!UseGridPendingOrders) return;
+  if (g_beDone[SideIdx(side)]) return;   // after break-even: grid is gone for good this cycle
 
-  const ulong anchorTk = OldestBundleLegTicket(side);
+  // Anchor = oldest MANUAL leg only. A grid fill as anchor would tag the new
+  // pendings to an EA-magic parent, which CleanupOrphanGridPendings deletes →
+  // place/delete loop every tick (seen 28 Oct). No manual leg → nothing to re-arm.
+  const ulong anchorTk = OldestManualLegTicket(side);
   if (anchorTk == 0 || !PositionSelectByTicket(anchorTk)) return;
   const double entry    = PositionGetDouble(POSITION_PRICE_OPEN);
   const double baseLots = PositionGetDouble(POSITION_VOLUME);
@@ -1152,7 +1319,9 @@ void RearmGridForSide(const ENUM_POSITION_TYPE side) {
       if (gprice <= bid + minDist) continue;
     }
     if (HasPendingLimitNear(isBuy, gprice)) continue;   // already armed
-    if (HasBundlePositionNear(side, gprice)) continue;  // level still filled
+    // Level still filled? Tolerance = half a step so a slipped fill (e.g. limit
+    // 4049.43 filled at 4049.47) still counts as this level and is NOT re-armed.
+    if (HasBundlePositionNear(side, gprice, MathMax(pt * 2.0, gstep * 0.45))) continue;
     if (!PendingSlDistanceOkVsOrder(isBuy, gprice, gridSL)) continue;
     const double lots = NormalizeVolumeLocal(baseLots + increaseLot * (double)gi);
     if (lots <= 0.0) continue;
@@ -1256,19 +1425,12 @@ double BundleSideFloatingProfitMoney(const ENUM_POSITION_TYPE side) {
 }
 
 // Close all bundle positions AND pendings on ONE side.
+// Pendings are deleted FIRST so a grid limit cannot fill while the positions
+// are being closed (28 Oct: a fill landed 0.3 s after the stop and stayed open).
 void CloseBundleSide(const ENUM_POSITION_TYPE side) {
   const bool isBuy = (side == POSITION_TYPE_BUY);
   trade.SetDeviationInPoints(SlippagePoints);
 
-  for (int i = PositionsTotal() - 1; i >= 0; i--) {
-    const ulong tk = PositionGetTicket(i);
-    if (!IsBundlePositionLeg(tk)) continue;
-    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
-    SetTradeMagicForPositionTicket(tk);
-    if (!trade.PositionClose(tk))
-      Print("[MGridBS] Side close position failed tk=", tk,
-            " ret=", trade.ResultRetcode());
-  }
   for (int j = OrdersTotal() - 1; j >= 0; j--) {
     const ulong ot = OrderGetTicket(j);
     if (!IsBundleOrderLeg(ot)) continue;
@@ -1279,7 +1441,39 @@ void CloseBundleSide(const ENUM_POSITION_TYPE side) {
       Print("[MGridBS] Side close delete pending failed ot=", ot,
             " ret=", trade.ResultRetcode());
   }
+  for (int i = PositionsTotal() - 1; i >= 0; i--) {
+    const ulong tk = PositionGetTicket(i);
+    if (!IsBundlePositionLeg(tk)) continue;
+    if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+    SetTradeMagicForPositionTicket(tk);
+    if (!trade.PositionClose(tk))
+      Print("[MGridBS] Side close position failed tk=", tk,
+            " ret=", trade.ResultRetcode());
+  }
   ResetSideLevels(side);
+  g_sideStopAt[SideIdx(side)] = TimeCurrent();
+}
+
+// For 10 s after a side stop, a grid fill that still slipped through (deal
+// already in flight when the pending was deleted) is closed too. Only EA-magic
+// grid legs — a fresh click of yours is never touched here.
+void CloseLateGridFills() {
+  for (int k = 0; k < 2; k++) {
+    if (g_sideStopAt[k] <= 0) continue;
+    if (TimeCurrent() - g_sideStopAt[k] > 10) { g_sideStopAt[k] = 0; continue; }
+    const ENUM_POSITION_TYPE side = (k == 0) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+      const ulong tk = PositionGetTicket(i);
+      if (!IsBundlePositionLeg(tk)) continue;
+      if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
+      if ((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      trade.SetDeviationInPoints(SlippagePoints);
+      SetTradeMagicForPositionTicket(tk);
+      if (trade.PositionClose(tk))
+        Print("[MGridBS] late grid fill tk=", tk, " closed (side was stopped ",
+              IntegerToString((int)(TimeCurrent() - g_sideStopAt[k])), " s ago)");
+    }
+  }
 }
 
 // Apply one shared TP price to all bundle positions + pendings on a side.
@@ -1623,11 +1817,26 @@ int OnInit() {
     }
   }
 
+  if (UseEntryFilter) {
+    g_fEmaFastHandle = iMA(_Symbol, FilterEmaTF, FilterEmaFast, 0, MODE_EMA, PRICE_CLOSE);
+    g_fEmaSlowHandle = iMA(_Symbol, FilterEmaTF, FilterEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
+    g_fStochHandle   = iStochastic(_Symbol, FilterStochTF, FilterStochK, FilterStochD,
+                                   FilterStochSlowing, MODE_SMA, STO_LOWHIGH);
+    if (g_fEmaFastHandle == INVALID_HANDLE || g_fEmaSlowHandle == INVALID_HANDLE ||
+        g_fStochHandle == INVALID_HANDLE) {
+      Print("[MGridBS] Failed to create entry-filter indicator handles.");
+      return INIT_FAILED;
+    }
+  }
+
   return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason) {
   Comment("");
+  if (g_fEmaFastHandle != INVALID_HANDLE) IndicatorRelease(g_fEmaFastHandle);
+  if (g_fEmaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_fEmaSlowHandle);
+  if (g_fStochHandle != INVALID_HANDLE) IndicatorRelease(g_fStochHandle);
   if (g_autoEmaHandle != INVALID_HANDLE) IndicatorRelease(g_autoEmaHandle);
   if (g_autoEmaSlowHandle != INVALID_HANDLE) IndicatorRelease(g_autoEmaSlowHandle);
   if (g_autoStochHandle != INVALID_HANDLE) IndicatorRelease(g_autoStochHandle);
@@ -1691,6 +1900,7 @@ void OnTick() {
   if (dayStopped) return;
 
   if (CheckSideRiskStop()) return;   // SideLossPercent is per side
+  CloseLateGridFills();              // grid fill that landed during a side stop
 
   // Signal alerts (no orders — you click; the manager loop below handles the click).
   ProcessSignalAlert();
@@ -1701,6 +1911,10 @@ void OnTick() {
     if (tk == 0) continue;
     ManageManualPosition(tk);
   }
+
+  // Break-even once per side (first order >= BETriggerPoints in profit).
+  ApplyBreakEven(POSITION_TYPE_BUY);
+  ApplyBreakEven(POSITION_TYPE_SELL);
 
   // Side SL: accept your tightening, restore widening/removal, sync legs + pendings.
   EnforceSideSL(POSITION_TYPE_BUY);
