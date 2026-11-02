@@ -32,7 +32,7 @@ input double TPRiskReward             = 1.5;    // TP = first entry + this x (fi
 input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
-input int    GridExtraPendingLegs     = 3;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
+input int    GridExtraPendingLegs     = 2;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
 input int    GridFullDistancePoints   = 1200;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
 input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.01;   // max lot per leg; bigger open is partially closed down to this (0=off)
