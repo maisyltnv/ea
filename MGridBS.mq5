@@ -14,7 +14,7 @@
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.14"
+#property version   "1.15"
 #property description "MGridBS - grid, shared SL/TP you can trail, 6-tier TP, per-side USD stop, over-trading guards."
 
 #include <Trade/Trade.mqh>
@@ -78,6 +78,10 @@ input int    FilterStochD             = 3;
 input int    FilterStochSlowing       = 3;
 input double FilterBuyStochMax        = 20.0;   // BUY needs %K <= this
 input double FilterSellStochMin       = 80.0;   // SELL needs %K >= this
+// Your own pendings vs the FilterEmaTF trend (checked every tick, not only when placed):
+// Buy Limit/Stop allowed only while EMA fast > slow, Sell Limit/Stop only while fast < slow.
+// Against the trend → deleted at once (also one placed earlier when the trend flips). EA grid not touched.
+input bool   UsePendingTrendFilter    = true;
 
 //--------------------------- Globals --------------------------------
 CTrade trade;
@@ -809,6 +813,42 @@ bool CheckEntryFilter(const ulong tk) {
   Print("[MGridBS] ", msg, " tk=", tk);
   Alert("[MGridBS] ", msg);
   return true;
+}
+
+// Your own pending orders (magic 0) must follow the FilterEmaTF EMA trend:
+// buy-side (Buy Limit / Buy Stop / Buy Stop Limit) only while fast > slow,
+// sell-side only while fast < slow. Anything against the trend is deleted,
+// including one placed earlier when the trend flips. No data → nothing deleted.
+void EnforcePendingTrend() {
+  if (!UsePendingTrendFilter) return;
+  double ef = 0.0, es = 0.0;
+  if (!IndNow(g_fEmaFastHandle, ef) || !IndNow(g_fEmaSlowHandle, es)) return;
+  const bool buyOk  = (ef > es);
+  const bool sellOk = (ef < es);
+  const int digits = DigitsCount();
+  for (int j = OrdersTotal() - 1; j >= 0; j--) {
+    const ulong ot = OrderGetTicket(j);
+    if (ot == 0 || !OrderSelect(ot)) continue;
+    if (OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+    if ((long)OrderGetInteger(ORDER_MAGIC) != 0) continue;        // yours only (EA grid / other EAs untouched)
+    const ENUM_ORDER_TYPE typ = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+    const bool isBuy = (typ == ORDER_TYPE_BUY_LIMIT || typ == ORDER_TYPE_BUY_STOP || typ == ORDER_TYPE_BUY_STOP_LIMIT);
+    const bool isSell = (typ == ORDER_TYPE_SELL_LIMIT || typ == ORDER_TYPE_SELL_STOP || typ == ORDER_TYPE_SELL_STOP_LIMIT);
+    if (!isBuy && !isSell) continue;
+    if ((isBuy && buyOk) || (isSell && sellOk)) continue;
+    const double op = OrderGetDouble(ORDER_PRICE_OPEN);
+    SetTradeMagicForOrderTicket(ot);
+    if (!trade.OrderDelete(ot)) {
+      Print("[MGridBS] PendingTrend: delete failed ot=", ot, " ret=", trade.ResultRetcode());
+      continue;
+    }
+    const string tname = StringSubstr(EnumToString(typ), 11);   // e.g. BUY_LIMIT
+    const string msg = StringFormat("%s #%I64u at %s deleted: %s EMA%d %.2f %s EMA%d %.2f (against trend)",
+                                    tname, ot, DoubleToString(op, digits), EnumToString(FilterEmaTF),
+                                    FilterEmaFast, ef, (isBuy ? "<=" : ">="), FilterEmaSlow, es);
+    Print("[MGridBS] ", msg);
+    Alert("[MGridBS] ", msg);
+  }
 }
 
 // All over-trading guards for a fresh manual click. Returns true if closed.
@@ -1817,7 +1857,7 @@ int OnInit() {
     }
   }
 
-  if (UseEntryFilter) {
+  if (UseEntryFilter || UsePendingTrendFilter) {
     g_fEmaFastHandle = iMA(_Symbol, FilterEmaTF, FilterEmaFast, 0, MODE_EMA, PRICE_CLOSE);
     g_fEmaSlowHandle = iMA(_Symbol, FilterEmaTF, FilterEmaSlow, 0, MODE_EMA, PRICE_CLOSE);
     g_fStochHandle   = iStochastic(_Symbol, FilterStochTF, FilterStochK, FilterStochD,
@@ -1845,6 +1885,10 @@ void OnDeinit(const int reason) {
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result) {
+  if (trans.type == TRADE_TRANSACTION_ORDER_ADD) {   // you placed a pending → check trend at once
+    if (trans.symbol == _Symbol) EnforcePendingTrend();
+    return;
+  }
   if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
   if (trans.deal == 0) return;
   if (!HistoryDealSelect(trans.deal)) return;
@@ -1901,6 +1945,7 @@ void OnTick() {
 
   if (CheckSideRiskStop()) return;   // SideLossPercent is per side
   CloseLateGridFills();              // grid fill that landed during a side stop
+  EnforcePendingTrend();             // your pendings must follow the M5 EMA trend
 
   // Signal alerts (no orders — you click; the manager loop below handles the click).
   ProcessSignalAlert();
