@@ -7,14 +7,14 @@
 //|   per-side USD stop, MaxLotPerLeg.                               |
 //| You may TIGHTEN the side SL (never widen) and move the side TP   |
 //|   on the oldest leg — EA copies it to every leg + grid pending.  |
-//| Over-trading guards per side: staged adds (EarlyAddMaxLot), MaxTotalLot, |
+//| Over-trading guards per side: staged adds (AddFracLevel*), MaxTotalLot, |
 //|   MaxTotalOrders (manual add that breaks a rule is closed back). |
 //| ALERT (AutoTF): BUY EMA50>EMA200 & close>EMA50 & %K<=BuyLevel;    |
 //|   SELL mirror. Popup / push / sound only — you click the order.   |
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.19"
+#property version   "1.20"
 #property description "MGridBS - grid, shared SL/TP you can trail, 6-tier TP, per-side USD stop, over-trading guards."
 
 #include <Trade/Trade.mqh>
@@ -36,15 +36,20 @@ input int    GridExtraPendingLegs     = 3;      // grid legs when entry→SL >= 
 input int    GridFullDistancePoints   = 2000;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
 input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.01;   // max lot per leg; bigger open is partially closed down to this (0=off)
-// Staged manual adds (AllowManualAdd=true). Stage = how deep the EA GRID has filled (your adds never raise it):
-//   first order in loss, no grid fill → no add | first order in profit → side total <= EarlyAddMaxLot
-//   grid level 1 filled → Stage1AddOrders more add(s), side total <= EarlyAddMaxLot | grid level 2 filled → side total <= MaxTotalLot
-//   Two stages at once → the bigger limit, never above MaxTotalLot. Your own pending fills are not checked.
-input double EarlyAddMaxLot           = 0.05;   // side total lot limit while the first order is in profit or only grid level 1 has filled
-input int    Stage1AddOrders          = 1;      // manual adds allowed once grid level 1 has filled (before level 2)
-input double MaxTotalLot              = 0.1;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
+// Staged manual adds (AllowManualAdd=true). Every add needs the FIRST order in profit
+// (BUY: price above first entry, SELL: below). Stage = deepest EA GRID level filled (your adds never raise it):
+//   no grid fill  → ProfitAddOrders add(s), each lot <= the first order's lot
+//   grid level 1  → YOUR adds (not first/grid) total <= AddFracLevel1 x MaxTotalLot
+//   grid level 2  → YOUR adds total <= AddFracLevel2 x MaxTotalLot
+//   grid level 3+ → YOUR adds total <= AddFracLevel3 x MaxTotalLot
+//   The whole side still never exceeds MaxTotalLot. Your own pending fills are not checked.
+input int    ProfitAddOrders          = 1;      // no grid fill yet, first order in profit: this many adds, each lot <= first order lot
+input double AddFracLevel1            = 0.25;   // grid level 1 filled: your adds total <= this x MaxTotalLot (once first order is back in profit)
+input double AddFracLevel2            = 0.50;   // grid level 2 filled: your adds total <= this x MaxTotalLot
+input double AddFracLevel3            = 1.00;   // grid level 3+ filled: your adds total <= this x MaxTotalLot
+input double MaxTotalLot              = 0.4;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
 input int    MaxTotalOrders           = 0;      // per side: open positions must stay <= this; manual add over it is closed back, grid stops (0=off)
-input bool   AllowManualAdd           = true;  // false: once any order is open on this symbol, every extra manual order (BUY/SELL, market or your own pending) is closed back — only the EA grid fills. true = staged add rules (EarlyAddMaxLot / Stage1AddOrders / MaxTotal*)
+input bool   AllowManualAdd           = true;  // false: once any order is open on this symbol, every extra manual order (BUY/SELL, market or your own pending) is closed back — only the EA grid fills. true = staged add rules (ProfitAddOrders / AddFracLevel* / MaxTotal*)
 input bool   AllowOppositeSide        = false;  // false: no hedge — while any BUY is open (manual or grid) a SELL you open (click or your own pending fill) is closed at once, and vice versa
 input int    BETriggerPoints          = 1000;    // least-profit order of the side (worst entry) in profit >= this (points) → SL of every leg = that entry ± BELockPoints; re-arms when an add has a worse entry (0=off)
 input int    BELockPoints             = 50;     // break-even lock: BUY SL = least-profit entry + this, SELL SL = least-profit entry - this (points)
@@ -492,13 +497,12 @@ void UpdateGridFillStage() {
 }
 
 // Staged manual adds (AllowManualAdd=true). A market click on a side that already
-// has a first order is allowed by stage; only EA grid fills raise the stage:
-//   grid level 2 filled           → side total <= MaxTotalLot
-//   first order in profit          → side total <= EarlyAddMaxLot
-//   grid level 1 filled (in loss)  → Stage1AddOrders add(s), side total <= EarlyAddMaxLot
-//   otherwise (in loss, no fill)   → no add
-// The bigger limit wins, never above MaxTotalLot. Grid fills and your own
-// pendings are not checked. Returns true if the position was closed.
+// has a first order needs the FIRST order in profit; the stage (deepest EA grid
+// level filled — your adds never raise it) sets how much you may add:
+//   no grid fill → ProfitAddOrders add(s), each lot <= first order lot
+//   level 1 / 2 / 3+ → your adds total <= AddFracLevel1/2/3 x MaxTotalLot
+// The whole side is still capped by MaxTotalLot (CheckMaxTotals). Grid fills and
+// your own pendings are not checked. Returns true if the position was closed.
 bool CheckStagedAdd(const ulong tk) {
   if (tk == 0 || !PositionSelectByTicket(tk)) return false;
   if (PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
@@ -514,49 +518,47 @@ bool CheckStagedAdd(const ulong tk) {
   if (firstTk == 0 || firstTk == tk || !PositionSelectByTicket(firstTk)) return false; // this IS the first order
   if ((long)PositionGetInteger(POSITION_TIME_MSC) > myMsc) return false;
   const double firstEntry = PositionGetDouble(POSITION_PRICE_OPEN);
+  const double firstVol = PositionGetDouble(POSITION_VOLUME);
 
   const double pt = Pt();
   if (pt <= 0.0) return false;
+  const int digits = DigitsCount();
   const double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
   const bool inProfit = isBuy ? (price > firstEntry) : (price < firstEntry);
 
   UpdateGridFillStage();
-  const int stage = g_gridFillMax[SideIdx(side)];             // 0, 1, 2+
+  const int stage = g_gridFillMax[SideIdx(side)];             // 0, 1, 2, 3+
 
   // Your adds already open on this side (manual legs except the first and this one).
   int prevAdds = 0;
+  double prevAddLots = 0.0;
   for (int i = PositionsTotal() - 1; i >= 0; i--) {
     const ulong t2 = PositionGetTicket(i);
     if (t2 == tk || t2 == firstTk || !IsBundlePositionLeg(t2)) continue;
     if ((long)PositionGetInteger(POSITION_MAGIC) == MagicNumber) continue;
     if ((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != side) continue;
     prevAdds++;
+    prevAddLots += PositionGetDouble(POSITION_VOLUME);
   }
+  const double myEff = EffectiveLegVolume(myVol);
+  const double addLots = prevAddLots + myEff;                  // your adds incl. this one
 
-  double limit = -1.0;                      // < 0 → add not allowed at all
-  string stageTxt = "";
-  if (stage >= 2) {
-    limit = (MaxTotalLot > 0.0) ? MaxTotalLot : 1e9;
-    stageTxt = "grid level 2 filled";
-  } else if (inProfit) {
-    limit = EarlyAddMaxLot;
-    stageTxt = "first order in profit";
-  } else if (stage >= 1) {
-    stageTxt = "grid level 1 filled";
-    if (prevAdds < Stage1AddOrders) limit = EarlyAddMaxLot;
-  } else {
-    stageTxt = "first order in loss, no grid level filled";
-  }
-  if (limit >= 0.0 && MaxTotalLot > 0.0) limit = MathMin(limit, MaxTotalLot);
-
-  const double lots = SideOpenLots(side) - myVol + EffectiveLegVolume(myVol);
+  const string stageTxt = (stage <= 0) ? "no grid level filled"
+                                       : StringFormat("grid level %d filled", MathMin(stage, 3));
   string why = "";
-  if (limit < 0.0) {
-    why = (stage == 1)
-        ? StringFormat("%s — only %d add(s) allowed before grid level 2", stageTxt, Stage1AddOrders)
-        : stageTxt + " — no add yet";
-  } else if (lots > limit + 1e-9) {
-    why = StringFormat("%s — side lot %.2f > limit %.2f", stageTxt, lots, limit);
+  if (!inProfit) {
+    why = StringFormat("%s — first order (%s) not in profit yet", stageTxt, DoubleToString(firstEntry, digits));
+  } else if (stage <= 0) {
+    if (prevAdds >= ProfitAddOrders)
+      why = StringFormat("%s — only %d add(s) allowed before the grid fills", stageTxt, ProfitAddOrders);
+    else if (myEff > firstVol + 1e-9)
+      why = StringFormat("%s — add lot %.2f > first order lot %.2f", stageTxt, myEff, firstVol);
+  } else {
+    const double frac = (stage == 1) ? AddFracLevel1 : (stage == 2) ? AddFracLevel2 : AddFracLevel3;
+    const double limit = (MaxTotalLot > 0.0) ? frac * MaxTotalLot : 1e9;
+    if (addLots > limit + 1e-9)
+      why = StringFormat("%s — your adds %.2f > limit %.3f (%.2f x max %.2f)",
+                         stageTxt, addLots, limit, frac, MaxTotalLot);
   }
   if (why == "") return false;
 
