@@ -14,7 +14,7 @@
 //| Version history: see git.                                        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.20"
+#property version   "1.21"
 #property description "MGridBS - grid, shared SL/TP you can trail, 6-tier TP, per-side USD stop, over-trading guards."
 
 #include <Trade/Trade.mqh>
@@ -24,7 +24,7 @@ input long   MagicNumber              = 909090; // EA will manage positions with
 input ENUM_TIMEFRAMES SwingTF         = PERIOD_M1;
 input int    SwingLookbackBars        = 50;     // search range for swing high/low
 input int    SwingBufferPoints        = 200;    // SL = swing low - this (BUY) / swing high + this (SELL), points
-input int    MinSLDistancePoints      = 2000;   // first SL only: if entry→SL < this, push SL out to exactly this (0=off)
+input int    MinSLDistancePoints      = 8000;   // first SL only: if entry→SL < this, push SL out to exactly this (0=off)
 
 //------- Shared TP per side -------
 input double TPRiskReward             = 1.5;    // TP = first entry + this x (first entry→first SL); same TP on every leg (0=off)
@@ -32,22 +32,24 @@ input double TPRiskReward             = 1.5;    // TP = first entry + this x (fi
 input int    SlippagePoints           = 20;
 
 input bool   UseGridPendingOrders     = true;   // after swing SL is set
-input int    GridExtraPendingLegs     = 3;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
-input int    GridFullDistancePoints   = 2000;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
+input int    GridExtraPendingLegs     = 7;      // grid legs when entry→SL >= GridFullDistancePoints; fewer when closer (min 1)
+input int    GridFullDistancePoints   = 8000;   // entry→SL distance that gets the full leg count; legs are spread evenly entry→SL
 input double increaseLot              = 0.0;    // grid: add this lot to each next leg (0=all equal; e.g. 0.02 → leg1 base, leg2 +0.02, leg3 +0.04 …)
 input double MaxLotPerLeg             = 0.01;   // max lot per leg; bigger open is partially closed down to this (0=off)
 // Staged manual adds (AllowManualAdd=true). Every add needs the FIRST order in profit
 // (BUY: price above first entry, SELL: below). Stage = deepest EA GRID level filled (your adds never raise it):
 //   no grid fill  → ProfitAddOrders add(s), each lot <= the first order's lot
 //   grid level 1  → YOUR adds (not first/grid) total <= AddFracLevel1 x MaxTotalLot
-//   grid level 2  → YOUR adds total <= AddFracLevel2 x MaxTotalLot
-//   grid level 3+ → YOUR adds total <= AddFracLevel3 x MaxTotalLot
+//   grid level 2 / 3 / 4 → YOUR adds total <= AddFracLevel2 / 3 / 4 x MaxTotalLot
+//   grid level 5+ → YOUR adds total <= AddFracLevel5 x MaxTotalLot
 //   The whole side still never exceeds MaxTotalLot. Your own pending fills are not checked.
 input int    ProfitAddOrders          = 1;      // no grid fill yet, first order in profit: this many adds, each lot <= first order lot
-input double AddFracLevel1            = 0.25;   // grid level 1 filled: your adds total <= this x MaxTotalLot (once first order is back in profit)
-input double AddFracLevel2            = 0.50;   // grid level 2 filled: your adds total <= this x MaxTotalLot
-input double AddFracLevel3            = 1.00;   // grid level 3+ filled: your adds total <= this x MaxTotalLot
-input double MaxTotalLot              = 0.4;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
+input double AddFracLevel1            = 0.05;   // grid level 1 filled: your adds total <= this x MaxTotalLot (1/20; once first order is back in profit)
+input double AddFracLevel2            = 0.10;   // grid level 2 filled: your adds total <= this x MaxTotalLot (2/20)
+input double AddFracLevel3            = 0.30;   // grid level 3 filled: your adds total <= this x MaxTotalLot (3/10)
+input double AddFracLevel4            = 0.50;   // grid level 4 filled: your adds total <= this x MaxTotalLot (5/10)
+input double AddFracLevel5            = 1.00;   // grid level 5+ filled: your adds total <= this x MaxTotalLot
+input double MaxTotalLot              = 1;    // per side: sum of open lots must stay <= this; manual add over it is closed back, grid stops (0=off)
 input int    MaxTotalOrders           = 0;      // per side: open positions must stay <= this; manual add over it is closed back, grid stops (0=off)
 input bool   AllowManualAdd           = true;  // false: once any order is open on this symbol, every extra manual order (BUY/SELL, market or your own pending) is closed back — only the EA grid fills. true = staged add rules (ProfitAddOrders / AddFracLevel* / MaxTotal*)
 input bool   AllowOppositeSide        = false;  // false: no hedge — while any BUY is open (manual or grid) a SELL you open (click or your own pending fill) is closed at once, and vice versa
@@ -500,7 +502,7 @@ void UpdateGridFillStage() {
 // has a first order needs the FIRST order in profit; the stage (deepest EA grid
 // level filled — your adds never raise it) sets how much you may add:
 //   no grid fill → ProfitAddOrders add(s), each lot <= first order lot
-//   level 1 / 2 / 3+ → your adds total <= AddFracLevel1/2/3 x MaxTotalLot
+//   level 1 / 2 / 3 / 4 / 5+ → your adds total <= AddFracLevel1..5 x MaxTotalLot
 // The whole side is still capped by MaxTotalLot (CheckMaxTotals). Grid fills and
 // your own pendings are not checked. Returns true if the position was closed.
 bool CheckStagedAdd(const ulong tk) {
@@ -544,7 +546,7 @@ bool CheckStagedAdd(const ulong tk) {
   const double addLots = prevAddLots + myEff;                  // your adds incl. this one
 
   const string stageTxt = (stage <= 0) ? "no grid level filled"
-                                       : StringFormat("grid level %d filled", MathMin(stage, 3));
+                                       : StringFormat("grid level %d filled", stage);
   string why = "";
   if (!inProfit) {
     why = StringFormat("%s — first order (%s) not in profit yet", stageTxt, DoubleToString(firstEntry, digits));
@@ -554,7 +556,8 @@ bool CheckStagedAdd(const ulong tk) {
     else if (myEff > firstVol + 1e-9)
       why = StringFormat("%s — add lot %.2f > first order lot %.2f", stageTxt, myEff, firstVol);
   } else {
-    const double frac = (stage == 1) ? AddFracLevel1 : (stage == 2) ? AddFracLevel2 : AddFracLevel3;
+    const double frac = (stage == 1) ? AddFracLevel1 : (stage == 2) ? AddFracLevel2 :
+                        (stage == 3) ? AddFracLevel3 : (stage == 4) ? AddFracLevel4 : AddFracLevel5;
     const double limit = (MaxTotalLot > 0.0) ? frac * MaxTotalLot : 1e9;
     if (addLots > limit + 1e-9)
       why = StringFormat("%s — your adds %.2f > limit %.3f (%.2f x max %.2f)",
